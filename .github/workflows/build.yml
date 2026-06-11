@@ -1,0 +1,35 @@
+name: Build Driver
+
+on:
+  push:
+    branches: [ master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Add MSBuild to PATH
+      uses: microsoft/setup-msbuild@v1.1
+
+    - name: Install WDK
+      run: |
+        choco install windowsdriverkit11 -y
+      shell: powershell
+
+    - name: Build SPI Driver
+      run: |
+        msbuild src/AmtPtpDeviceSpiKm/AmtPtpDeviceSpiKm.vcxproj /p:Configuration=Release /p:Platform=x64
+      shell: powershell
+
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v3
+      with:
+        name: AmtPtpDeviceSpiKm-Release-x64
+        path: |
+          src/AmtPtpDeviceSpiKm/x64/Release/*.sys
+          src/AmtPtpDeviceSpiKm/x64/Release/*.inf
+          src/AmtPtpDeviceSpiKm/x64/Release/*.cat
