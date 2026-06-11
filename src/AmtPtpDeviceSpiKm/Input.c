@@ -176,6 +176,7 @@ AmtPtpRequestCompletionRoutine(
 	LARGE_INTEGER CurrentCounter;
 	LARGE_INTEGER Frequency;
 	LONGLONG CounterDelta;
+	UINT8 SlotContactID[5]; // stable per-slot contact IDs for this report
 
 	UNREFERENCED_PARAMETER(Target);
 
@@ -215,44 +216,37 @@ AmtPtpRequestCompletionRoutine(
 
 	// Get Counter
 	// ScanTime units are 100 microseconds per HID PTP spec.
-	// Compute: delta_ticks / freq_Hz * 10000 = delta in 100us units.
-	KeQueryPerformanceCounter(&CurrentCounter);
-	Frequency.QuadPart = 0;
-	KeQueryPerformanceCounter(&Frequency); // second call returns frequency
-	// Use proper frequency-based conversion instead of hardcoded /100
-	// which was wrong on machines where frequency != 10MHz
-	if (Frequency.QuadPart > 0) {
+	// KeQueryPerformanceCounter returns current tick count.
+	// KeQueryPerformanceFrequency returns ticks per second.
+	CurrentCounter = KeQueryPerformanceCounter(NULL);
+	KeQueryPerformanceFrequency(&Frequency);
+	// Compute delta in 100us units: (delta_ticks * 10000) / freq_Hz
+	if (Frequency.QuadPart > 0 && pDeviceContext->LastReportTime.QuadPart > 0) {
 		CounterDelta = ((CurrentCounter.QuadPart - pDeviceContext->LastReportTime.QuadPart) * 10000LL)
 			/ Frequency.QuadPart;
 	} else {
-		CounterDelta = (CurrentCounter.QuadPart - pDeviceContext->LastReportTime.QuadPart) / 100;
+		CounterDelta = 0;
 	}
 	pDeviceContext->LastReportTime.QuadPart = CurrentCounter.QuadPart;
 
 	// Write report
+	RtlZeroMemory(&PtpReport, sizeof(PTP_REPORT));
 	PtpReport.ReportID = REPORTID_MULTITOUCH;
 	PtpReport.ContactCount = pSpiTrackpadPacket->NumOfFingers;
 	PtpReport.IsButtonClicked = pSpiTrackpadPacket->ClickOccurred;
 
 	UINT8 AdjustedCount = (pSpiTrackpadPacket->NumOfFingers > 5) ? 5 : pSpiTrackpadPacket->NumOfFingers;
+
+	// Use slot index directly as ContactID (0..4).
+	// Apple SPI protocol assigns fingers to fixed slots and keeps them
+	// there until lift-off, so slot index is a naturally stable ID.
+	// A coordinate-hash ID (old code) changes every frame as the finger
+	// moves, causing Windows to think the contact disappeared and
+	// reappeared - which makes the cursor jump back to a previous position.
 	for (UINT8 Count = 0; Count < AdjustedCount; Count++)
 	{
-		// Use stable ContactID: hash slot position via low bits of OriginalX/Y
-		// to avoid ID reassignment when finger count changes mid-gesture.
-		// ContactID field is 3 bits (0-7), so mask to 7.
-		UINT8 stableId = (UINT8)(
-			((pSpiTrackpadPacket->Fingers[Count].OriginalX & 0x07) ^
-			 ((pSpiTrackpadPacket->Fingers[Count].OriginalY >> 1) & 0x07))
-		) & 0x07;
-		// Ensure no two contacts share the same computed ID in this report
-		// by falling back to index if collision would occur
-		for (UINT8 prev = 0; prev < Count; prev++) {
-			if (PtpReport.Contacts[prev].ContactID == stableId) {
-				stableId = (stableId + 1) & 0x07;
-				break;
-			}
-		}
-		PtpReport.Contacts[Count].ContactID = stableId;
+		SlotContactID[Count] = Count; // slot index = stable contact ID
+		PtpReport.Contacts[Count].ContactID = SlotContactID[Count];
 		PtpReport.Contacts[Count].X = ((pSpiTrackpadPacket->Fingers[Count].X - pDeviceContext->TrackpadInfo.XMin) > 0) ? 
 			(USHORT)(pSpiTrackpadPacket->Fingers[Count].X - pDeviceContext->TrackpadInfo.XMin) : 0;
 		PtpReport.Contacts[Count].Y = ((pDeviceContext->TrackpadInfo.YMax - pSpiTrackpadPacket->Fingers[Count].Y) > 0) ? 
