@@ -13,16 +13,18 @@ jobs:
     - uses: actions/checkout@v4
 
     - name: Add MSBuild to PATH
-      uses: microsoft/setup-msbuild@v1.1
+      uses: microsoft/setup-msbuild@v2
 
-    - name: Install WDK
+    - name: Install WDK via winget
       run: |
-        choco install windowsdriverkit11 -y
+        $wdkUrl = "https://go.microsoft.com/fwlink/?linkid=2196230"
+        $wdkInstaller = "$env:TEMP\wdksetup.exe"
+        Invoke-WebRequest -Uri $wdkUrl -OutFile $wdkInstaller
+        Start-Process -FilePath $wdkInstaller -ArgumentList "/quiet /norestart" -Wait
       shell: powershell
 
     - name: Build SPI Driver
-      run: |
-        msbuild src/AmtPtpDeviceSpiKm/AmtPtpDeviceSpiKm.vcxproj /p:Configuration=Release /p:Platform=x64
+      run: msbuild src/AmtPtpDeviceSpiKm/AmtPtpDeviceSpiKm.vcxproj /p:Configuration=Release /p:Platform=x64
       shell: powershell
 
     - name: Upload artifacts
