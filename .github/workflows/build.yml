@@ -24,7 +24,18 @@ jobs:
         $wdkInstaller = "$env:TEMP\wdksetup.exe"
         Invoke-WebRequest -Uri $wdkUrl -OutFile $wdkInstaller
         Start-Process -FilePath $wdkInstaller -ArgumentList "/quiet /norestart" -Wait
-        Write-Host "WDK installed"
+      shell: powershell
+
+    - name: Diagnose WDK installation
+      run: |
+        Write-Host "=== Windows Kits ==="
+        Get-ChildItem "C:\Program Files (x86)\Windows Kits\" -ErrorAction SilentlyContinue
+        Write-Host "=== Include folders ==="
+        Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\Include\" -ErrorAction SilentlyContinue
+        Write-Host "=== Looking for ntddk.h ==="
+        Get-ChildItem "C:\Program Files (x86)\Windows Kits\" -Recurse -Filter "ntddk.h" -ErrorAction SilentlyContinue | Select FullName
+        Write-Host "=== WDK MSBuild extensions ==="
+        Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\build\" -ErrorAction SilentlyContinue
       shell: powershell
 
     - name: Build SPI Driver
