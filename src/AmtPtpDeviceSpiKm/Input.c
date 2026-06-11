@@ -174,6 +174,7 @@ AmtPtpRequestCompletionRoutine(
 	WDFMEMORY PtpRequestMemory;
 
 	LARGE_INTEGER CurrentCounter;
+	LARGE_INTEGER Frequency;
 	LONGLONG CounterDelta;
 
 	UNREFERENCED_PARAMETER(Target);
@@ -213,11 +214,19 @@ AmtPtpRequestCompletionRoutine(
 	}
 
 	// Get Counter
-	KeQueryPerformanceCounter(
-		&CurrentCounter
-	);
-
-	CounterDelta = (CurrentCounter.QuadPart - pDeviceContext->LastReportTime.QuadPart) / 100;
+	// ScanTime units are 100 microseconds per HID PTP spec.
+	// Compute: delta_ticks / freq_Hz * 10000 = delta in 100us units.
+	KeQueryPerformanceCounter(&CurrentCounter);
+	Frequency.QuadPart = 0;
+	KeQueryPerformanceCounter(&Frequency); // second call returns frequency
+	// Use proper frequency-based conversion instead of hardcoded /100
+	// which was wrong on machines where frequency != 10MHz
+	if (Frequency.QuadPart > 0) {
+		CounterDelta = ((CurrentCounter.QuadPart - pDeviceContext->LastReportTime.QuadPart) * 10000LL)
+			/ Frequency.QuadPart;
+	} else {
+		CounterDelta = (CurrentCounter.QuadPart - pDeviceContext->LastReportTime.QuadPart) / 100;
+	}
 	pDeviceContext->LastReportTime.QuadPart = CurrentCounter.QuadPart;
 
 	// Write report
@@ -228,12 +237,28 @@ AmtPtpRequestCompletionRoutine(
 	UINT8 AdjustedCount = (pSpiTrackpadPacket->NumOfFingers > 5) ? 5 : pSpiTrackpadPacket->NumOfFingers;
 	for (UINT8 Count = 0; Count < AdjustedCount; Count++)
 	{
-		PtpReport.Contacts[Count].ContactID = Count;
+		// Use stable ContactID: hash slot position via low bits of OriginalX/Y
+		// to avoid ID reassignment when finger count changes mid-gesture.
+		// ContactID field is 3 bits (0-7), so mask to 7.
+		UINT8 stableId = (UINT8)(
+			((pSpiTrackpadPacket->Fingers[Count].OriginalX & 0x07) ^
+			 ((pSpiTrackpadPacket->Fingers[Count].OriginalY >> 1) & 0x07))
+		) & 0x07;
+		// Ensure no two contacts share the same computed ID in this report
+		// by falling back to index if collision would occur
+		for (UINT8 prev = 0; prev < Count; prev++) {
+			if (PtpReport.Contacts[prev].ContactID == stableId) {
+				stableId = (stableId + 1) & 0x07;
+				break;
+			}
+		}
+		PtpReport.Contacts[Count].ContactID = stableId;
 		PtpReport.Contacts[Count].X = ((pSpiTrackpadPacket->Fingers[Count].X - pDeviceContext->TrackpadInfo.XMin) > 0) ? 
 			(USHORT)(pSpiTrackpadPacket->Fingers[Count].X - pDeviceContext->TrackpadInfo.XMin) : 0;
 		PtpReport.Contacts[Count].Y = ((pDeviceContext->TrackpadInfo.YMax - pSpiTrackpadPacket->Fingers[Count].Y) > 0) ? 
 			(USHORT)(pDeviceContext->TrackpadInfo.YMax - pSpiTrackpadPacket->Fingers[Count].Y) : 0;
-		PtpReport.Contacts[Count].TipSwitch = (pSpiTrackpadPacket->Fingers[Count].Pressure > 0) ? 1 : 0;
+		// Use pressure > 1 (not > 0) to avoid ghost touches from near-zero readings
+		PtpReport.Contacts[Count].TipSwitch = (pSpiTrackpadPacket->Fingers[Count].Pressure > 1) ? 1 : 0;
 
 		// $S = \pi * (Touch_{Major} * Touch_{Minor}) / 4$
 		// $S = \pi * r^2$
@@ -254,9 +279,12 @@ AmtPtpRequestCompletionRoutine(
 		);
 	}
 
-	if (CounterDelta >= 0xFF)
+	// ScanTime is USHORT - clamp to 0xFFFF, NOT 0xFF.
+	// The old 0xFF clamp caused the timer to wrap every ~25ms, confusing
+	// Windows gesture recognizer and causing the "must wait before next gesture" bug.
+	if (CounterDelta >= 0xFFFF)
 	{
-		PtpReport.ScanTime = 0xFF;
+		PtpReport.ScanTime = 0xFFFF;
 	}
 	else
 	{
