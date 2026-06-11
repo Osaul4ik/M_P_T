@@ -99,3 +99,4 @@ I would like to thank projects like [magictrackpad2-dkms](https://github.com/rob
 - USB driver is licensed under [GPLv2](LICENSE-GPL.md).
 - SPI driver is licensed under [MIT](LICENSE-MIT.md).
 
+
