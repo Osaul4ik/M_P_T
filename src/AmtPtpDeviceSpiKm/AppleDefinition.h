@@ -63,6 +63,17 @@ static const SPI_TRACKPAD_INFO SpiTrackpadConfigTable[] =
 	{ 0x05ac, 0x0278, -7456, 7976, -163, 9283 },
 	/* MacBook10 */
 	{ 0x05ac, 0x0279, -5087, 5579, -128, 6089 },
+	/* MacBookPro15,1 / MacBookPro15,3 (2018, 15-inch T2) */
+	{ 0x05ac, 0x027a, -7456, 7976, -163, 9283 },
+	{ 0x05ac, 0x027b, -7456, 7976, -163, 9283 },
+	/* MacBookPro15,2 (2018, 13-inch T2) */
+	{ 0x05ac, 0x027c, -6243, 6749, -170, 7685 },
+	{ 0x05ac, 0x027d, -6243, 6749, -170, 7685 },
+	/* MacBookPro16,1 / MacBookPro16,4 (2019, 16-inch T2) - YOUR DEVICE */
+	{ 0x05ac, 0x0280, -7456, 7976, -163, 9283 },
+	/* MacBookPro16,2 / MacBookPro16,3 (2020, 13-inch T2) */
+	{ 0x05ac, 0x0281, -6243, 6749, -170, 7685 },
+	{ 0x05ac, 0x0282, -6243, 6749, -170, 7685 },
 	/* MacBookAir7,2 fallback */
 	{ 0x05ac, 0x0290, -5087, 5579, -128, 6089 },
 	{ 0x05ac, 0x0291, -5087, 5579, -128, 6089 },
