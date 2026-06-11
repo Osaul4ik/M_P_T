@@ -218,7 +218,6 @@ AmtPtpRequestCompletionRoutine(
 	// ScanTime units are 100 microseconds per HID PTP spec.
 	// KeQueryPerformanceCounter returns current tick count.
 	// KeQueryPerformanceFrequency returns ticks per second.
-	LARGE_INTEGER Frequency;
     CurrentCounter = KeQueryPerformanceCounter(&Frequency);
 	// Compute delta in 100us units: (delta_ticks * 10000) / freq_Hz
 	if (Frequency.QuadPart > 0 && pDeviceContext->LastReportTime.QuadPart > 0) {
