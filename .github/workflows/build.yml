@@ -15,7 +15,7 @@ jobs:
     - name: Add MSBuild to PATH
       uses: microsoft/setup-msbuild@v2
 
-    - name: Install WDK via winget
+    - name: Install WDK
       run: |
         $wdkUrl = "https://go.microsoft.com/fwlink/?linkid=2196230"
         $wdkInstaller = "$env:TEMP\wdksetup.exe"
@@ -23,8 +23,20 @@ jobs:
         Start-Process -FilePath $wdkInstaller -ArgumentList "/quiet /norestart" -Wait
       shell: powershell
 
-    - name: Build SPI Driver
-      run: msbuild src/AmtPtpDeviceSpiKm/AmtPtpDeviceSpiKm.vcxproj /p:Configuration=Release /p:Platform=x64
+    - name: Find WDK and build
+      run: |
+        # Знайти папку WDK
+        $wdkRoot = "C:\Program Files (x86)\Windows Kits\10"
+        $wdkInc = Get-ChildItem "$wdkRoot\Include" | Sort-Object Name -Descending | Select-Object -First 1
+        $wdkLib = Get-ChildItem "$wdkRoot\Lib" | Sort-Object Name -Descending | Select-Object -First 1
+        Write-Host "WDK Include: $($wdkInc.FullName)"
+        Write-Host "WDK Lib: $($wdkLib.FullName)"
+
+        msbuild src/AmtPtpDeviceSpiKm/AmtPtpDeviceSpiKm.vcxproj `
+          /p:Configuration=Release `
+          /p:Platform=x64 `
+          /p:WindowsTargetPlatformVersion=$($wdkInc.Name) `
+          /p:KernelModeDriverType=WDM
       shell: powershell
 
     - name: Upload artifacts
