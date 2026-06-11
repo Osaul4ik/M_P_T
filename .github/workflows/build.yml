@@ -5,9 +5,12 @@ on:
     branches: [ master ]
   workflow_dispatch:
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   build:
-    runs-on: windows-latest
+    runs-on: windows-2022
 
     steps:
     - uses: actions/checkout@v4
@@ -17,24 +20,30 @@ jobs:
 
     - name: Install WDK via NuGet
       run: |
-        nuget install Microsoft.Windows.WDK.x64 -Version 10.0.26100.3 -OutputDirectory C:\wdk
-        nuget install Microsoft.Windows.SDK.CPP -Version 10.0.26100.3 -OutputDirectory C:\wdk
-        nuget install Microsoft.Windows.SDK.CPP.x64 -Version 10.0.26100.3 -OutputDirectory C:\wdk
+        nuget install Microsoft.Windows.WDK.x64 -Version 10.0.22621.2428 -OutputDirectory C:\wdk -NonInteractive
+        nuget install Microsoft.Windows.SDK.CPP -Version 10.0.22621.2428 -OutputDirectory C:\wdk -NonInteractive
+        nuget install Microsoft.Windows.SDK.CPP.x64 -Version 10.0.22621.2428 -OutputDirectory C:\wdk -NonInteractive
+        # Перевірити що встановилось
+        Get-ChildItem C:\wdk -Recurse -Filter "ntddk.h" | Select-Object FullName
       shell: powershell
 
     - name: Build SPI Driver
       run: |
-        $sdkInc = "C:\wdk\Microsoft.Windows.SDK.CPP.10.0.26100.3\c\Include\10.0.26100.0"
-        $sdkLib = "C:\wdk\Microsoft.Windows.SDK.CPP.x64.10.0.26100.3\c\Lib\10.0.26100.0"
-        $wdkInc = "C:\wdk\Microsoft.Windows.WDK.x64.10.0.26100.3\c\Include\10.0.26100.0"
-        $wdkLib = "C:\wdk\Microsoft.Windows.WDK.x64.10.0.26100.3\c\Lib\10.0.26100.0"
+        $ver = "10.0.22621.2428"
+        $sdkInc = "C:\wdk\Microsoft.Windows.SDK.CPP.$ver\c\Include\10.0.22621.0"
+        $sdkLibx64 = "C:\wdk\Microsoft.Windows.SDK.CPP.x64.$ver\c\Lib\10.0.22621.0"
+        $wdkInc = "C:\wdk\Microsoft.Windows.WDK.x64.$ver\c\Include\10.0.22621.0"
+        $wdkLib = "C:\wdk\Microsoft.Windows.WDK.x64.$ver\c\Lib\10.0.22621.0"
+
+        Write-Host "Checking paths..."
+        Write-Host "ntddk.h exists: $(Test-Path "$wdkInc\km\ntddk.h")"
 
         msbuild src/AmtPtpDeviceSpiKm/AmtPtpDeviceSpiKm.vcxproj `
           /p:Configuration=Release `
           /p:Platform=x64 `
-          /p:WindowsTargetPlatformVersion=10.0.26100.0 `
-          /p:IncludePath="$wdkInc\km;$sdkInc\shared;$sdkInc\km;$(IncludePath)" `
-          /p:LibraryPath="$wdkLib\km\x64;$sdkLib\km\x64;$(LibraryPath)"
+          /p:WindowsTargetPlatformVersion=10.0.22621.0 `
+          /p:IncludePath="$wdkInc\km;$sdkInc\shared;$sdkInc\km;$sdkInc\ucrt;$(IncludePath)" `
+          /p:LibraryPath="$wdkLib\km\x64;$sdkLibx64\km\x64;$sdkLibx64\ucrt\x64;$(LibraryPath)"
       shell: powershell
 
     - name: Upload artifacts
