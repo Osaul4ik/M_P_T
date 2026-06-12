@@ -29,7 +29,7 @@ AmtPtpSpiInputRoutineWorker(
 	}
 
 	// Only issue request when fully configured.
-	// Otherwise we will let power recovery process to triage it
+	// Otherwise we will let power recovery process to triage it.
 	if (pDeviceContext->DeviceStatus == D0ActiveAndConfigured) {
 		AmtPtpSpiInputIssueRequest(Device);
 	}
@@ -113,14 +113,8 @@ AmtPtpSpiInputIssueRequest(
 			Status
 		);
 
-		if (SpiHidReadOutputMemory != NULL) {
-			WdfObjectDelete(SpiHidReadOutputMemory);
-		}
-
-		if (SpiHidReadRequest != NULL) {
-			WdfObjectDelete(SpiHidReadRequest);
-		}
-
+		WdfObjectDelete(SpiHidReadOutputMemory);
+		WdfObjectDelete(SpiHidReadRequest);
 		return;
 	}
 
@@ -141,16 +135,11 @@ AmtPtpSpiInputIssueRequest(
 		TraceEvents(
 			TRACE_LEVEL_INFORMATION,
 			TRACE_DEVICE,
-			"%!FUNC! AmtPtpSpiInputRoutineWorker request failed to sent"
+			"%!FUNC! WdfRequestSend failed"
 		);
 
-		if (SpiHidReadOutputMemory != NULL) {
-			WdfObjectDelete(SpiHidReadOutputMemory);
-		}
-
-		if (SpiHidReadRequest != NULL) {
-			WdfObjectDelete(SpiHidReadRequest);
-		}
+		WdfObjectDelete(SpiHidReadOutputMemory);
+		WdfObjectDelete(SpiHidReadRequest);
 	}
 }
 
@@ -167,6 +156,7 @@ AmtPtpRequestCompletionRoutine(
 	PDEVICE_CONTEXT pDeviceContext;
 
 	LONG SpiRequestLength;
+	LONG MinPacketLength;
 	PSPI_TRACKPAD_PACKET pSpiTrackpadPacket;
 
 	WDFREQUEST PtpRequest;
@@ -174,9 +164,13 @@ AmtPtpRequestCompletionRoutine(
 	WDFMEMORY PtpRequestMemory;
 
 	LARGE_INTEGER CurrentCounter;
-	LARGE_INTEGER Frequency;
 	LONGLONG CounterDelta;
-	UINT8 SlotContactID[5]; // stable per-slot contact IDs for this report
+	UINT8 AdjustedCount;
+	UINT8 Count;
+	SHORT RawX;
+	SHORT RawY;
+	LONG NormX;
+	LONG NormY;
 
 	UNREFERENCED_PARAMETER(Target);
 
@@ -184,8 +178,9 @@ AmtPtpRequestCompletionRoutine(
 	RequestContext = (PWORKER_REQUEST_CONTEXT) Context;
 	pDeviceContext = RequestContext->DeviceContext;
 
-	// Read report and fulfill PTP request.
-	// If no report is found, just exit.
+	// Retrieve the pending PTP request before doing any work.
+	// If Windows has not posted a read (e.g. during mode switch), just drop
+	// the SPI packet silently — no point processing input nobody will receive.
 	Status = WdfIoQueueRetrieveNextRequest(pDeviceContext->HidQueue, &PtpRequest);
 	if (!NT_SUCCESS(Status)) {
 		TraceEvents(
@@ -198,106 +193,167 @@ AmtPtpRequestCompletionRoutine(
 		goto cleanup;
 	}
 
-	SpiRequestLength = (LONG) WdfRequestGetInformation(SpiRequest);
-	pSpiTrackpadPacket = (PSPI_TRACKPAD_PACKET) WdfMemoryGetBuffer(Params->Parameters.Ioctl.Output.Buffer, NULL);
+	// Check PTP mode flags set by Windows via SET_FEATURE.
+	// If the host switched to mouse mode (PtpInputOn = FALSE), or disabled
+	// surface reports (PtpReportTouch = FALSE), complete the request with an
+	// empty report rather than spending cycles translating touch data.
+	if (!pDeviceContext->PtpInputOn || !pDeviceContext->PtpReportTouch) {
+		RtlZeroMemory(&PtpReport, sizeof(PTP_REPORT));
+		PtpReport.ReportID = REPORTID_MULTITOUCH;
 
-	// Safe measurement for buffer overrun and device state reset
+		Status = WdfRequestRetrieveOutputMemory(PtpRequest, &PtpRequestMemory);
+		if (NT_SUCCESS(Status)) {
+			WdfMemoryCopyFromBuffer(PtpRequestMemory, 0, &PtpReport, sizeof(PTP_REPORT));
+			WdfRequestSetInformation(PtpRequest, sizeof(PTP_REPORT));
+		}
+		goto exit;
+	}
+
+	SpiRequestLength = (LONG) WdfRequestGetInformation(SpiRequest);
+	pSpiTrackpadPacket = (PSPI_TRACKPAD_PACKET) WdfMemoryGetBuffer(
+		Params->Parameters.Ioctl.Output.Buffer, NULL);
+
+	// Validate the packet header is present.
+	// sizeof(SPI_TRACKPAD_PACKET) header (without finger array) = 46 bytes.
 	if (SpiRequestLength < 46) {
 		TraceEvents(
 			TRACE_LEVEL_ERROR,
 			TRACE_DRIVER,
-			"%!FUNC! Input too small: %d < 46. Attempt to re-enable the device.",
+			"%!FUNC! Packet too short for header: %d < 46",
 			SpiRequestLength
 		);
-
 		Status = STATUS_DEVICE_DATA_ERROR;
 		goto exit;
 	}
 
-	// Get Counter
-	// ScanTime units are 100 microseconds per HID PTP spec.
-	// KeQueryPerformanceCounter returns current tick count.
-	// KeQueryPerformanceFrequency returns ticks per second.
-    CurrentCounter = KeQueryPerformanceCounter(&Frequency);
-	// Compute delta in 100us units: (delta_ticks * 10000) / freq_Hz
-	if (Frequency.QuadPart > 0 && pDeviceContext->LastReportTime.QuadPart > 0) {
-		CounterDelta = ((CurrentCounter.QuadPart - pDeviceContext->LastReportTime.QuadPart) * 10000LL)
-			/ Frequency.QuadPart;
+	// Validate that the buffer contains all claimed finger records.
+	// Without this check, reading Fingers[N] when the packet only contains
+	// M < N fingers is an out-of-bounds read into adjacent memory.
+	// sizeof(SPI_TRACKPAD_FINGER) = 30 bytes.
+	MinPacketLength = 46 + (LONG)pSpiTrackpadPacket->NumOfFingers *
+	                       (LONG)sizeof(SPI_TRACKPAD_FINGER);
+	if (SpiRequestLength < MinPacketLength) {
+		TraceEvents(
+			TRACE_LEVEL_ERROR,
+			TRACE_DRIVER,
+			"%!FUNC! Packet truncated: %d < %d (%d fingers claimed)",
+			SpiRequestLength,
+			MinPacketLength,
+			pSpiTrackpadPacket->NumOfFingers
+		);
+		Status = STATUS_DEVICE_DATA_ERROR;
+		goto exit;
+	}
+
+	// Compute ScanTime.
+	// ScanTime unit per HID PTP spec: 100 microseconds.
+	// PerformanceFrequency is cached at D0Entry (it is a hardware constant).
+	// Formula: delta_ticks * 10000 / freq_Hz = delta in 100us units.
+	CurrentCounter = KeQueryPerformanceCounter(NULL);
+
+	if (pDeviceContext->PerformanceFrequency > 0) {
+		CounterDelta =
+			((CurrentCounter.QuadPart - pDeviceContext->LastReportTime.QuadPart)
+			 * 10000LL)
+			/ pDeviceContext->PerformanceFrequency;
 	} else {
 		CounterDelta = 0;
 	}
+
+	// Clamp to USHORT. Values > 6.5 seconds only happen on the very first
+	// frame after power-on and are harmless at the ceiling.
+	if (CounterDelta > 0xFFFF) {
+		CounterDelta = 0xFFFF;
+	}
+
 	pDeviceContext->LastReportTime.QuadPart = CurrentCounter.QuadPart;
 
-	// Write report
+	// Zero the entire report.
+	// PTP_REPORT is a stack variable; unused contact slots would contain
+	// stack garbage — random coordinates, stale ContactIDs, and TipSwitch=1
+	// — which Windows interprets as phantom fingers.
 	RtlZeroMemory(&PtpReport, sizeof(PTP_REPORT));
-	PtpReport.ReportID = REPORTID_MULTITOUCH;
-	PtpReport.ContactCount = pSpiTrackpadPacket->NumOfFingers;
+
+	// Clamp contact count to what the report struct can hold.
+	AdjustedCount = (pSpiTrackpadPacket->NumOfFingers > PTP_MAX_CONTACT_POINTS)
+		? PTP_MAX_CONTACT_POINTS
+		: pSpiTrackpadPacket->NumOfFingers;
+
+	PtpReport.ReportID        = REPORTID_MULTITOUCH;
+	PtpReport.ContactCount    = AdjustedCount;
 	PtpReport.IsButtonClicked = pSpiTrackpadPacket->ClickOccurred;
+	PtpReport.ScanTime        = (USHORT) CounterDelta;
 
-	UINT8 AdjustedCount = (pSpiTrackpadPacket->NumOfFingers > 5) ? 5 : pSpiTrackpadPacket->NumOfFingers;
-
-	// Use slot index directly as ContactID (0..4).
-	// Apple SPI protocol assigns fingers to fixed slots and keeps them
-	// there until lift-off, so slot index is a naturally stable ID.
-	// A coordinate-hash ID (old code) changes every frame as the finger
-	// moves, causing Windows to think the contact disappeared and
-	// reappeared - which makes the cursor jump back to a previous position.
-	for (UINT8 Count = 0; Count < AdjustedCount; Count++)
+	for (Count = 0; Count < AdjustedCount; Count++)
 	{
-		SlotContactID[Count] = Count; // slot index = stable contact ID
-		PtpReport.Contacts[Count].ContactID = SlotContactID[Count];
-		PtpReport.Contacts[Count].X = ((pSpiTrackpadPacket->Fingers[Count].X - pDeviceContext->TrackpadInfo.XMin) > 0) ? 
-			(USHORT)(pSpiTrackpadPacket->Fingers[Count].X - pDeviceContext->TrackpadInfo.XMin) : 0;
-		PtpReport.Contacts[Count].Y = ((pDeviceContext->TrackpadInfo.YMax - pSpiTrackpadPacket->Fingers[Count].Y) > 0) ? 
-			(USHORT)(pDeviceContext->TrackpadInfo.YMax - pSpiTrackpadPacket->Fingers[Count].Y) : 0;
-		// Use pressure > 1 (not > 0) to avoid ghost touches from near-zero readings
-		PtpReport.Contacts[Count].TipSwitch = (pSpiTrackpadPacket->Fingers[Count].Pressure > 1) ? 1 : 0;
+		// ContactID = slot index.
+		// Apple T2 SPI firmware assigns each finger to a fixed slot for its
+		// entire lifetime (touchdown to lift-off). The slot index is the only
+		// stable identifier — coordinate-derived hashes change every frame
+		// and cause Windows to see a new contact on every movement, snapping
+		// the cursor back to the previous frame's position.
+		PtpReport.Contacts[Count].ContactID = Count;
 
-		// $S = \pi * (Touch_{Major} * Touch_{Minor}) / 4$
-		// $S = \pi * r^2$
-		// $r^2 = (Touch_{Major} * Touch_{Minor}) / 4$
-		// Using i386 in 2018 is evil
-		PtpReport.Contacts[Count].Confidence = (pSpiTrackpadPacket->Fingers[Count].TouchMajor < 2500 &&
-			pSpiTrackpadPacket->Fingers[Count].TouchMinor < 2500) ? 1 : 0;
+		// Normalize X: map [XMin..XMax] → [0..XRange].
+		// XRange is precomputed as (XMax - XMin) at D0Entry.
+		// Clamp with saturating arithmetic; use LONG intermediates to avoid
+		// signed SHORT overflow before the clamp comparison.
+		RawX  = pSpiTrackpadPacket->Fingers[Count].X;
+		NormX = (LONG)RawX - (LONG)pDeviceContext->TrackpadInfo.XMin;
+		PtpReport.Contacts[Count].X =
+			(NormX <= 0) ? 0 :
+			(NormX >= (LONG)pDeviceContext->XRange) ? pDeviceContext->XRange :
+			(USHORT)NormX;
+
+		// Normalize Y: Apple Y grows downward; PTP Y grows upward.
+		// Map [YMin..YMax] → [YRange..0] (invert).
+		RawY  = pSpiTrackpadPacket->Fingers[Count].Y;
+		NormY = (LONG)pDeviceContext->TrackpadInfo.YMax - (LONG)RawY;
+		PtpReport.Contacts[Count].Y =
+			(NormY <= 0) ? 0 :
+			(NormY >= (LONG)pDeviceContext->YRange) ? pDeviceContext->YRange :
+			(USHORT)NormY;
+
+		// TipSwitch: report the contact as touching whenever Pressure >= 1.
+		// The T2 firmware reports Pressure == 1 on the very first contact frame
+		// (finger still forming contact). Excluding it (old threshold > 1)
+		// caused Windows to miss the touchdown and treat the next frame as a
+		// new contact mid-gesture, making the cursor jump.
+		PtpReport.Contacts[Count].TipSwitch =
+			(pSpiTrackpadPacket->Fingers[Count].Pressure >= 1) ? 1 : 0;
+
+		// Confidence: mark the contact as a valid finger unless it looks like
+		// a palm. A palm has BOTH TouchMajor and TouchMinor exceeding the
+		// threshold simultaneously. A finger at an angle has a large Major
+		// but a small Minor — that is a valid touch and must not be dropped.
+		// Units match the X/Y space (~1 unit ≈ 0.01 mm for MBP16,1).
+		// Threshold 2500 ≈ 25 mm; a palm exceeds this on both axes.
+		PtpReport.Contacts[Count].Confidence =
+			(pSpiTrackpadPacket->Fingers[Count].TouchMajor < 2500 ||
+			 pSpiTrackpadPacket->Fingers[Count].TouchMinor < 2500) ? 1 : 0;
 
 		TraceEvents(
-			TRACE_LEVEL_INFORMATION,
+			TRACE_LEVEL_VERBOSE,
 			TRACE_HID_INPUT,
-			"%!FUNC! PTP Contact %d OX %d, OY %d, X %d, Y %d",
+			"%!FUNC! Contact[%d] X=%d Y=%d P=%d Maj=%d Min=%d",
 			Count,
-			pSpiTrackpadPacket->Fingers[Count].OriginalX,
-			pSpiTrackpadPacket->Fingers[Count].OriginalY,
 			pSpiTrackpadPacket->Fingers[Count].X,
-			pSpiTrackpadPacket->Fingers[Count].Y
+			pSpiTrackpadPacket->Fingers[Count].Y,
+			pSpiTrackpadPacket->Fingers[Count].Pressure,
+			pSpiTrackpadPacket->Fingers[Count].TouchMajor,
+			pSpiTrackpadPacket->Fingers[Count].TouchMinor
 		);
 	}
 
-	// ScanTime is USHORT - clamp to 0xFFFF, NOT 0xFF.
-	// The old 0xFF clamp caused the timer to wrap every ~25ms, confusing
-	// Windows gesture recognizer and causing the "must wait before next gesture" bug.
-	if (CounterDelta >= 0xFFFF)
-	{
-		PtpReport.ScanTime = 0xFFFF;
-	}
-	else
-	{
-		PtpReport.ScanTime = (USHORT) CounterDelta;
-	}
-
-	Status = WdfRequestRetrieveOutputMemory(
-		PtpRequest,
-		&PtpRequestMemory
-	);
-
+	Status = WdfRequestRetrieveOutputMemory(PtpRequest, &PtpRequestMemory);
 	if (!NT_SUCCESS(Status))
 	{
 		TraceEvents(
 			TRACE_LEVEL_ERROR,
 			TRACE_DRIVER,
-			"%!FUNC! WdfRequestRetrieveOutputBuffer failed with %!STATUS!",
+			"%!FUNC! WdfRequestRetrieveOutputMemory failed with %!STATUS!",
 			Status
 		);
-
 		goto exit;
 	}
 
@@ -316,25 +372,15 @@ AmtPtpRequestCompletionRoutine(
 			"%!FUNC! WdfMemoryCopyFromBuffer failed with %!STATUS!",
 			Status
 		);
-
 		goto exit;
 	}
 
-	// Set information
-	WdfRequestSetInformation(
-		PtpRequest,
-		sizeof(PTP_REPORT)
-	);
+	WdfRequestSetInformation(PtpRequest, sizeof(PTP_REPORT));
 
 exit:
-	WdfRequestComplete(
-		PtpRequest,
-		Status
-	);
+	WdfRequestComplete(PtpRequest, Status);
 
 cleanup:
-	// Clean up
-	pSpiTrackpadPacket = NULL;
 	WdfObjectDelete(SpiRequest);
 	if (RequestContext->RequestMemory != NULL) {
 		WdfObjectDelete(RequestContext->RequestMemory);
