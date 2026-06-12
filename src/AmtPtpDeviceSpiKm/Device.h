@@ -27,16 +27,6 @@ typedef struct _SPI_TRACKPAD_INFO {
 	SHORT YMax;
 } SPI_TRACKPAD_INFO, *PSPI_TRACKPAD_INFO;
 
-// Stupid Microsoft only assigns a UCHAR for touch ID
-// we could have a better approach
-typedef struct _PTP_AAPL_MAPPING {
-	SHORT OriginalX;
-	SHORT OriginalY;
-	INT8 ContactID;
-} PTP_AAPL_MAPPING, *PPTP_AAPL_MAPPING;
-
-#define MAPPING_MAX 10
-
 typedef enum _REPORT_TYPE {
 	PrecisionTouchpad = 0,
 	Touchscreen = 1,
@@ -59,7 +49,6 @@ typedef struct _DEVICE_CONTEXT
 	WDFDEVICE	SpiDevice;
 	WDFIOTARGET SpiTrackpadIoTarget;
 	PTP_AAPL_DEVICE_POWER_STATUS DeviceStatus;
-	HANDLE		InputPollThreadHandle;
 	WDFQUEUE	HidQueue;
 
 	// SPI device metadata
@@ -77,6 +66,17 @@ typedef struct _DEVICE_CONTEXT
 	// Timer
 	LARGE_INTEGER LastReportTime;
 	WDFTIMER PowerOnRecoveryTimer;
+
+	// Performance counter frequency, cached at D0Entry.
+	// KeQueryPerformanceFrequency returns a hardware constant;
+	// caching it avoids a kernel call on every SPI completion (~125-250 Hz).
+	LONGLONG PerformanceFrequency;
+
+	// Precomputed coordinate ranges, cached at D0Entry.
+	// Avoids repeated signed subtraction with range checks in the hot path.
+	// XRange = XMax - XMin, YRange = YMax - YMin, both always positive.
+	USHORT XRange;
+	USHORT YRange;
 
 	// List of buffers
 	WDFLOOKASIDE HidReadBufferLookaside;
