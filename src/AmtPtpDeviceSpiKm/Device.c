@@ -1,17 +1,10 @@
 /*++
-
 Module Name:
-
-    device.c - Device handling events for example driver.
-
+    device.c
 Abstract:
-
-   This file contains the device entry points and callbacks.
-    
+    This file contains the device entry points and callbacks.
 Environment:
-
     Kernel-mode Driver Framework
-
 --*/
 
 #include "driver.h"
@@ -21,112 +14,105 @@ Environment:
 #pragma alloc_text (PAGE, AmtPtpDeviceSpiKmCreateDevice)
 #endif
 
+static VOID
+AmtPtpResetTrackingState(
+	_In_ PDEVICE_CONTEXT pDeviceContext
+)
+{
+	UINT8 k;
+	pDeviceContext->NextContactID    = 0;
+	pDeviceContext->PrevAdjustedCount = 0;
+	for (k = 0; k < PTP_MAX_CONTACT_POINTS; k++) {
+		pDeviceContext->PrevOriginalX[k] = 0x7FFF;
+		pDeviceContext->PrevOriginalY[k] = 0x7FFF;
+		pDeviceContext->SlotContactID[k] = 0xFF;
+		pDeviceContext->SlotIsPalm[k]    = FALSE;
+	}
+	pDeviceContext->LastKeyboardEventTime.QuadPart = 0;
+}
+
 NTSTATUS
 AmtPtpDeviceSpiKmCreateDevice(
-    _Inout_ PWDFDEVICE_INIT DeviceInit
-    )
+	_Inout_ PWDFDEVICE_INIT DeviceInit
+)
 {
-    WDF_OBJECT_ATTRIBUTES DeviceAttributes;
+	WDF_OBJECT_ATTRIBUTES DeviceAttributes;
 	WDF_OBJECT_ATTRIBUTES TimerAttributes;
-    PDEVICE_CONTEXT pDeviceContext;
+	PDEVICE_CONTEXT pDeviceContext;
 	WDF_TIMER_CONFIG TimerConfig;
-    WDFDEVICE Device;
-    NTSTATUS Status;
-
+	WDFDEVICE Device;
+	NTSTATUS Status;
 	WDF_PNPPOWER_EVENT_CALLBACKS pnpPowerCallbacks;
 
-    PAGED_CODE();
+	PAGED_CODE();
 
-	TraceEvents(
-		TRACE_LEVEL_INFORMATION,
-		TRACE_DRIVER,
-		"%!FUNC! Entry"
-	);
+	TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DRIVER, "%!FUNC! Entry");
 
 	WDF_PNPPOWER_EVENT_CALLBACKS_INIT(&pnpPowerCallbacks);
-
-	pnpPowerCallbacks.EvtDevicePrepareHardware = AmtPtpEvtDevicePrepareHardware;
-	pnpPowerCallbacks.EvtDeviceD0Entry = AmtPtpEvtDeviceD0Entry;
-	pnpPowerCallbacks.EvtDeviceD0Exit = AmtPtpEvtDeviceD0Exit;
-	pnpPowerCallbacks.EvtDeviceSelfManagedIoInit = AmtPtpEvtDeviceSelfManagedIoInitOrRestart;
-	pnpPowerCallbacks.EvtDeviceSelfManagedIoRestart = AmtPtpEvtDeviceSelfManagedIoInitOrRestart;
+	pnpPowerCallbacks.EvtDevicePrepareHardware        = AmtPtpEvtDevicePrepareHardware;
+	pnpPowerCallbacks.EvtDeviceD0Entry                = AmtPtpEvtDeviceD0Entry;
+	pnpPowerCallbacks.EvtDeviceD0Exit                 = AmtPtpEvtDeviceD0Exit;
+	pnpPowerCallbacks.EvtDeviceSelfManagedIoInit      = AmtPtpEvtDeviceSelfManagedIoInitOrRestart;
+	pnpPowerCallbacks.EvtDeviceSelfManagedIoRestart   = AmtPtpEvtDeviceSelfManagedIoInitOrRestart;
 	WdfDeviceInitSetPnpPowerEventCallbacks(DeviceInit, &pnpPowerCallbacks);
 
-    WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&DeviceAttributes, DEVICE_CONTEXT);
+	WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&DeviceAttributes, DEVICE_CONTEXT);
+	Status = WdfDeviceCreate(&DeviceInit, &DeviceAttributes, &Device);
+	if (!NT_SUCCESS(Status)) {
+		goto exit;
+	}
 
-    Status = WdfDeviceCreate(&DeviceInit, &DeviceAttributes, &Device);
+	pDeviceContext = DeviceGetContext(Device);
+	pDeviceContext->SpiDevice = Device;
 
-    if (NT_SUCCESS(Status)) 
-	{
-        pDeviceContext = DeviceGetContext(Device);
+	Status = WdfLookasideListCreate(
+		WDF_NO_OBJECT_ATTRIBUTES,
+		REPORT_BUFFER_SIZE,
+		NonPagedPoolNx,
+		WDF_NO_OBJECT_ATTRIBUTES,
+		PTP_LIST_POOL_TAG,
+		&pDeviceContext->HidReadBufferLookaside
+	);
+	if (!NT_SUCCESS(Status)) {
+		TraceEvents(TRACE_LEVEL_ERROR, TRACE_DRIVER,
+			"%!FUNC! WdfLookasideListCreate failed with %!STATUS!", Status);
+		goto exit;
+	}
 
-		pDeviceContext->SpiDevice = Device;
+	WDF_TIMER_CONFIG_INIT(&TimerConfig, AmtPtpPowerRecoveryTimerCallback);
+	TimerConfig.AutomaticSerialization = TRUE;
+	WDF_OBJECT_ATTRIBUTES_INIT(&TimerAttributes);
+	TimerAttributes.ParentObject   = Device;
+	TimerAttributes.ExecutionLevel = WdfExecutionLevelPassive;
+	Status = WdfTimerCreate(&TimerConfig, &TimerAttributes,
+		&pDeviceContext->PowerOnRecoveryTimer);
+	if (!NT_SUCCESS(Status)) {
+		TraceEvents(TRACE_LEVEL_ERROR, TRACE_DRIVER,
+			"%!FUNC! WdfTimerCreate failed with %!STATUS!", Status);
+		goto exit;
+	}
 
-		Status = WdfLookasideListCreate(
-			WDF_NO_OBJECT_ATTRIBUTES,
-			REPORT_BUFFER_SIZE,
-			NonPagedPoolNx,
-			WDF_NO_OBJECT_ATTRIBUTES,
-			PTP_LIST_POOL_TAG,
-			&pDeviceContext->HidReadBufferLookaside
-		);
+	pDeviceContext->SpiTrackpadIoTarget = WdfDeviceGetIoTarget(Device);
+	if (pDeviceContext->SpiTrackpadIoTarget == NULL) {
+		Status = STATUS_INVALID_DEVICE_STATE;
+		goto exit;
+	}
 
-		if (!NT_SUCCESS(Status)) {
-			TraceEvents(
-				TRACE_LEVEL_ERROR,
-				TRACE_DRIVER,
-				"%!FUNC! WdfLookasideListCreate failed with %!STATUS!",
-				Status
-			);
-			goto exit;
-		}
+	pDeviceContext->DeviceStatus = D3;
 
-		WDF_TIMER_CONFIG_INIT(&TimerConfig, AmtPtpPowerRecoveryTimerCallback);
-		TimerConfig.AutomaticSerialization = TRUE;
-		WDF_OBJECT_ATTRIBUTES_INIT(&TimerAttributes);
-		TimerAttributes.ParentObject = Device;
-		TimerAttributes.ExecutionLevel = WdfExecutionLevelPassive;
-		Status = WdfTimerCreate(&TimerConfig, &TimerAttributes, &pDeviceContext->PowerOnRecoveryTimer);
-		if (!NT_SUCCESS(Status)) {
-			TraceEvents(
-				TRACE_LEVEL_ERROR,
-				TRACE_DRIVER,
-				"%!FUNC! WdfTimerCreate failed with %!STATUS!",
-				Status
-			);
-			goto exit;
-		}
-
-		pDeviceContext->SpiTrackpadIoTarget = WdfDeviceGetIoTarget(Device);
-		if (pDeviceContext->SpiTrackpadIoTarget == NULL) 
-		{
-			Status = STATUS_INVALID_DEVICE_STATE;
-			goto exit;
-		}
-
-		pDeviceContext->DeviceStatus = D3;
-
-        Status = WdfDeviceCreateDeviceInterface(
-            Device,
-            &GUID_DEVINTERFACE_AmtPtpDeviceSpiKm,
-            NULL
-        );
-
-        if (NT_SUCCESS(Status)) 
-		{
-            Status = AmtPtpDeviceSpiKmQueueInitialize(Device);
-        }
-    }
+	Status = WdfDeviceCreateDeviceInterface(
+		Device,
+		&GUID_DEVINTERFACE_AmtPtpDeviceSpiKm,
+		NULL
+	);
+	if (NT_SUCCESS(Status)) {
+		Status = AmtPtpDeviceSpiKmQueueInitialize(Device);
+	}
 
 exit:
-	TraceEvents(
-		TRACE_LEVEL_INFORMATION,
-		TRACE_DRIVER,
-		"%!FUNC! Exit, Status = %!STATUS!",
-		Status
-	);
-
-    return Status;
+	TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DRIVER,
+		"%!FUNC! Exit, Status = %!STATUS!", Status);
+	return Status;
 }
 
 NTSTATUS
@@ -138,13 +124,10 @@ AmtPtpEvtDevicePrepareHardware(
 {
 	NTSTATUS Status = STATUS_SUCCESS;
 	PDEVICE_CONTEXT pDeviceContext;
-
 	WDF_MEMORY_DESCRIPTOR HidAttributeMemoryDescriptor;
 	HID_DEVICE_ATTRIBUTES DeviceAttributes;
-	
 	const SPI_TRACKPAD_INFO* pTrackpadInfo;
 	BOOLEAN DeviceFound = FALSE;
-
 	WDFKEY ParamRegistryKey;
 	DECLARE_CONST_UNICODE_STRING(DesiredReportTypeKey, L"DesiredReportType");
 	ULONG DesiredReportTypeValue, Length, ValueType = 0;
@@ -153,21 +136,11 @@ AmtPtpEvtDevicePrepareHardware(
 	UNREFERENCED_PARAMETER(ResourceList);
 	UNREFERENCED_PARAMETER(ResourceListTranslated);
 
-	TraceEvents(
-		TRACE_LEVEL_INFORMATION,
-		TRACE_DRIVER,
-		"%!FUNC! Entry"
-	);
+	TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DRIVER, "%!FUNC! Entry");
 
 	pDeviceContext = DeviceGetContext(Device);
-	if (pDeviceContext == NULL)
-	{
+	if (pDeviceContext == NULL) {
 		Status = STATUS_INVALID_DEVICE_STATE;
-		TraceEvents(
-			TRACE_LEVEL_INFORMATION,
-			TRACE_DRIVER,
-			"%!FUNC! pDeviceContext == NULL"
-		);
 		goto exit;
 	}
 
@@ -187,41 +160,32 @@ AmtPtpEvtDevicePrepareHardware(
 		NULL,
 		NULL
 	);
-
-	if (!NT_SUCCESS(Status))
-	{
-		KdPrintEx((
-			DPFLTR_IHVDRIVER_ID,
-			DPFLTR_INFO_LEVEL,
-			"WdfIoTargetSendInternalIoctlSynchronously failed, status = 0x%x \n",
-			Status
-		));
+	if (!NT_SUCCESS(Status)) {
+		KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+			"WdfIoTargetSendInternalIoctlSynchronously failed, status = 0x%x\n", Status));
 		goto exit;
 	}
 
-	pDeviceContext->HidVendorID = DeviceAttributes.VendorID;
-	pDeviceContext->HidProductID = DeviceAttributes.ProductID;
+	pDeviceContext->HidVendorID     = DeviceAttributes.VendorID;
+	pDeviceContext->HidProductID    = DeviceAttributes.ProductID;
 	pDeviceContext->HidVersionNumber = DeviceAttributes.VersionNumber;
 
-	for (pTrackpadInfo = SpiTrackpadConfigTable; pTrackpadInfo->VendorId; ++pTrackpadInfo)
-	{
+	for (pTrackpadInfo = SpiTrackpadConfigTable; pTrackpadInfo->VendorId; ++pTrackpadInfo) {
 		if (pTrackpadInfo->VendorId == DeviceAttributes.VendorID &&
 			pTrackpadInfo->ProductId == DeviceAttributes.ProductID)
 		{
 			pDeviceContext->TrackpadInfo.ProductId = pTrackpadInfo->ProductId;
-			pDeviceContext->TrackpadInfo.VendorId = pTrackpadInfo->VendorId;
-			pDeviceContext->TrackpadInfo.XMin = pTrackpadInfo->XMin;
-			pDeviceContext->TrackpadInfo.XMax = pTrackpadInfo->XMax;
-			pDeviceContext->TrackpadInfo.YMin = pTrackpadInfo->YMin;
-			pDeviceContext->TrackpadInfo.YMax = pTrackpadInfo->YMax;
-
+			pDeviceContext->TrackpadInfo.VendorId  = pTrackpadInfo->VendorId;
+			pDeviceContext->TrackpadInfo.XMin      = pTrackpadInfo->XMin;
+			pDeviceContext->TrackpadInfo.XMax      = pTrackpadInfo->XMax;
+			pDeviceContext->TrackpadInfo.YMin      = pTrackpadInfo->YMin;
+			pDeviceContext->TrackpadInfo.YMax      = pTrackpadInfo->YMax;
 			DeviceFound = TRUE;
 			break;
 		}
 	}
 
-	if (!DeviceFound)
-	{
+	if (!DeviceFound) {
 		Status = STATUS_NOT_FOUND;
 		goto exit;
 	}
@@ -232,9 +196,7 @@ AmtPtpEvtDevicePrepareHardware(
 		WDF_NO_OBJECT_ATTRIBUTES,
 		&ParamRegistryKey
 	);
-
-	if (NT_SUCCESS(Status))
-	{
+	if (NT_SUCCESS(Status)) {
 		Status = WdfRegistryQueryValue(
 			ParamRegistryKey,
 			&DesiredReportTypeKey,
@@ -243,36 +205,21 @@ AmtPtpEvtDevicePrepareHardware(
 			&Length,
 			&ValueType
 		);
-
-		if (NT_SUCCESS(Status))
-		{
-			switch (DesiredReportTypeValue)
-			{
-			case 0:
-				pDeviceContext->ReportType = PrecisionTouchpad;
-				break;
-			case 1:
-				pDeviceContext->ReportType = Touchscreen;
-				break;
-			default:
-				Status = STATUS_INVALID_PARAMETER;
-				break;
+		if (NT_SUCCESS(Status)) {
+			switch (DesiredReportTypeValue) {
+			case 0: pDeviceContext->ReportType = PrecisionTouchpad; break;
+			case 1: pDeviceContext->ReportType = Touchscreen;       break;
+			default: Status = STATUS_INVALID_PARAMETER;             break;
 			}
 		}
-
 		WdfRegistryClose(ParamRegistryKey);
 	}
 
 	Status = STATUS_SUCCESS;
 
 exit:
-	TraceEvents(
-		TRACE_LEVEL_INFORMATION,
-		TRACE_DRIVER,
-		"%!FUNC! Exit, Status = %!STATUS!",
-		Status
-	);
-
+	TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DRIVER,
+		"%!FUNC! Exit, Status = %!STATUS!", Status);
 	return Status;
 }
 
@@ -285,24 +232,16 @@ AmtPtpEvtDeviceD0Entry(
 	NTSTATUS Status = STATUS_SUCCESS;
 	PDEVICE_CONTEXT pDeviceContext;
 
-	TraceEvents(
-		TRACE_LEVEL_INFORMATION,
-		TRACE_DRIVER,
+	TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DRIVER,
 		"%!FUNC! -->AmtPtpDeviceEvtDeviceD0Entry - coming from %s",
-		DbgDevicePowerString(PreviousState)
-	);
+		DbgDevicePowerString(PreviousState));
 
 	pDeviceContext = DeviceGetContext(Device);
 	pDeviceContext->DeviceStatus = D0ActiveAndUnconfigured;
-
 	KeQueryPerformanceCounter(&pDeviceContext->LastReportTime);
 
-	TraceEvents(
-		TRACE_LEVEL_INFORMATION,
-		TRACE_DRIVER,
-		"%!FUNC! <-- AmtPtpDeviceEvtDeviceD0Entry"
-	);
-
+	TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DRIVER,
+		"%!FUNC! <-- AmtPtpDeviceEvtDeviceD0Entry");
 	return Status;
 }
 
@@ -316,22 +255,18 @@ AmtPtpEvtDeviceD0Exit(
 	PDEVICE_CONTEXT pDeviceContext;
 	WDFREQUEST OutstandingRequest;
 
-	TraceEvents(
-		TRACE_LEVEL_INFORMATION,
-		TRACE_DRIVER,
+	TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DRIVER,
 		"%!FUNC! -->AmtPtpDeviceEvtDeviceD0Exit - moving to %s",
-		DbgDevicePowerString(TargetState)
-	);
+		DbgDevicePowerString(TargetState));
 
 	pDeviceContext = DeviceGetContext(Device);
 	pDeviceContext->DeviceStatus = D3;
 
 	while (NT_SUCCESS(Status)) {
 		Status = WdfIoQueueRetrieveNextRequest(
-			pDeviceContext->HidQueue, 
+			pDeviceContext->HidQueue,
 			&OutstandingRequest
 		);
-
 		if (NT_SUCCESS(Status)) {
 			WdfRequestComplete(OutstandingRequest, STATUS_CANCELLED);
 		}
@@ -339,12 +274,8 @@ AmtPtpEvtDeviceD0Exit(
 
 	Status = STATUS_SUCCESS;
 
-	TraceEvents(
-		TRACE_LEVEL_INFORMATION,
-		TRACE_DRIVER,
-		"%!FUNC! <--AmtPtpDeviceEvtDeviceD0Exit"
-	);
-
+	TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DRIVER,
+		"%!FUNC! <--AmtPtpDeviceEvtDeviceD0Exit");
 	return Status;
 }
 
@@ -355,47 +286,47 @@ AmtPtpEvtDeviceSelfManagedIoInitOrRestart(
 {
 	NTSTATUS Status = STATUS_SUCCESS;
 	PDEVICE_CONTEXT pDeviceContext;
-	UINT8 k;
+	LARGE_INTEGER Freq;
 
 	TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DRIVER, "%!FUNC! Entry");
 	pDeviceContext = DeviceGetContext(Device);
-	
+
 	Status = AmtPtpSpiSetState(Device, TRUE);
-	if (!NT_SUCCESS(Status))
-	{
-		TraceEvents(TRACE_LEVEL_ERROR, TRACE_DRIVER, "%!FUNC! AmtPtpSpiSetState failed with %!STATUS!. Retry after 5 seconds", Status);
+	if (!NT_SUCCESS(Status)) {
+		TraceEvents(TRACE_LEVEL_ERROR, TRACE_DRIVER,
+			"%!FUNC! AmtPtpSpiSetState failed with %!STATUS!. Retry after 5 seconds", Status);
 		Status = STATUS_SUCCESS;
 		WdfTimerStart(pDeviceContext->PowerOnRecoveryTimer, WDF_REL_TIMEOUT_IN_SEC(5));
 		goto exit;
 	}
-	else
-	{
-		LARGE_INTEGER Freq;
 
-		pDeviceContext->LastReportTime = KeQueryPerformanceCounter(&Freq);
-		pDeviceContext->PerformanceFrequency = Freq.QuadPart;
+	pDeviceContext->LastReportTime = KeQueryPerformanceCounter(&Freq);
+	pDeviceContext->PerformanceFrequency = Freq.QuadPart;
 
-		pDeviceContext->XRange =
-			(USHORT)((SHORT)pDeviceContext->TrackpadInfo.XMax -
-			         (SHORT)pDeviceContext->TrackpadInfo.XMin);
-		pDeviceContext->YRange =
-			(USHORT)((SHORT)pDeviceContext->TrackpadInfo.YMax -
-			         (SHORT)pDeviceContext->TrackpadInfo.YMin);
+	pDeviceContext->XRange =
+		(USHORT)((SHORT)pDeviceContext->TrackpadInfo.XMax -
+		         (SHORT)pDeviceContext->TrackpadInfo.XMin);
+	pDeviceContext->YRange =
+		(USHORT)((SHORT)pDeviceContext->TrackpadInfo.YMax -
+		         (SHORT)pDeviceContext->TrackpadInfo.YMin);
 
-		pDeviceContext->DeviceStatus = D0ActiveAndConfigured;
+	pDeviceContext->DeviceStatus = D0ActiveAndConfigured;
 
-		// Init finger tracking
-		pDeviceContext->NextContactID = 0;
-		for (k = 0; k < PTP_MAX_CONTACT_POINTS; k++) {
-			pDeviceContext->PrevOriginalX[k] = 0x7FFF;
-			pDeviceContext->PrevOriginalY[k] = 0x7FFF;
-			pDeviceContext->SlotContactID[k] = 0xFF;
-		}
-	}
+	AmtPtpResetTrackingState(pDeviceContext);
 
 exit:
-	TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DRIVER, "%!FUNC! Exit, Status = %!STATUS!", Status);
+	TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DRIVER,
+		"%!FUNC! Exit, Status = %!STATUS!", Status);
 	return Status;
+}
+
+VOID
+AmtPtpNotifyKeyboardEvent(
+	_In_ WDFDEVICE Device
+)
+{
+	PDEVICE_CONTEXT pDeviceContext = DeviceGetContext(Device);
+	KeQuerySystemTime(&pDeviceContext->LastKeyboardEventTime);
 }
 
 PCHAR
@@ -403,26 +334,16 @@ DbgDevicePowerString(
 	_In_ WDF_POWER_DEVICE_STATE Type
 )
 {
-	switch (Type)
-	{
-	case WdfPowerDeviceInvalid:
-		return "WdfPowerDeviceInvalid";
-	case WdfPowerDeviceD0:
-		return "WdfPowerDeviceD0";
-	case WdfPowerDeviceD1:
-		return "WdfPowerDeviceD1";
-	case WdfPowerDeviceD2:
-		return "WdfPowerDeviceD2";
-	case WdfPowerDeviceD3:
-		return "WdfPowerDeviceD3";
-	case WdfPowerDeviceD3Final:
-		return "WdfPowerDeviceD3Final";
-	case WdfPowerDevicePrepareForHibernation:
-		return "WdfPowerDevicePrepareForHibernation";
-	case WdfPowerDeviceMaximum:
-		return "WdfPowerDeviceMaximum";
-	default:
-		return "UnKnown Device Power State";
+	switch (Type) {
+	case WdfPowerDeviceInvalid:              return "WdfPowerDeviceInvalid";
+	case WdfPowerDeviceD0:                   return "WdfPowerDeviceD0";
+	case WdfPowerDeviceD1:                   return "WdfPowerDeviceD1";
+	case WdfPowerDeviceD2:                   return "WdfPowerDeviceD2";
+	case WdfPowerDeviceD3:                   return "WdfPowerDeviceD3";
+	case WdfPowerDeviceD3Final:              return "WdfPowerDeviceD3Final";
+	case WdfPowerDevicePrepareForHibernation: return "WdfPowerDevicePrepareForHibernation";
+	case WdfPowerDeviceMaximum:              return "WdfPowerDeviceMaximum";
+	default:                                 return "UnKnown Device Power State";
 	}
 }
 
@@ -440,14 +361,10 @@ AmtPtpSpiSetState(
 	PSPI_SET_FEATURE pSpiSetStatus;
 
 	pDeviceContext = DeviceGetContext(Device);
-	if (pDeviceContext == NULL)
-	{
+	if (pDeviceContext == NULL) {
 		Status = STATUS_INVALID_DEVICE_STATE;
-		TraceEvents(
-			TRACE_LEVEL_INFORMATION,
-			TRACE_DRIVER,
-			"%!FUNC! pDeviceContext == NULL"
-		);
+		TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DRIVER,
+			"%!FUNC! pDeviceContext == NULL");
 		goto exit;
 	}
 
@@ -459,13 +376,12 @@ AmtPtpSpiSetState(
 		HID_XFER_PACKET_SIZE
 	);
 
-	pHidPacket->reportId = HID_REPORTID_MOUSE;
+	pHidPacket->reportId        = HID_REPORTID_MOUSE;
 	pHidPacket->reportBufferLen = sizeof(SPI_SET_FEATURE);
-	pHidPacket->reportBuffer = (PUCHAR) pHidPacket + sizeof(HID_XFER_PACKET);
+	pHidPacket->reportBuffer    = (PUCHAR) pHidPacket + sizeof(HID_XFER_PACKET);
 	pSpiSetStatus = (PSPI_SET_FEATURE) pHidPacket->reportBuffer;
-
 	pSpiSetStatus->BusLocation = 2;
-	pSpiSetStatus->Status = DesiredState ? 1 : 0;
+	pSpiSetStatus->Status      = DesiredState ? 1 : 0;
 
 	Status = WdfIoTargetSendInternalIoctlSynchronously(
 		pDeviceContext->SpiTrackpadIoTarget,
@@ -477,33 +393,17 @@ AmtPtpSpiSetState(
 		NULL
 	);
 
-	if (!NT_SUCCESS(Status))
-	{
-		TraceEvents(
-			TRACE_LEVEL_ERROR,
-			TRACE_DRIVER,
-			"%!FUNC! WdfIoTargetSendIoctlSynchronously failed with %!STATUS!",
-			Status
-		);
-	}
-	else
-	{
-		TraceEvents(
-			TRACE_LEVEL_INFORMATION,
-			TRACE_DRIVER,
-			"%!FUNC! Changed trackpad status to %d",
-			DesiredState
-		);
+	if (!NT_SUCCESS(Status)) {
+		TraceEvents(TRACE_LEVEL_ERROR, TRACE_DRIVER,
+			"%!FUNC! WdfIoTargetSendIoctlSynchronously failed with %!STATUS!", Status);
+	} else {
+		TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DRIVER,
+			"%!FUNC! Changed trackpad status to %d", DesiredState);
 	}
 
 exit:
-	TraceEvents(
-		TRACE_LEVEL_INFORMATION,
-		TRACE_DRIVER,
-		"%!FUNC! Exit, Status = %!STATUS!",
-		Status
-	);
-
+	TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DRIVER,
+		"%!FUNC! Exit, Status = %!STATUS!", Status);
 	return Status;
 }
 
@@ -514,26 +414,18 @@ void AmtPtpPowerRecoveryTimerCallback(
 	WDFDEVICE Device;
 	PDEVICE_CONTEXT pDeviceContext;
 	NTSTATUS Status = STATUS_SUCCESS;
-	UINT8 k;
 
 	TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DRIVER, "%!FUNC! Entry");
 	Device = WdfTimerGetParentObject(Timer);
 	pDeviceContext = DeviceGetContext(Device);
 
 	Status = AmtPtpSpiSetState(Device, TRUE);
-	if (NT_SUCCESS(Status))
-	{
+	if (NT_SUCCESS(Status)) {
 		AmtPtpSpiInputIssueRequest(Device);
 		pDeviceContext->DeviceStatus = D0ActiveAndConfigured;
-
-		// Re-init finger tracking after power recovery
-		pDeviceContext->NextContactID = 0;
-		for (k = 0; k < PTP_MAX_CONTACT_POINTS; k++) {
-			pDeviceContext->PrevOriginalX[k] = 0x7FFF;
-			pDeviceContext->PrevOriginalY[k] = 0x7FFF;
-			pDeviceContext->SlotContactID[k] = 0xFF;
-		}
+		AmtPtpResetTrackingState(pDeviceContext);
 	}
 
-	TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DRIVER, "%!FUNC! Exit, Status = %!STATUS!", Status);
+	TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DRIVER,
+		"%!FUNC! Exit, Status = %!STATUS!", Status);
 }
