@@ -7,6 +7,11 @@ Environment:
     Kernel-mode Driver Framework
 --*/
 #include "public.h"
+
+#ifndef PTP_MAX_CONTACT_POINTS
+#define PTP_MAX_CONTACT_POINTS 5
+#endif
+
 EXTERN_C_START
 typedef struct _SPI_TRACKPAD_INFO {
 	USHORT VendorId;
