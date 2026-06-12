@@ -94,10 +94,6 @@ AmtPtpDeviceSpiKmCreateDevice(
 		goto exit;
 	}
 
-	// Pre-allocate the SPI read request and output memory once.
-	// These are reused every frame via WdfRequestReuse, eliminating
-	// per-frame kernel object alloc/free (~125Hz hot path).
-	// ParentObject = Device so they are freed automatically on device removal.
 	WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&RequestAttributes, WORKER_REQUEST_CONTEXT);
 	RequestAttributes.ParentObject = Device;
 	Status = WdfRequestCreate(
@@ -121,8 +117,6 @@ AmtPtpDeviceSpiKmCreateDevice(
 		goto exit;
 	}
 
-	// Wire up the worker context for the pre-allocated request.
-	// DeviceContext pointer never changes; RequestMemory is fixed too.
 	{
 		PWORKER_REQUEST_CONTEXT pCtx =
 			WorkerRequestGetContext(pDeviceContext->SpiHidReadRequest);
@@ -130,10 +124,6 @@ AmtPtpDeviceSpiKmCreateDevice(
 		pCtx->RequestMemory  = pDeviceContext->SpiHidReadOutputMemory;
 	}
 
-	// Format the pre-allocated request once.
-	// WdfRequestReuse with WDF_REQUEST_REUSE_NO_FLAGS preserves the
-	// format, so WdfIoTargetFormatRequestForInternalIoctl only needs
-	// to run here — not on every frame.
 	Status = WdfIoTargetFormatRequestForInternalIoctl(
 		pDeviceContext->SpiTrackpadIoTarget,
 		pDeviceContext->SpiHidReadRequest,
@@ -147,7 +137,6 @@ AmtPtpDeviceSpiKmCreateDevice(
 		goto exit;
 	}
 
-	// Set completion routine once — also survives WdfRequestReuse.
 	WdfRequestSetCompletionRoutine(
 		pDeviceContext->SpiHidReadRequest,
 		AmtPtpRequestCompletionRoutine,
@@ -294,11 +283,10 @@ AmtPtpEvtDeviceD0Entry(
 
 	pDeviceContext = DeviceGetContext(Device);
 	pDeviceContext->DeviceStatus = D0ActiveAndUnconfigured;
-	{
-		ULONGLONG QpcBias;
-		pDeviceContext->LastReportTime.QuadPart =
-			(LONGLONG)KeQueryInterruptTimeToPrecise(&QpcBias);
-	}
+
+	// KeQueryInterruptTime returns 100ns units since boot,
+	// identical semantics to KeQueryInterruptTimeToPrecise for ScanTime purposes.
+	pDeviceContext->LastReportTime.QuadPart = (LONGLONG)KeQueryInterruptTime();
 
 	TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DRIVER,
 		"%!FUNC! <-- AmtPtpDeviceEvtDeviceD0Entry");
@@ -359,11 +347,9 @@ AmtPtpEvtDeviceSelfManagedIoInitOrRestart(
 		goto exit;
 	}
 
-	{
-		ULONGLONG QpcBias;
-		pDeviceContext->LastReportTime.QuadPart =
-			(LONGLONG)KeQueryInterruptTimeToPrecise(&QpcBias);
-	}
+	// KeQueryInterruptTime returns 100ns units since boot,
+	// identical semantics to KeQueryInterruptTimeToPrecise for ScanTime purposes.
+	pDeviceContext->LastReportTime.QuadPart = (LONGLONG)KeQueryInterruptTime();
 
 	pDeviceContext->XRange =
 		(USHORT)((SHORT)pDeviceContext->TrackpadInfo.XMax -
