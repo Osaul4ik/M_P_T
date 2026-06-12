@@ -43,10 +43,8 @@ AmtPtpDeviceSpiKmCreateDevice(
 		"%!FUNC! Entry"
 	);
 
-	// Initialize Power Callback
 	WDF_PNPPOWER_EVENT_CALLBACKS_INIT(&pnpPowerCallbacks);
 
-	// Initialize PNP power event callbacks
 	pnpPowerCallbacks.EvtDevicePrepareHardware = AmtPtpEvtDevicePrepareHardware;
 	pnpPowerCallbacks.EvtDeviceD0Entry = AmtPtpEvtDeviceD0Entry;
 	pnpPowerCallbacks.EvtDeviceD0Exit = AmtPtpEvtDeviceD0Exit;
@@ -54,7 +52,6 @@ AmtPtpDeviceSpiKmCreateDevice(
 	pnpPowerCallbacks.EvtDeviceSelfManagedIoRestart = AmtPtpEvtDeviceSelfManagedIoInitOrRestart;
 	WdfDeviceInitSetPnpPowerEventCallbacks(DeviceInit, &pnpPowerCallbacks);
 
-	// Create WDF device object
     WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&DeviceAttributes, DEVICE_CONTEXT);
 
     Status = WdfDeviceCreate(&DeviceInit, &DeviceAttributes, &Device);
@@ -358,6 +355,7 @@ AmtPtpEvtDeviceSelfManagedIoInitOrRestart(
 {
 	NTSTATUS Status = STATUS_SUCCESS;
 	PDEVICE_CONTEXT pDeviceContext;
+	UINT8 k;
 
 	TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DRIVER, "%!FUNC! Entry");
 	pDeviceContext = DeviceGetContext(Device);
@@ -385,6 +383,14 @@ AmtPtpEvtDeviceSelfManagedIoInitOrRestart(
 			         (SHORT)pDeviceContext->TrackpadInfo.YMin);
 
 		pDeviceContext->DeviceStatus = D0ActiveAndConfigured;
+
+		// Init finger tracking
+		pDeviceContext->NextContactID = 0;
+		for (k = 0; k < PTP_MAX_CONTACT_POINTS; k++) {
+			pDeviceContext->PrevOriginalX[k] = 0x7FFF;
+			pDeviceContext->PrevOriginalY[k] = 0x7FFF;
+			pDeviceContext->SlotContactID[k] = 0xFF;
+		}
 	}
 
 exit:
@@ -508,6 +514,7 @@ void AmtPtpPowerRecoveryTimerCallback(
 	WDFDEVICE Device;
 	PDEVICE_CONTEXT pDeviceContext;
 	NTSTATUS Status = STATUS_SUCCESS;
+	UINT8 k;
 
 	TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DRIVER, "%!FUNC! Entry");
 	Device = WdfTimerGetParentObject(Timer);
@@ -518,6 +525,14 @@ void AmtPtpPowerRecoveryTimerCallback(
 	{
 		AmtPtpSpiInputIssueRequest(Device);
 		pDeviceContext->DeviceStatus = D0ActiveAndConfigured;
+
+		// Re-init finger tracking after power recovery
+		pDeviceContext->NextContactID = 0;
+		for (k = 0; k < PTP_MAX_CONTACT_POINTS; k++) {
+			pDeviceContext->PrevOriginalX[k] = 0x7FFF;
+			pDeviceContext->PrevOriginalY[k] = 0x7FFF;
+			pDeviceContext->SlotContactID[k] = 0xFF;
+		}
 	}
 
 	TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DRIVER, "%!FUNC! Exit, Status = %!STATUS!", Status);
