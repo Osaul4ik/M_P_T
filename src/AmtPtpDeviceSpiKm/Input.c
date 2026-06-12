@@ -101,7 +101,6 @@ AmtPtpRequestCompletionRoutine(
 	BOOLEAN IsPalm;
 
 	UNREFERENCED_PARAMETER(Target);
-	UNREFERENCED_PARAMETER(SpiRequest);
 
 	RequestContext = (PWORKER_REQUEST_CONTEXT) Context;
 	pDeviceContext = RequestContext->DeviceContext;
@@ -337,10 +336,16 @@ AmtPtpRequestCompletionRoutine(
 	// CurrentReportedMask already excludes lift entries by construction
 	// (lift bits are in DroppedMask which is the complement of CurrentReportedMask).
 	{
-		UINT8 LiftCount = (UINT8)__popcnt(
-			pDeviceContext->PrevReportedMask & ~CurrentReportedMask);
-		pDeviceContext->PrevReportedCount =
-			(ReportedCount > LiftCount) ? (ReportedCount - LiftCount) : 0;
+		// Portable bit-count: __popcnt() is x86-only and unavailable on ARM64.
+		// Kernighan loop: each iteration clears the lowest set bit.
+		{
+			UINT8 LiftMask = pDeviceContext->PrevReportedMask & ~CurrentReportedMask;
+			UINT8 LiftCount = 0;
+			UINT8 m = LiftMask;
+			while (m) { LiftCount++; m &= (UINT8)(m - 1); }
+			pDeviceContext->PrevReportedCount =
+				(ReportedCount > LiftCount) ? (ReportedCount - LiftCount) : 0;
+		}
 	}
 	pDeviceContext->PrevReportedMask = CurrentReportedMask;
 
