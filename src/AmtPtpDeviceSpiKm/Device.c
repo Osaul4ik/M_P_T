@@ -20,15 +20,10 @@ AmtPtpResetTrackingState(
 )
 {
 	UINT8 k;
-	pDeviceContext->NextContactID    = 0;
 	pDeviceContext->PrevAdjustedCount = 0;
 	for (k = 0; k < PTP_MAX_CONTACT_POINTS; k++) {
-		pDeviceContext->PrevOriginalX[k] = 0x7FFF;
-		pDeviceContext->PrevOriginalY[k] = 0x7FFF;
-		pDeviceContext->SlotContactID[k] = 0xFF;
-		pDeviceContext->SlotIsPalm[k]    = FALSE;
+		pDeviceContext->SlotIsPalm[k] = FALSE;
 	}
-	pDeviceContext->LastKeyboardEventTime.QuadPart = 0;
 }
 
 NTSTATUS
@@ -320,14 +315,6 @@ exit:
 	return Status;
 }
 
-VOID
-AmtPtpNotifyKeyboardEvent(
-	_In_ WDFDEVICE Device
-)
-{
-	PDEVICE_CONTEXT pDeviceContext = DeviceGetContext(Device);
-	KeQuerySystemTime(&pDeviceContext->LastKeyboardEventTime);
-}
 
 PCHAR
 DbgDevicePowerString(
