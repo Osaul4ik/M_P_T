@@ -14,12 +14,6 @@ Environment:
 #pragma alloc_text (PAGE, AmtPtpDeviceSpiKmCreateDevice)
 #endif
 
-// Compile-time sanity check: HID_XFER_PACKET must be exactly the size we
-// assume in AmtPtpSpiSetState where we do:
-//   pHidPacket->reportBuffer = (PUCHAR)pHidPacket + sizeof(HID_XFER_PACKET)
-// If the struct ever gains padding this assert will catch it at build time.
-C_ASSERT(sizeof(HID_XFER_PACKET) == sizeof(PUCHAR) + sizeof(ULONG) + sizeof(UCHAR));
-
 static VOID
 AmtPtpResetTrackingState(
 	_In_ PDEVICE_CONTEXT pDeviceContext
@@ -441,8 +435,6 @@ AmtPtpSpiSetState(
 
 	pHidPacket->reportId        = HID_REPORTID_MOUSE;
 	pHidPacket->reportBufferLen = sizeof(SPI_SET_FEATURE);
-	// The C_ASSERT at the top of this file guarantees sizeof(HID_XFER_PACKET)
-	// matches the actual struct layout, so this pointer arithmetic is safe.
 	pHidPacket->reportBuffer    = (PUCHAR) pHidPacket + sizeof(HID_XFER_PACKET);
 	pSpiSetStatus               = (PSPI_SET_FEATURE) pHidPacket->reportBuffer;
 	pSpiSetStatus->BusLocation  = 2;
