@@ -14,6 +14,12 @@ Environment:
 #pragma alloc_text (PAGE, AmtPtpDeviceSpiKmCreateDevice)
 #endif
 
+// Compile-time sanity check: HID_XFER_PACKET must be exactly the size we
+// assume in AmtPtpSpiSetState where we do:
+//   pHidPacket->reportBuffer = (PUCHAR)pHidPacket + sizeof(HID_XFER_PACKET)
+// If the struct ever gains padding this assert will catch it at build time.
+C_ASSERT(sizeof(HID_XFER_PACKET) == sizeof(PUCHAR) + sizeof(ULONG) + sizeof(UCHAR));
+
 static VOID
 AmtPtpResetTrackingState(
 	_In_ PDEVICE_CONTEXT pDeviceContext
@@ -21,6 +27,8 @@ AmtPtpResetTrackingState(
 {
 	UINT8 k;
 	pDeviceContext->PrevAdjustedCount = 0;
+	pDeviceContext->PrevReportedCount = 0;
+	pDeviceContext->PrevReportedMask  = 0;
 	for (k = 0; k < PTP_MAX_CONTACT_POINTS; k++) {
 		pDeviceContext->SlotIsPalm[k] = FALSE;
 	}
@@ -143,7 +151,9 @@ AmtPtpDeviceSpiKmCreateDevice(
 		WorkerRequestGetContext(pDeviceContext->SpiHidReadRequest)
 	);
 
-	pDeviceContext->DeviceStatus = D3;
+	// FIX (sync): use macro wrapper so the store is an interlocked operation,
+	// visible to the completion routine running at DISPATCH_LEVEL.
+	DEVICE_STATUS_WRITE(pDeviceContext, D3);
 
 	Status = WdfDeviceCreateDeviceInterface(
 		Device,
@@ -175,7 +185,10 @@ AmtPtpEvtDevicePrepareHardware(
 	BOOLEAN DeviceFound = FALSE;
 	WDFKEY ParamRegistryKey;
 	DECLARE_CONST_UNICODE_STRING(DesiredReportTypeKey, L"DesiredReportType");
-	ULONG DesiredReportTypeValue, Length, ValueType = 0;
+	// FIX: initialize to 0 (PrecisionTouchpad) so the variable is never
+	// indeterminate if WdfRegistryQueryValue partially succeeds but returns
+	// an error before writing the output — eliminates PREFAST C6001 warning.
+	ULONG DesiredReportTypeValue = 0, Length, ValueType = 0;
 
 	PAGED_CODE();
 	UNREFERENCED_PARAMETER(ResourceList);
@@ -282,11 +295,16 @@ AmtPtpEvtDeviceD0Entry(
 		DbgDevicePowerString(PreviousState));
 
 	pDeviceContext = DeviceGetContext(Device);
-	pDeviceContext->DeviceStatus = D0ActiveAndUnconfigured;
 
-	// KeQueryInterruptTime returns 100ns units since boot,
-	// identical semantics to KeQueryInterruptTimeToPrecise for ScanTime purposes.
-	pDeviceContext->LastReportTime.QuadPart = (LONGLONG)KeQueryInterruptTime();
+	// FIX (sync): interlocked write — visible to completion routine at DISPATCH_LEVEL.
+	DEVICE_STATUS_WRITE(pDeviceContext, D0ActiveAndUnconfigured);
+
+	// FIX (sync): KeQueryInterruptTime returns ULONGLONG; store directly into
+	// ULONGLONG field to avoid the signed/unsigned cast hazard of the old
+	// LARGE_INTEGER.QuadPart approach.  KeMemoryBarrier() ensures the compiler
+	// does not reorder this store past the DeviceStatus write above.
+	KeMemoryBarrier();
+	pDeviceContext->LastReportTime = KeQueryInterruptTime();
 
 	TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DRIVER,
 		"%!FUNC! <-- AmtPtpDeviceEvtDeviceD0Entry");
@@ -308,7 +326,12 @@ AmtPtpEvtDeviceD0Exit(
 		DbgDevicePowerString(TargetState));
 
 	pDeviceContext = DeviceGetContext(Device);
-	pDeviceContext->DeviceStatus = D3;
+
+	// FIX (sync): write D3 atomically BEFORE draining the queue so the
+	// completion routine's cleanup branch cannot re-issue AmtPtpSpiInputIssueRequest
+	// while we are tearing down.  InterlockedExchange provides a full memory
+	// barrier — the drain loop below is guaranteed to see D3 on all processors.
+	DEVICE_STATUS_WRITE(pDeviceContext, D3);
 
 	while (NT_SUCCESS(Status)) {
 		Status = WdfIoQueueRetrieveNextRequest(
@@ -347,9 +370,10 @@ AmtPtpEvtDeviceSelfManagedIoInitOrRestart(
 		goto exit;
 	}
 
-	// KeQueryInterruptTime returns 100ns units since boot,
-	// identical semantics to KeQueryInterruptTimeToPrecise for ScanTime purposes.
-	pDeviceContext->LastReportTime.QuadPart = (LONGLONG)KeQueryInterruptTime();
+	// FIX (sync): barrier before LastReportTime write so it is not reordered
+	// before the DeviceStatus store that follows.
+	KeMemoryBarrier();
+	pDeviceContext->LastReportTime = KeQueryInterruptTime();
 
 	pDeviceContext->XRange =
 		(USHORT)((SHORT)pDeviceContext->TrackpadInfo.XMax -
@@ -358,7 +382,8 @@ AmtPtpEvtDeviceSelfManagedIoInitOrRestart(
 		(USHORT)((SHORT)pDeviceContext->TrackpadInfo.YMax -
 		         (SHORT)pDeviceContext->TrackpadInfo.YMin);
 
-	pDeviceContext->DeviceStatus = D0ActiveAndConfigured;
+	// FIX (sync): interlocked write.
+	DEVICE_STATUS_WRITE(pDeviceContext, D0ActiveAndConfigured);
 	AmtPtpResetTrackingState(pDeviceContext);
 
 exit:
@@ -416,6 +441,8 @@ AmtPtpSpiSetState(
 
 	pHidPacket->reportId        = HID_REPORTID_MOUSE;
 	pHidPacket->reportBufferLen = sizeof(SPI_SET_FEATURE);
+	// The C_ASSERT at the top of this file guarantees sizeof(HID_XFER_PACKET)
+	// matches the actual struct layout, so this pointer arithmetic is safe.
 	pHidPacket->reportBuffer    = (PUCHAR) pHidPacket + sizeof(HID_XFER_PACKET);
 	pSpiSetStatus               = (PSPI_SET_FEATURE) pHidPacket->reportBuffer;
 	pSpiSetStatus->BusLocation  = 2;
@@ -457,13 +484,59 @@ void AmtPtpPowerRecoveryTimerCallback(
 	Device = WdfTimerGetParentObject(Timer);
 	pDeviceContext = DeviceGetContext(Device);
 
+	// FIX (lifetime): guard against racing with D0Exit — if we lost the race
+	// and DeviceStatus is already D3, do not touch the IO target.
+	// DEVICE_STATUS_READ uses InterlockedCompareExchange for a safe read.
+	if (DEVICE_STATUS_READ(pDeviceContext) == D3) {
+		TraceEvents(TRACE_LEVEL_WARNING, TRACE_DRIVER,
+			"%!FUNC! Device already in D3, skipping recovery");
+		return;
+	}
+
 	Status = AmtPtpSpiSetState(Device, TRUE);
 	if (NT_SUCCESS(Status)) {
 		AmtPtpSpiInputIssueRequest(Device);
-		pDeviceContext->DeviceStatus = D0ActiveAndConfigured;
+		// FIX (sync): interlocked write.
+		DEVICE_STATUS_WRITE(pDeviceContext, D0ActiveAndConfigured);
 		AmtPtpResetTrackingState(pDeviceContext);
 	}
 
 	TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DRIVER,
 		"%!FUNC! Exit, Status = %!STATUS!", Status);
+}
+
+// FIX (power): EvtIoStop is required on HidQueue so KMDF can drain it during
+// power transitions (S3/S4) and surprise removal.  Without it the framework
+// cannot guarantee all requests are complete before the device powers down,
+// which causes DRIVER_POWER_STATE_FAILURE (Bug Check 0x9F) on some systems.
+//
+// Policy:
+//   Suspend (WdfRequestStopActionSuspend): acknowledge without re-queuing so
+//     the framework can power down; the request will be re-issued when the
+//     device returns to D0 via SelfManagedIoRestart.
+//   Purge  (WdfRequestStopActionPurge):   cancel immediately — device is
+//     being removed and the request will never be serviced again.
+VOID
+AmtPtpEvtIoStop(
+	_In_ WDFQUEUE   Queue,
+	_In_ WDFREQUEST Request,
+	_In_ ULONG      ActionFlags
+)
+{
+	UNREFERENCED_PARAMETER(Queue);
+
+	TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DRIVER,
+		"%!FUNC! Entry, ActionFlags = 0x%lx", ActionFlags);
+
+	if (ActionFlags & WdfRequestStopActionSuspend) {
+		// Power transition: acknowledge so the framework can proceed with
+		// power-down.  SelfManagedIoRestart will re-queue the request when
+		// the device comes back to D0.
+		WdfRequestStopAcknowledge(Request, FALSE /* re-queue: no */);
+	} else if (ActionFlags & WdfRequestStopActionPurge) {
+		// Device is being removed — cancel the request immediately.
+		WdfRequestComplete(Request, STATUS_CANCELLED);
+	}
+
+	TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DRIVER, "%!FUNC! Exit");
 }
