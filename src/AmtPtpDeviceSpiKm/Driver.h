@@ -20,7 +20,7 @@ Environment:
 #include <ntddk.h>
 #include <wdf.h>
 #include <initguid.h>
-#include <hidport.h>
+#include <hidclass.h>
 
 #include "device.h"
 #include "queue.h"
