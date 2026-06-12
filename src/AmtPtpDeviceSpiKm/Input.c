@@ -68,8 +68,8 @@ AmtPtpSpiInputIssueRequest(
 	}
 
 	RequestContext = WorkerRequestGetContext(SpiHidReadRequest);
-	RequestContext->DeviceContext  = pDeviceContext;
-	RequestContext->RequestMemory  = SpiHidReadOutputMemory;
+	RequestContext->DeviceContext = pDeviceContext;
+	RequestContext->RequestMemory = SpiHidReadOutputMemory;
 
 	Status = WdfIoTargetFormatRequestForInternalIoctl(
 		pDeviceContext->SpiTrackpadIoTarget,
@@ -105,40 +105,17 @@ AmtPtpSpiInputIssueRequest(
 	}
 }
 
-// Palm detection thresholds.
-// A contact is a palm when BOTH axes exceed the threshold simultaneously.
-// TouchMajor/TouchMinor units ~= 0.01mm for T2 MacBook trackpads.
-// 3500 ~= 35mm: a fingertip at angle may exceed 35mm on Major but not Minor.
-// 3500 on both axes simultaneously means a flat palm.
+// Palm rejection thresholds (Apple SPI raw units, ~0.01mm each).
+// A palm has both axes large simultaneously.
+// A finger resting at an angle: large Major, small Minor — must NOT be rejected.
 #define PALM_MAJOR_THRESHOLD 3500
 #define PALM_MINOR_THRESHOLD 3500
 
-// Once a slot is marked as palm, keep it suppressed until lift-off
-// (sticky palm: avoids flicker when palm briefly dips below threshold).
-static BOOLEAN
-IsPalmContact(
-	_In_ PDEVICE_CONTEXT pDeviceContext,
-	_In_ UINT8 SlotIndex,
-	_In_ SHORT TouchMajor,
-	_In_ SHORT TouchMinor
-)
-{
-	BOOLEAN IsPalm;
-
-	// Sticky: once flagged as palm, stays palm until lift-off.
-	if (pDeviceContext->SlotIsPalm[SlotIndex]) {
-		return TRUE;
-	}
-
-	IsPalm = (TouchMajor >= PALM_MAJOR_THRESHOLD &&
-	           TouchMinor >= PALM_MINOR_THRESHOLD);
-
-	if (IsPalm) {
-		pDeviceContext->SlotIsPalm[SlotIndex] = TRUE;
-	}
-
-	return IsPalm;
-}
+// ScanTime cap for the first frame of a new touch sequence (100us units).
+// 80 = 8ms, a typical 125Hz interval. Avoids sending ScanTime=0, which
+// Windows treats as zero elapsed time => infinite initial velocity =>
+// the first gesture frame appears instantaneous to the gesture engine.
+#define FIRST_FRAME_SCANTIME_CAP 80
 
 VOID
 AmtPtpRequestCompletionRoutine(
@@ -161,26 +138,23 @@ AmtPtpRequestCompletionRoutine(
 	WDFMEMORY PtpRequestMemory;
 
 	LARGE_INTEGER CurrentCounter;
-	LARGE_INTEGER CurrentSystemTime;
 	LONGLONG CounterDelta;
-	LONGLONG KeyboardSuppressDelta;
 	UINT8 AdjustedCount;
 	UINT8 ReportedCount;
 	UINT8 Count;
+	UINT8 i;
 	SHORT RawX;
 	SHORT RawY;
 	LONG NormX;
 	LONG NormY;
-
-	BOOLEAN Matched[PTP_MAX_CONTACT_POINTS];
-	BOOLEAN UsedSlot[PTP_MAX_CONTACT_POINTS];
-	UINT8 i, j;
+	BOOLEAN IsPalm;
 
 	UNREFERENCED_PARAMETER(Target);
 
 	RequestContext = (PWORKER_REQUEST_CONTEXT) Context;
 	pDeviceContext = RequestContext->DeviceContext;
 
+	// Retrieve the pending PTP request before doing any work.
 	Status = WdfIoQueueRetrieveNextRequest(pDeviceContext->HidQueue, &PtpRequest);
 	if (!NT_SUCCESS(Status)) {
 		TraceEvents(TRACE_LEVEL_ERROR, TRACE_DRIVER,
@@ -188,6 +162,8 @@ AmtPtpRequestCompletionRoutine(
 		goto cleanup;
 	}
 
+	// If Windows switched to mouse mode or disabled surface reports,
+	// complete with an empty report immediately.
 	if (!pDeviceContext->PtpInputOn || !pDeviceContext->PtpReportTouch) {
 		RtlZeroMemory(&PtpReport, sizeof(PTP_REPORT));
 		PtpReport.ReportID = REPORTID_MULTITOUCH;
@@ -199,30 +175,11 @@ AmtPtpRequestCompletionRoutine(
 		goto exit;
 	}
 
-	// Keyboard suppression: drop all touch input for 1 second after keystroke.
-	// This prevents accidental cursor movement or gesture triggering while typing.
-	if (pDeviceContext->LastKeyboardEventTime.QuadPart > 0) {
-		KeQuerySystemTime(&CurrentSystemTime);
-		KeyboardSuppressDelta =
-			CurrentSystemTime.QuadPart -
-			pDeviceContext->LastKeyboardEventTime.QuadPart;
-		if (KeyboardSuppressDelta < KEYBOARD_SUPPRESSION_INTERVAL) {
-			// Still within suppression window — send empty report.
-			RtlZeroMemory(&PtpReport, sizeof(PTP_REPORT));
-			PtpReport.ReportID = REPORTID_MULTITOUCH;
-			Status = WdfRequestRetrieveOutputMemory(PtpRequest, &PtpRequestMemory);
-			if (NT_SUCCESS(Status)) {
-				WdfMemoryCopyFromBuffer(PtpRequestMemory, 0, &PtpReport, sizeof(PTP_REPORT));
-				WdfRequestSetInformation(PtpRequest, sizeof(PTP_REPORT));
-			}
-			goto exit;
-		}
-	}
-
 	SpiRequestLength = (LONG) WdfRequestGetInformation(SpiRequest);
 	pSpiTrackpadPacket = (PSPI_TRACKPAD_PACKET) WdfMemoryGetBuffer(
 		Params->Parameters.Ioctl.Output.Buffer, NULL);
 
+	// Validate header presence.
 	if (SpiRequestLength < 46) {
 		TraceEvents(TRACE_LEVEL_ERROR, TRACE_DRIVER,
 			"%!FUNC! Packet too short for header: %d < 46", SpiRequestLength);
@@ -230,18 +187,21 @@ AmtPtpRequestCompletionRoutine(
 		goto exit;
 	}
 
+	// Validate that the packet holds all claimed finger records.
+	// Without this, reading Fingers[N] when the packet only has M < N
+	// fingers is an out-of-bounds read.
 	MinPacketLength = 46 + (LONG)pSpiTrackpadPacket->NumOfFingers *
 	                       (LONG)sizeof(SPI_TRACKPAD_FINGER);
 	if (SpiRequestLength < MinPacketLength) {
 		TraceEvents(TRACE_LEVEL_ERROR, TRACE_DRIVER,
 			"%!FUNC! Packet truncated: %d < %d (%d fingers claimed)",
-			SpiRequestLength, MinPacketLength,
-			pSpiTrackpadPacket->NumOfFingers);
+			SpiRequestLength, MinPacketLength, pSpiTrackpadPacket->NumOfFingers);
 		Status = STATUS_DEVICE_DATA_ERROR;
 		goto exit;
 	}
 
 	// Compute ScanTime (100us units per HID PTP spec).
+	// PerformanceFrequency is a hardware constant cached at D0Entry.
 	CurrentCounter = KeQueryPerformanceCounter(NULL);
 	if (pDeviceContext->PerformanceFrequency > 0) {
 		CounterDelta =
@@ -256,111 +216,117 @@ AmtPtpRequestCompletionRoutine(
 	}
 	pDeviceContext->LastReportTime.QuadPart = CurrentCounter.QuadPart;
 
+	// Zero the entire report. PTP_REPORT is a stack variable; unused contact
+	// slots must not contain garbage that Windows could interpret as phantom fingers.
 	RtlZeroMemory(&PtpReport, sizeof(PTP_REPORT));
 
 	AdjustedCount = (pSpiTrackpadPacket->NumOfFingers > PTP_MAX_CONTACT_POINTS)
 		? PTP_MAX_CONTACT_POINTS
 		: pSpiTrackpadPacket->NumOfFingers;
 
-	// Zero ScanTime delta on first frame of a new touch sequence.
-	// Without this, the first frame after a pause has a huge delta,
-	// making Windows think the gesture started slowly → weak inertia.
+	// FIX: ScanTime on first contact frame.
+	//
+	// On the first frame of a new touch (PrevAdjustedCount == 0 && AdjustedCount > 0),
+	// CounterDelta reflects the idle time since the last report — potentially seconds.
+	// ScanTime = 0 is also bad: Windows treats it as zero elapsed time, making the
+	// gesture engine think infinite velocity on the first movement.
+	// Cap at FIRST_FRAME_SCANTIME_CAP (8ms) for a realistic first-frame delta.
 	if (pDeviceContext->PrevAdjustedCount == 0 && AdjustedCount > 0) {
-		CounterDelta = 0;
+		if (CounterDelta > FIRST_FRAME_SCANTIME_CAP) {
+			CounterDelta = FIRST_FRAME_SCANTIME_CAP;
+		}
 	}
 	pDeviceContext->PrevAdjustedCount = AdjustedCount;
 
-	// Clear palm state for slots that lifted off.
-	for (i = AdjustedCount; i < PTP_MAX_CONTACT_POINTS; i++) {
+	// FIX: Palm state — clear ALL slots on each frame, then re-evaluate.
+	//
+	// The previous approach only cleared slots >= AdjustedCount. This left stale
+	// palm state in lower slots when a palm lifted while another finger stayed down:
+	//
+	//   Frame N:   slots [0]=palm [1]=finger  → AdjustedCount=2, SlotIsPalm[0]=TRUE
+	//   Frame N+1: palm lifts, finger stays  → AdjustedCount=1, slots [0]=finger
+	//              Old code: only clears slots >= 1, so SlotIsPalm[0] stays TRUE
+	//              Result: the remaining real finger is forever classified as a palm
+	//
+	// Fix: reset all palm state each frame and re-derive it from current touch data.
+	// The PALM_MAJOR/MINOR thresholds provide enough hysteresis on their own.
+	for (i = 0; i < PTP_MAX_CONTACT_POINTS; i++) {
 		pDeviceContext->SlotIsPalm[i] = FALSE;
 	}
 
-	// --- Contact ID assignment via OriginalX/Y matching ---
-	RtlZeroMemory(Matched,  sizeof(Matched));
-	RtlZeroMemory(UsedSlot, sizeof(UsedSlot));
-
-	for (i = 0; i < AdjustedCount; i++) {
-		for (j = 0; j < AdjustedCount; j++) {
-			if (UsedSlot[j]) continue;
-			if (pSpiTrackpadPacket->Fingers[i].OriginalX == pDeviceContext->PrevOriginalX[j] &&
-				pSpiTrackpadPacket->Fingers[i].OriginalY == pDeviceContext->PrevOriginalY[j])
-			{
-				PtpReport.Contacts[i].ContactID = pDeviceContext->SlotContactID[j];
-				Matched[i] = TRUE;
-				UsedSlot[j] = TRUE;
-				break;
-			}
-		}
-	}
-
-	for (i = 0; i < AdjustedCount; i++) {
-		if (!Matched[i]) {
-			PtpReport.Contacts[i].ContactID = pDeviceContext->NextContactID;
-			pDeviceContext->NextContactID = (pDeviceContext->NextContactID + 1) % 8;
-		}
-	}
-
-	for (i = 0; i < AdjustedCount; i++) {
-		pDeviceContext->PrevOriginalX[i] = pSpiTrackpadPacket->Fingers[i].OriginalX;
-		pDeviceContext->PrevOriginalY[i] = pSpiTrackpadPacket->Fingers[i].OriginalY;
-		pDeviceContext->SlotContactID[i] = PtpReport.Contacts[i].ContactID;
-	}
-	for (i = AdjustedCount; i < PTP_MAX_CONTACT_POINTS; i++) {
-		pDeviceContext->PrevOriginalX[i] = 0x7FFF;
-		pDeviceContext->PrevOriginalY[i] = 0x7FFF;
-		pDeviceContext->SlotContactID[i] = 0xFF;
-	}
+	// FIX: ContactID assignment — use slot index directly.
+	//
+	// The previous approach matched fingers by OriginalX == PrevOriginalX.
+	// OriginalX and OriginalY are raw touch COORDINATES; they change every frame
+	// as the finger moves. An exact equality match virtually never fires, so every
+	// frame fell through to the NextContactID counter path, assigning a new ID each
+	// frame. Windows saw a lift+reappear on every movement → cursor snapped back.
+	//
+	// Apple T2 SPI firmware assigns each active finger to a fixed slot (0..N-1)
+	// and keeps it there from touchdown to lift-off. The slot index IS the stable
+	// finger identity; no cross-frame matching is needed.
+	//
+	// ContactID field is 3 bits (values 0-7); slot indices 0-4 fit without wrapping.
 
 	// Build contact records, skipping palms.
-	// ReportedCount tracks only non-palm contacts sent to Windows.
 	ReportedCount = 0;
 	for (Count = 0; Count < AdjustedCount; Count++) {
-		BOOLEAN IsPalm = IsPalmContact(
-			pDeviceContext,
-			Count,
-			pSpiTrackpadPacket->Fingers[Count].TouchMajor,
-			pSpiTrackpadPacket->Fingers[Count].TouchMinor
-		);
+
+		// Palm rejection: reject only when BOTH axes are large simultaneously.
+		// A fingertip at an angle produces large TouchMajor but small TouchMinor
+		// and must not be rejected.
+		IsPalm = (pSpiTrackpadPacket->Fingers[Count].TouchMajor >= PALM_MAJOR_THRESHOLD &&
+		          pSpiTrackpadPacket->Fingers[Count].TouchMinor >= PALM_MINOR_THRESHOLD);
+		pDeviceContext->SlotIsPalm[Count] = IsPalm;
 
 		if (IsPalm) {
 			TraceEvents(TRACE_LEVEL_VERBOSE, TRACE_HID_INPUT,
-				"%!FUNC! Contact[%d] classified as palm, suppressed", Count);
+				"%!FUNC! Contact[%d] classified as palm (Maj=%d Min=%d), suppressed",
+				Count,
+				pSpiTrackpadPacket->Fingers[Count].TouchMajor,
+				pSpiTrackpadPacket->Fingers[Count].TouchMinor);
 			continue;
 		}
 
+		// Stable ContactID = slot index. See comment above.
+		PtpReport.Contacts[ReportedCount].ContactID = Count;
+
+		// Normalize X: map [XMin..XMax] → [0..XRange] with saturating clamp.
+		// LONG intermediates prevent signed SHORT overflow before comparison.
 		RawX  = pSpiTrackpadPacket->Fingers[Count].X;
 		NormX = (LONG)RawX - (LONG)pDeviceContext->TrackpadInfo.XMin;
 		PtpReport.Contacts[ReportedCount].X =
-			(NormX <= 0) ? 0 :
+			(NormX <= 0)                          ? 0 :
 			(NormX >= (LONG)pDeviceContext->XRange) ? pDeviceContext->XRange :
-			(USHORT)NormX;
+			                                          (USHORT)NormX;
 
+		// Normalize Y: Apple Y grows downward; PTP Y grows upward (invert).
 		RawY  = pSpiTrackpadPacket->Fingers[Count].Y;
 		NormY = (LONG)pDeviceContext->TrackpadInfo.YMax - (LONG)RawY;
 		PtpReport.Contacts[ReportedCount].Y =
-			(NormY <= 0) ? 0 :
+			(NormY <= 0)                          ? 0 :
 			(NormY >= (LONG)pDeviceContext->YRange) ? pDeviceContext->YRange :
-			(USHORT)NormY;
+			                                          (USHORT)NormY;
 
-		PtpReport.Contacts[ReportedCount].ContactID = PtpReport.Contacts[Count].ContactID;
-
+		// TipSwitch: include Pressure == 1.
+		// T2 reports Pressure=1 on the first contact frame (finger forming).
+		// Excluding it (old threshold > 1) made Windows miss the touchdown,
+		// treating the next frame as a new contact mid-gesture.
 		PtpReport.Contacts[ReportedCount].TipSwitch =
 			(pSpiTrackpadPacket->Fingers[Count].Pressure >= 1) ? 1 : 0;
 
 		// Confidence: always 1 for non-palm contacts.
-		// Palm filtering is done above; remaining contacts are valid fingers.
+		// Palm filtering is done above; everything that reaches here is a valid finger.
 		PtpReport.Contacts[ReportedCount].Confidence = 1;
 
 		TraceEvents(TRACE_LEVEL_VERBOSE, TRACE_HID_INPUT,
 			"%!FUNC! Contact[%d->%d] ID=%d X=%d Y=%d P=%d Maj=%d Min=%d",
-			Count, ReportedCount,
-			PtpReport.Contacts[ReportedCount].ContactID,
+			Count, ReportedCount, Count,
 			pSpiTrackpadPacket->Fingers[Count].X,
 			pSpiTrackpadPacket->Fingers[Count].Y,
 			pSpiTrackpadPacket->Fingers[Count].Pressure,
 			pSpiTrackpadPacket->Fingers[Count].TouchMajor,
-			pSpiTrackpadPacket->Fingers[Count].TouchMinor
-		);
+			pSpiTrackpadPacket->Fingers[Count].TouchMinor);
 
 		ReportedCount++;
 	}
