@@ -33,6 +33,7 @@ AmtPtpDeviceSpiKmCreateDevice(
 {
 	WDF_OBJECT_ATTRIBUTES DeviceAttributes;
 	WDF_OBJECT_ATTRIBUTES TimerAttributes;
+	WDF_OBJECT_ATTRIBUTES RequestAttributes;
 	PDEVICE_CONTEXT pDeviceContext;
 	WDF_TIMER_CONFIG TimerConfig;
 	WDFDEVICE Device;
@@ -92,6 +93,66 @@ AmtPtpDeviceSpiKmCreateDevice(
 		Status = STATUS_INVALID_DEVICE_STATE;
 		goto exit;
 	}
+
+	// Pre-allocate the SPI read request and output memory once.
+	// These are reused every frame via WdfRequestReuse, eliminating
+	// per-frame kernel object alloc/free (~125Hz hot path).
+	// ParentObject = Device so they are freed automatically on device removal.
+	WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&RequestAttributes, WORKER_REQUEST_CONTEXT);
+	RequestAttributes.ParentObject = Device;
+	Status = WdfRequestCreate(
+		&RequestAttributes,
+		pDeviceContext->SpiTrackpadIoTarget,
+		&pDeviceContext->SpiHidReadRequest
+	);
+	if (!NT_SUCCESS(Status)) {
+		TraceEvents(TRACE_LEVEL_ERROR, TRACE_DRIVER,
+			"%!FUNC! WdfRequestCreate (preallocated) failed with %!STATUS!", Status);
+		goto exit;
+	}
+
+	Status = WdfMemoryCreateFromLookaside(
+		pDeviceContext->HidReadBufferLookaside,
+		&pDeviceContext->SpiHidReadOutputMemory
+	);
+	if (!NT_SUCCESS(Status)) {
+		TraceEvents(TRACE_LEVEL_ERROR, TRACE_DRIVER,
+			"%!FUNC! WdfMemoryCreateFromLookaside (preallocated) failed with %!STATUS!", Status);
+		goto exit;
+	}
+
+	// Wire up the worker context for the pre-allocated request.
+	// DeviceContext pointer never changes; RequestMemory is fixed too.
+	{
+		PWORKER_REQUEST_CONTEXT pCtx =
+			WorkerRequestGetContext(pDeviceContext->SpiHidReadRequest);
+		pCtx->DeviceContext  = pDeviceContext;
+		pCtx->RequestMemory  = pDeviceContext->SpiHidReadOutputMemory;
+	}
+
+	// Format the pre-allocated request once.
+	// WdfRequestReuse with WDF_REQUEST_REUSE_NO_FLAGS preserves the
+	// format, so WdfIoTargetFormatRequestForInternalIoctl only needs
+	// to run here — not on every frame.
+	Status = WdfIoTargetFormatRequestForInternalIoctl(
+		pDeviceContext->SpiTrackpadIoTarget,
+		pDeviceContext->SpiHidReadRequest,
+		IOCTL_HID_READ_REPORT,
+		NULL, 0,
+		pDeviceContext->SpiHidReadOutputMemory, 0
+	);
+	if (!NT_SUCCESS(Status)) {
+		TraceEvents(TRACE_LEVEL_ERROR, TRACE_DRIVER,
+			"%!FUNC! WdfIoTargetFormatRequestForInternalIoctl (preallocated) failed with %!STATUS!", Status);
+		goto exit;
+	}
+
+	// Set completion routine once — also survives WdfRequestReuse.
+	WdfRequestSetCompletionRoutine(
+		pDeviceContext->SpiHidReadRequest,
+		AmtPtpRequestCompletionRoutine,
+		WorkerRequestGetContext(pDeviceContext->SpiHidReadRequest)
+	);
 
 	pDeviceContext->DeviceStatus = D3;
 
@@ -161,8 +222,8 @@ AmtPtpEvtDevicePrepareHardware(
 		goto exit;
 	}
 
-	pDeviceContext->HidVendorID     = DeviceAttributes.VendorID;
-	pDeviceContext->HidProductID    = DeviceAttributes.ProductID;
+	pDeviceContext->HidVendorID      = DeviceAttributes.VendorID;
+	pDeviceContext->HidProductID     = DeviceAttributes.ProductID;
 	pDeviceContext->HidVersionNumber = DeviceAttributes.VersionNumber;
 
 	for (pTrackpadInfo = SpiTrackpadConfigTable; pTrackpadInfo->VendorId; ++pTrackpadInfo) {
@@ -233,7 +294,11 @@ AmtPtpEvtDeviceD0Entry(
 
 	pDeviceContext = DeviceGetContext(Device);
 	pDeviceContext->DeviceStatus = D0ActiveAndUnconfigured;
-	KeQueryPerformanceCounter(&pDeviceContext->LastReportTime);
+	{
+		ULONGLONG QpcBias;
+		pDeviceContext->LastReportTime.QuadPart =
+			(LONGLONG)KeQueryInterruptTimeToPrecise(&QpcBias);
+	}
 
 	TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DRIVER,
 		"%!FUNC! <-- AmtPtpDeviceEvtDeviceD0Entry");
@@ -270,7 +335,7 @@ AmtPtpEvtDeviceD0Exit(
 	Status = STATUS_SUCCESS;
 
 	TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DRIVER,
-		"%!FUNC! <--AmtPtpDeviceEvtDeviceD0Exit");
+		"%!FUNC! <-- AmtPtpEvtDeviceD0Exit");
 	return Status;
 }
 
@@ -281,7 +346,6 @@ AmtPtpEvtDeviceSelfManagedIoInitOrRestart(
 {
 	NTSTATUS Status = STATUS_SUCCESS;
 	PDEVICE_CONTEXT pDeviceContext;
-	LARGE_INTEGER Freq;
 
 	TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DRIVER, "%!FUNC! Entry");
 	pDeviceContext = DeviceGetContext(Device);
@@ -295,8 +359,11 @@ AmtPtpEvtDeviceSelfManagedIoInitOrRestart(
 		goto exit;
 	}
 
-	pDeviceContext->LastReportTime = KeQueryPerformanceCounter(&Freq);
-	pDeviceContext->PerformanceFrequency = Freq.QuadPart;
+	{
+		ULONGLONG QpcBias;
+		pDeviceContext->LastReportTime.QuadPart =
+			(LONGLONG)KeQueryInterruptTimeToPrecise(&QpcBias);
+	}
 
 	pDeviceContext->XRange =
 		(USHORT)((SHORT)pDeviceContext->TrackpadInfo.XMax -
@@ -306,7 +373,6 @@ AmtPtpEvtDeviceSelfManagedIoInitOrRestart(
 		         (SHORT)pDeviceContext->TrackpadInfo.YMin);
 
 	pDeviceContext->DeviceStatus = D0ActiveAndConfigured;
-
 	AmtPtpResetTrackingState(pDeviceContext);
 
 exit:
@@ -315,22 +381,21 @@ exit:
 	return Status;
 }
 
-
 PCHAR
 DbgDevicePowerString(
 	_In_ WDF_POWER_DEVICE_STATE Type
 )
 {
 	switch (Type) {
-	case WdfPowerDeviceInvalid:              return "WdfPowerDeviceInvalid";
-	case WdfPowerDeviceD0:                   return "WdfPowerDeviceD0";
-	case WdfPowerDeviceD1:                   return "WdfPowerDeviceD1";
-	case WdfPowerDeviceD2:                   return "WdfPowerDeviceD2";
-	case WdfPowerDeviceD3:                   return "WdfPowerDeviceD3";
-	case WdfPowerDeviceD3Final:              return "WdfPowerDeviceD3Final";
+	case WdfPowerDeviceInvalid:               return "WdfPowerDeviceInvalid";
+	case WdfPowerDeviceD0:                    return "WdfPowerDeviceD0";
+	case WdfPowerDeviceD1:                    return "WdfPowerDeviceD1";
+	case WdfPowerDeviceD2:                    return "WdfPowerDeviceD2";
+	case WdfPowerDeviceD3:                    return "WdfPowerDeviceD3";
+	case WdfPowerDeviceD3Final:               return "WdfPowerDeviceD3Final";
 	case WdfPowerDevicePrepareForHibernation: return "WdfPowerDevicePrepareForHibernation";
-	case WdfPowerDeviceMaximum:              return "WdfPowerDeviceMaximum";
-	default:                                 return "UnKnown Device Power State";
+	case WdfPowerDeviceMaximum:               return "WdfPowerDeviceMaximum";
+	default:                                  return "UnKnown Device Power State";
 	}
 }
 
@@ -366,9 +431,9 @@ AmtPtpSpiSetState(
 	pHidPacket->reportId        = HID_REPORTID_MOUSE;
 	pHidPacket->reportBufferLen = sizeof(SPI_SET_FEATURE);
 	pHidPacket->reportBuffer    = (PUCHAR) pHidPacket + sizeof(HID_XFER_PACKET);
-	pSpiSetStatus = (PSPI_SET_FEATURE) pHidPacket->reportBuffer;
-	pSpiSetStatus->BusLocation = 2;
-	pSpiSetStatus->Status      = DesiredState ? 1 : 0;
+	pSpiSetStatus               = (PSPI_SET_FEATURE) pHidPacket->reportBuffer;
+	pSpiSetStatus->BusLocation  = 2;
+	pSpiSetStatus->Status       = DesiredState ? 1 : 0;
 
 	Status = WdfIoTargetSendInternalIoctlSynchronously(
 		pDeviceContext->SpiTrackpadIoTarget,
