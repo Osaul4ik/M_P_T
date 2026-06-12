@@ -25,6 +25,8 @@ AmtPtpResetTrackingState(
 	pDeviceContext->PrevReportedMask  = 0;
 	for (k = 0; k < PTP_MAX_CONTACT_POINTS; k++) {
 		pDeviceContext->SlotIsPalm[k] = FALSE;
+		pDeviceContext->SlotLastX[k]  = 0;
+		pDeviceContext->SlotLastY[k]  = 0;
 	}
 }
 
