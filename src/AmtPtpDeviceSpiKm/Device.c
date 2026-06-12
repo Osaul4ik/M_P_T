@@ -1,295 +1,483 @@
-#include "driver.h"
-#include "Input.tmh"
+/*++
+Module Name:
+    device.c
+Abstract:
+    This file contains the device entry points and callbacks.
+Environment:
+    Kernel-mode Driver Framework
+--*/
 
-VOID
-AmtPtpSpiInputRoutineWorker(
-	WDFDEVICE Device,
-	WDFREQUEST PtpRequest
+#include "driver.h"
+#include "device.tmh"
+
+#ifdef ALLOC_PRAGMA
+#pragma alloc_text (PAGE, AmtPtpDeviceSpiKmCreateDevice)
+#endif
+
+static VOID
+AmtPtpResetTrackingState(
+	_In_ PDEVICE_CONTEXT pDeviceContext
 )
 {
-	NTSTATUS Status;
-	PDEVICE_CONTEXT pDeviceContext;
-	pDeviceContext = DeviceGetContext(Device);
-
-	Status = WdfRequestForwardToIoQueue(
-		PtpRequest,
-		pDeviceContext->HidQueue
-	);
-
-	if (!NT_SUCCESS(Status)) {
-		TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DRIVER,
-			"%!FUNC! WdfRequestForwardToIoQueue fails, status = %!STATUS!", Status);
-		WdfRequestComplete(PtpRequest, Status);
-		return;
+	UINT8 k;
+	pDeviceContext->PrevAdjustedCount = 0;
+	for (k = 0; k < PTP_MAX_CONTACT_POINTS; k++) {
+		pDeviceContext->SlotIsPalm[k] = FALSE;
 	}
-
-	// The SPI read pipeline is now driven entirely from
-	// AmtPtpRequestCompletionRoutine. The first read is kicked off
-	// from AmtPtpEvtDeviceSelfManagedIoInitOrRestart (or power recovery)
-	// via AmtPtpSpiInputIssueRequest. After that, each completion
-	// immediately issues the next read without waiting for Windows to
-	// send another HID request — this prevents scroll stutter at 125Hz.
 }
 
-VOID
-AmtPtpSpiInputIssueRequest(
-	WDFDEVICE Device
+NTSTATUS
+AmtPtpDeviceSpiKmCreateDevice(
+	_Inout_ PWDFDEVICE_INIT DeviceInit
 )
 {
-	NTSTATUS Status;
+	WDF_OBJECT_ATTRIBUTES DeviceAttributes;
+	WDF_OBJECT_ATTRIBUTES TimerAttributes;
+	WDF_OBJECT_ATTRIBUTES RequestAttributes;
 	PDEVICE_CONTEXT pDeviceContext;
-	BOOLEAN RequestStatus;
-	WDF_REQUEST_REUSE_PARAMS ReuseParams;
+	WDF_TIMER_CONFIG TimerConfig;
+	WDFDEVICE Device;
+	NTSTATUS Status;
+	WDF_PNPPOWER_EVENT_CALLBACKS pnpPowerCallbacks;
 
-	pDeviceContext = DeviceGetContext(Device);
+	PAGED_CODE();
 
-	// Reuse the pre-allocated request.
-	// Format and completion routine are set once at device creation
-	// and survive WdfRequestReuse — no per-frame setup needed.
-	WDF_REQUEST_REUSE_PARAMS_INIT(&ReuseParams, WDF_REQUEST_REUSE_NO_FLAGS, STATUS_SUCCESS);
-	Status = WdfRequestReuse(pDeviceContext->SpiHidReadRequest, &ReuseParams);
+	TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DRIVER, "%!FUNC! Entry");
+
+	WDF_PNPPOWER_EVENT_CALLBACKS_INIT(&pnpPowerCallbacks);
+	pnpPowerCallbacks.EvtDevicePrepareHardware        = AmtPtpEvtDevicePrepareHardware;
+	pnpPowerCallbacks.EvtDeviceD0Entry                = AmtPtpEvtDeviceD0Entry;
+	pnpPowerCallbacks.EvtDeviceD0Exit                 = AmtPtpEvtDeviceD0Exit;
+	pnpPowerCallbacks.EvtDeviceSelfManagedIoInit      = AmtPtpEvtDeviceSelfManagedIoInitOrRestart;
+	pnpPowerCallbacks.EvtDeviceSelfManagedIoRestart   = AmtPtpEvtDeviceSelfManagedIoInitOrRestart;
+	WdfDeviceInitSetPnpPowerEventCallbacks(DeviceInit, &pnpPowerCallbacks);
+
+	WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&DeviceAttributes, DEVICE_CONTEXT);
+	Status = WdfDeviceCreate(&DeviceInit, &DeviceAttributes, &Device);
 	if (!NT_SUCCESS(Status)) {
-		TraceEvents(TRACE_LEVEL_ERROR, TRACE_DEVICE,
-			"%!FUNC! WdfRequestReuse fails, status = %!STATUS!", Status);
-		return;
+		goto exit;
 	}
 
-	RequestStatus = WdfRequestSend(
-		pDeviceContext->SpiHidReadRequest,
+	pDeviceContext = DeviceGetContext(Device);
+	pDeviceContext->SpiDevice = Device;
+
+	Status = WdfLookasideListCreate(
+		WDF_NO_OBJECT_ATTRIBUTES,
+		REPORT_BUFFER_SIZE,
+		NonPagedPoolNx,
+		WDF_NO_OBJECT_ATTRIBUTES,
+		PTP_LIST_POOL_TAG,
+		&pDeviceContext->HidReadBufferLookaside
+	);
+	if (!NT_SUCCESS(Status)) {
+		TraceEvents(TRACE_LEVEL_ERROR, TRACE_DRIVER,
+			"%!FUNC! WdfLookasideListCreate failed with %!STATUS!", Status);
+		goto exit;
+	}
+
+	WDF_TIMER_CONFIG_INIT(&TimerConfig, AmtPtpPowerRecoveryTimerCallback);
+	TimerConfig.AutomaticSerialization = TRUE;
+	WDF_OBJECT_ATTRIBUTES_INIT(&TimerAttributes);
+	TimerAttributes.ParentObject   = Device;
+	TimerAttributes.ExecutionLevel = WdfExecutionLevelPassive;
+	Status = WdfTimerCreate(&TimerConfig, &TimerAttributes,
+		&pDeviceContext->PowerOnRecoveryTimer);
+	if (!NT_SUCCESS(Status)) {
+		TraceEvents(TRACE_LEVEL_ERROR, TRACE_DRIVER,
+			"%!FUNC! WdfTimerCreate failed with %!STATUS!", Status);
+		goto exit;
+	}
+
+	pDeviceContext->SpiTrackpadIoTarget = WdfDeviceGetIoTarget(Device);
+	if (pDeviceContext->SpiTrackpadIoTarget == NULL) {
+		Status = STATUS_INVALID_DEVICE_STATE;
+		goto exit;
+	}
+
+	// Pre-allocate the SPI read request and output memory once.
+	// These are reused every frame via WdfRequestReuse, eliminating
+	// per-frame kernel object alloc/free (~125Hz hot path).
+	// ParentObject = Device so they are freed automatically on device removal.
+	WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&RequestAttributes, WORKER_REQUEST_CONTEXT);
+	RequestAttributes.ParentObject = Device;
+	Status = WdfRequestCreate(
+		&RequestAttributes,
 		pDeviceContext->SpiTrackpadIoTarget,
+		&pDeviceContext->SpiHidReadRequest
+	);
+	if (!NT_SUCCESS(Status)) {
+		TraceEvents(TRACE_LEVEL_ERROR, TRACE_DRIVER,
+			"%!FUNC! WdfRequestCreate (preallocated) failed with %!STATUS!", Status);
+		goto exit;
+	}
+
+	Status = WdfMemoryCreateFromLookaside(
+		pDeviceContext->HidReadBufferLookaside,
+		&pDeviceContext->SpiHidReadOutputMemory
+	);
+	if (!NT_SUCCESS(Status)) {
+		TraceEvents(TRACE_LEVEL_ERROR, TRACE_DRIVER,
+			"%!FUNC! WdfMemoryCreateFromLookaside (preallocated) failed with %!STATUS!", Status);
+		goto exit;
+	}
+
+	// Wire up the worker context for the pre-allocated request.
+	// DeviceContext pointer never changes; RequestMemory is fixed too.
+	{
+		PWORKER_REQUEST_CONTEXT pCtx =
+			WorkerRequestGetContext(pDeviceContext->SpiHidReadRequest);
+		pCtx->DeviceContext  = pDeviceContext;
+		pCtx->RequestMemory  = pDeviceContext->SpiHidReadOutputMemory;
+	}
+
+	// Format the pre-allocated request once.
+	// WdfRequestReuse with WDF_REQUEST_REUSE_NO_FLAGS preserves the
+	// format, so WdfIoTargetFormatRequestForInternalIoctl only needs
+	// to run here — not on every frame.
+	Status = WdfIoTargetFormatRequestForInternalIoctl(
+		pDeviceContext->SpiTrackpadIoTarget,
+		pDeviceContext->SpiHidReadRequest,
+		IOCTL_HID_READ_REPORT,
+		NULL, 0,
+		pDeviceContext->SpiHidReadOutputMemory, 0
+	);
+	if (!NT_SUCCESS(Status)) {
+		TraceEvents(TRACE_LEVEL_ERROR, TRACE_DRIVER,
+			"%!FUNC! WdfIoTargetFormatRequestForInternalIoctl (preallocated) failed with %!STATUS!", Status);
+		goto exit;
+	}
+
+	// Set completion routine once — also survives WdfRequestReuse.
+	WdfRequestSetCompletionRoutine(
+		pDeviceContext->SpiHidReadRequest,
+		AmtPtpRequestCompletionRoutine,
+		WorkerRequestGetContext(pDeviceContext->SpiHidReadRequest)
+	);
+
+	pDeviceContext->DeviceStatus = D3;
+
+	Status = WdfDeviceCreateDeviceInterface(
+		Device,
+		&GUID_DEVINTERFACE_AmtPtpDeviceSpiKm,
 		NULL
 	);
-	if (!RequestStatus) {
-		TraceEvents(TRACE_LEVEL_ERROR, TRACE_DEVICE,
-			"%!FUNC! WdfRequestSend failed");
+	if (NT_SUCCESS(Status)) {
+		Status = AmtPtpDeviceSpiKmQueueInitialize(Device);
+	}
+
+exit:
+	TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DRIVER,
+		"%!FUNC! Exit, Status = %!STATUS!", Status);
+	return Status;
+}
+
+NTSTATUS
+AmtPtpEvtDevicePrepareHardware(
+	_In_ WDFDEVICE Device,
+	_In_ WDFCMRESLIST ResourceList,
+	_In_ WDFCMRESLIST ResourceListTranslated
+)
+{
+	NTSTATUS Status = STATUS_SUCCESS;
+	PDEVICE_CONTEXT pDeviceContext;
+	WDF_MEMORY_DESCRIPTOR HidAttributeMemoryDescriptor;
+	HID_DEVICE_ATTRIBUTES DeviceAttributes;
+	const SPI_TRACKPAD_INFO* pTrackpadInfo;
+	BOOLEAN DeviceFound = FALSE;
+	WDFKEY ParamRegistryKey;
+	DECLARE_CONST_UNICODE_STRING(DesiredReportTypeKey, L"DesiredReportType");
+	ULONG DesiredReportTypeValue, Length, ValueType = 0;
+
+	PAGED_CODE();
+	UNREFERENCED_PARAMETER(ResourceList);
+	UNREFERENCED_PARAMETER(ResourceListTranslated);
+
+	TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DRIVER, "%!FUNC! Entry");
+
+	pDeviceContext = DeviceGetContext(Device);
+	if (pDeviceContext == NULL) {
+		Status = STATUS_INVALID_DEVICE_STATE;
+		goto exit;
+	}
+
+	RtlZeroMemory(&DeviceAttributes, sizeof(DeviceAttributes));
+	WDF_MEMORY_DESCRIPTOR_INIT_BUFFER(
+		&HidAttributeMemoryDescriptor,
+		(PVOID) &DeviceAttributes,
+		sizeof(DeviceAttributes)
+	);
+
+	Status = WdfIoTargetSendInternalIoctlSynchronously(
+		pDeviceContext->SpiTrackpadIoTarget,
+		NULL,
+		IOCTL_HID_GET_DEVICE_ATTRIBUTES,
+		NULL,
+		&HidAttributeMemoryDescriptor,
+		NULL,
+		NULL
+	);
+	if (!NT_SUCCESS(Status)) {
+		KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+			"WdfIoTargetSendInternalIoctlSynchronously failed, status = 0x%x\n", Status));
+		goto exit;
+	}
+
+	pDeviceContext->HidVendorID      = DeviceAttributes.VendorID;
+	pDeviceContext->HidProductID     = DeviceAttributes.ProductID;
+	pDeviceContext->HidVersionNumber = DeviceAttributes.VersionNumber;
+
+	for (pTrackpadInfo = SpiTrackpadConfigTable; pTrackpadInfo->VendorId; ++pTrackpadInfo) {
+		if (pTrackpadInfo->VendorId == DeviceAttributes.VendorID &&
+			pTrackpadInfo->ProductId == DeviceAttributes.ProductID)
+		{
+			pDeviceContext->TrackpadInfo.ProductId = pTrackpadInfo->ProductId;
+			pDeviceContext->TrackpadInfo.VendorId  = pTrackpadInfo->VendorId;
+			pDeviceContext->TrackpadInfo.XMin      = pTrackpadInfo->XMin;
+			pDeviceContext->TrackpadInfo.XMax      = pTrackpadInfo->XMax;
+			pDeviceContext->TrackpadInfo.YMin      = pTrackpadInfo->YMin;
+			pDeviceContext->TrackpadInfo.YMax      = pTrackpadInfo->YMax;
+			DeviceFound = TRUE;
+			break;
+		}
+	}
+
+	if (!DeviceFound) {
+		Status = STATUS_NOT_FOUND;
+		goto exit;
+	}
+
+	Status = WdfDriverOpenParametersRegistryKey(
+		WdfDeviceGetDriver(Device),
+		KEY_READ,
+		WDF_NO_OBJECT_ATTRIBUTES,
+		&ParamRegistryKey
+	);
+	if (NT_SUCCESS(Status)) {
+		Status = WdfRegistryQueryValue(
+			ParamRegistryKey,
+			&DesiredReportTypeKey,
+			sizeof(ULONG),
+			&DesiredReportTypeValue,
+			&Length,
+			&ValueType
+		);
+		if (NT_SUCCESS(Status)) {
+			switch (DesiredReportTypeValue) {
+			case 0: pDeviceContext->ReportType = PrecisionTouchpad; break;
+			case 1: pDeviceContext->ReportType = Touchscreen;       break;
+			default: Status = STATUS_INVALID_PARAMETER;             break;
+			}
+		}
+		WdfRegistryClose(ParamRegistryKey);
+	}
+
+	Status = STATUS_SUCCESS;
+
+exit:
+	TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DRIVER,
+		"%!FUNC! Exit, Status = %!STATUS!", Status);
+	return Status;
+}
+
+NTSTATUS
+AmtPtpEvtDeviceD0Entry(
+	_In_ WDFDEVICE Device,
+	_In_ WDF_POWER_DEVICE_STATE PreviousState
+)
+{
+	NTSTATUS Status = STATUS_SUCCESS;
+	PDEVICE_CONTEXT pDeviceContext;
+
+	TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DRIVER,
+		"%!FUNC! -->AmtPtpDeviceEvtDeviceD0Entry - coming from %s",
+		DbgDevicePowerString(PreviousState));
+
+	pDeviceContext = DeviceGetContext(Device);
+	pDeviceContext->DeviceStatus = D0ActiveAndUnconfigured;
+	{
+		ULONGLONG QpcBias;
+		pDeviceContext->LastReportTime.QuadPart =
+			(LONGLONG)KeQueryInterruptTimeToPrecise(&QpcBias);
+	}
+
+	TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DRIVER,
+		"%!FUNC! <-- AmtPtpDeviceEvtDeviceD0Entry");
+	return Status;
+}
+
+NTSTATUS
+AmtPtpEvtDeviceD0Exit(
+	_In_ WDFDEVICE Device,
+	_In_ WDF_POWER_DEVICE_STATE TargetState
+)
+{
+	NTSTATUS Status = STATUS_SUCCESS;
+	PDEVICE_CONTEXT pDeviceContext;
+	WDFREQUEST OutstandingRequest;
+
+	TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DRIVER,
+		"%!FUNC! -->AmtPtpDeviceEvtDeviceD0Exit - moving to %s",
+		DbgDevicePowerString(TargetState));
+
+	pDeviceContext = DeviceGetContext(Device);
+	pDeviceContext->DeviceStatus = D3;
+
+	while (NT_SUCCESS(Status)) {
+		Status = WdfIoQueueRetrieveNextRequest(
+			pDeviceContext->HidQueue,
+			&OutstandingRequest
+		);
+		if (NT_SUCCESS(Status)) {
+			WdfRequestComplete(OutstandingRequest, STATUS_CANCELLED);
+		}
+	}
+
+	Status = STATUS_SUCCESS;
+
+	TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DRIVER,
+		"%!FUNC! <-- AmtPtpEvtDeviceD0Exit");
+	return Status;
+}
+
+NTSTATUS
+AmtPtpEvtDeviceSelfManagedIoInitOrRestart(
+	_In_ WDFDEVICE Device
+)
+{
+	NTSTATUS Status = STATUS_SUCCESS;
+	PDEVICE_CONTEXT pDeviceContext;
+
+	TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DRIVER, "%!FUNC! Entry");
+	pDeviceContext = DeviceGetContext(Device);
+
+	Status = AmtPtpSpiSetState(Device, TRUE);
+	if (!NT_SUCCESS(Status)) {
+		TraceEvents(TRACE_LEVEL_ERROR, TRACE_DRIVER,
+			"%!FUNC! AmtPtpSpiSetState failed with %!STATUS!. Retry after 5 seconds", Status);
+		Status = STATUS_SUCCESS;
+		WdfTimerStart(pDeviceContext->PowerOnRecoveryTimer, WDF_REL_TIMEOUT_IN_SEC(5));
+		goto exit;
+	}
+
+	{
+		ULONGLONG QpcBias;
+		pDeviceContext->LastReportTime.QuadPart =
+			(LONGLONG)KeQueryInterruptTimeToPrecise(&QpcBias);
+	}
+
+	pDeviceContext->XRange =
+		(USHORT)((SHORT)pDeviceContext->TrackpadInfo.XMax -
+		         (SHORT)pDeviceContext->TrackpadInfo.XMin);
+	pDeviceContext->YRange =
+		(USHORT)((SHORT)pDeviceContext->TrackpadInfo.YMax -
+		         (SHORT)pDeviceContext->TrackpadInfo.YMin);
+
+	pDeviceContext->DeviceStatus = D0ActiveAndConfigured;
+	AmtPtpResetTrackingState(pDeviceContext);
+
+exit:
+	TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DRIVER,
+		"%!FUNC! Exit, Status = %!STATUS!", Status);
+	return Status;
+}
+
+PCHAR
+DbgDevicePowerString(
+	_In_ WDF_POWER_DEVICE_STATE Type
+)
+{
+	switch (Type) {
+	case WdfPowerDeviceInvalid:               return "WdfPowerDeviceInvalid";
+	case WdfPowerDeviceD0:                    return "WdfPowerDeviceD0";
+	case WdfPowerDeviceD1:                    return "WdfPowerDeviceD1";
+	case WdfPowerDeviceD2:                    return "WdfPowerDeviceD2";
+	case WdfPowerDeviceD3:                    return "WdfPowerDeviceD3";
+	case WdfPowerDeviceD3Final:               return "WdfPowerDeviceD3Final";
+	case WdfPowerDevicePrepareForHibernation: return "WdfPowerDevicePrepareForHibernation";
+	case WdfPowerDeviceMaximum:               return "WdfPowerDeviceMaximum";
+	default:                                  return "UnKnown Device Power State";
 	}
 }
 
-// Palm rejection thresholds (Apple SPI raw units, ~0.01mm each).
-// Reject only when BOTH axes are large simultaneously.
-// A finger at an angle: large Major, small Minor — must NOT be rejected.
-#define PALM_MAJOR_THRESHOLD 3500
-#define PALM_MINOR_THRESHOLD 3500
-
-// ScanTime cap for the first frame of a new touch sequence (100us units).
-// 80 = 8ms, a typical 125Hz interval. Only applied when idle >= IDLE_SCANTIME_THRESHOLD.
-#define FIRST_FRAME_SCANTIME_CAP  80
-
-// Idle threshold: only cap ScanTime when the gap exceeds this value.
-// 5000 units * 100us = 500ms — "trackpad was not touched for a while".
-// Below this threshold the real delta is passed through so Windows can
-// correctly distinguish rapid gesture sequences (e.g. triple-tap →
-// two-finger tap → single tap) without swallowing the first click.
-#define IDLE_SCANTIME_THRESHOLD   5000
-
-VOID
-AmtPtpRequestCompletionRoutine(
-	WDFREQUEST SpiRequest,
-	WDFIOTARGET Target,
-	PWDF_REQUEST_COMPLETION_PARAMS Params,
-	WDFCONTEXT Context
+NTSTATUS
+AmtPtpSpiSetState(
+	_In_ WDFDEVICE Device,
+	_In_ BOOLEAN DesiredState
 )
 {
 	NTSTATUS Status;
-	PWORKER_REQUEST_CONTEXT RequestContext;
 	PDEVICE_CONTEXT pDeviceContext;
+	UCHAR HidPacketBuffer[HID_XFER_PACKET_SIZE];
+	WDF_MEMORY_DESCRIPTOR HidMemoryDescriptor;
+	PHID_XFER_PACKET pHidPacket;
+	PSPI_SET_FEATURE pSpiSetStatus;
 
-	LONG SpiRequestLength;
-	LONG MinPacketLength;
-	PSPI_TRACKPAD_PACKET pSpiTrackpadPacket;
-
-	WDFREQUEST PtpRequest;
-	PTP_REPORT PtpReport;
-	WDFMEMORY PtpRequestMemory;
-
-	ULONGLONG CurrentTime;
-	ULONGLONG QpcBias;
-	LONGLONG CounterDelta;
-	UINT8 AdjustedCount;
-	UINT8 ReportedCount;
-	UINT8 Count;
-	UINT8 i;
-	SHORT RawX;
-	SHORT RawY;
-	LONG NormX;
-	LONG NormY;
-	BOOLEAN IsPalm;
-
-	UNREFERENCED_PARAMETER(Target);
-	UNREFERENCED_PARAMETER(SpiRequest); // pre-allocated, not deleted here
-
-	RequestContext = (PWORKER_REQUEST_CONTEXT) Context;
-	pDeviceContext = RequestContext->DeviceContext;
-
-	// Retrieve the pending PTP request. If the queue is empty (Windows
-	// hasn't sent a new HID request yet), skip the report and fall through
-	// to cleanup so we still issue the next SPI read. No request is leaked:
-	// there is nothing in the queue to complete.
-	Status = WdfIoQueueRetrieveNextRequest(pDeviceContext->HidQueue, &PtpRequest);
-	if (!NT_SUCCESS(Status)) {
+	pDeviceContext = DeviceGetContext(Device);
+	if (pDeviceContext == NULL) {
+		Status = STATUS_INVALID_DEVICE_STATE;
 		TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DRIVER,
-			"%!FUNC! No PTP request pending (%!STATUS!), skipping report", Status);
-		goto cleanup;
-	}
-
-	// If Windows switched to mouse mode or disabled surface reports,
-	// complete with an empty report immediately.
-	if (!pDeviceContext->PtpInputOn || !pDeviceContext->PtpReportTouch) {
-		RtlZeroMemory(&PtpReport, sizeof(PTP_REPORT));
-		PtpReport.ReportID = REPORTID_MULTITOUCH;
-		Status = WdfRequestRetrieveOutputMemory(PtpRequest, &PtpRequestMemory);
-		if (NT_SUCCESS(Status)) {
-			WdfMemoryCopyFromBuffer(PtpRequestMemory, 0, &PtpReport, sizeof(PTP_REPORT));
-			WdfRequestSetInformation(PtpRequest, sizeof(PTP_REPORT));
-		}
+			"%!FUNC! pDeviceContext == NULL");
 		goto exit;
 	}
 
-	SpiRequestLength = (LONG) WdfRequestGetInformation(SpiRequest);
-	pSpiTrackpadPacket = (PSPI_TRACKPAD_PACKET) WdfMemoryGetBuffer(
-		Params->Parameters.Ioctl.Output.Buffer, NULL);
-
-	// Validate header presence.
-	if (SpiRequestLength < 46) {
-		TraceEvents(TRACE_LEVEL_ERROR, TRACE_DRIVER,
-			"%!FUNC! Packet too short for header: %d < 46", SpiRequestLength);
-		Status = STATUS_DEVICE_DATA_ERROR;
-		goto exit;
-	}
-
-	// Validate that the packet holds all claimed finger records.
-	MinPacketLength = 46 + (LONG)pSpiTrackpadPacket->NumOfFingers *
-	                       (LONG)sizeof(SPI_TRACKPAD_FINGER);
-	if (SpiRequestLength < MinPacketLength) {
-		TraceEvents(TRACE_LEVEL_ERROR, TRACE_DRIVER,
-			"%!FUNC! Packet truncated: %d < %d (%d fingers claimed)",
-			SpiRequestLength, MinPacketLength, pSpiTrackpadPacket->NumOfFingers);
-		Status = STATUS_DEVICE_DATA_ERROR;
-		goto exit;
-	}
-
-	// Compute ScanTime (100us units per HID PTP spec).
-	// KeQueryInterruptTimeToPrecise returns 100ns units directly —
-	// no division by PerformanceFrequency needed, and it is cheaper
-	// than KeQueryPerformanceCounter (no RDTSC serialization fence).
-	// Divide by 1000 to convert 100ns → 100us.
-	CurrentTime = KeQueryInterruptTimeToPrecise(&QpcBias);
-	CounterDelta = (LONGLONG)((CurrentTime - pDeviceContext->LastReportTime.QuadPart) / 1000);
-	if (CounterDelta < 0) {
-		CounterDelta = 0;
-	}
-	if (CounterDelta > 0xFFFF) {
-		CounterDelta = 0xFFFF;
-	}
-	pDeviceContext->LastReportTime.QuadPart = (LONGLONG)CurrentTime;
-
-	RtlZeroMemory(&PtpReport, sizeof(PTP_REPORT));
-
-	AdjustedCount = (pSpiTrackpadPacket->NumOfFingers > PTP_MAX_CONTACT_POINTS)
-		? PTP_MAX_CONTACT_POINTS
-		: pSpiTrackpadPacket->NumOfFingers;
-
-	// ScanTime cap: only when truly idle (gap > 500ms).
-	// For short inter-gesture pauses the real delta is preserved so Windows
-	// correctly identifies each new gesture as distinct and does not swallow
-	// the first click of the next tap.
-	if (pDeviceContext->PrevAdjustedCount == 0 && AdjustedCount > 0) {
-		if (CounterDelta > IDLE_SCANTIME_THRESHOLD) {
-			CounterDelta = FIRST_FRAME_SCANTIME_CAP;
-		}
-	}
-	pDeviceContext->PrevAdjustedCount = AdjustedCount;
-
-	// Clear palm state each frame; re-derive from current touch data.
-	for (i = 0; i < PTP_MAX_CONTACT_POINTS; i++) {
-		pDeviceContext->SlotIsPalm[i] = FALSE;
-	}
-
-	ReportedCount = 0;
-	for (Count = 0; Count < AdjustedCount; Count++) {
-
-		IsPalm = (pSpiTrackpadPacket->Fingers[Count].TouchMajor >= PALM_MAJOR_THRESHOLD &&
-		          pSpiTrackpadPacket->Fingers[Count].TouchMinor >= PALM_MINOR_THRESHOLD);
-		pDeviceContext->SlotIsPalm[Count] = IsPalm;
-
-		if (IsPalm) {
-			TraceEvents(TRACE_LEVEL_VERBOSE, TRACE_HID_INPUT,
-				"%!FUNC! Contact[%d] classified as palm (Maj=%d Min=%d), suppressed",
-				Count,
-				pSpiTrackpadPacket->Fingers[Count].TouchMajor,
-				pSpiTrackpadPacket->Fingers[Count].TouchMinor);
-			continue;
-		}
-
-		PtpReport.Contacts[ReportedCount].ContactID = Count;
-
-		RawX  = pSpiTrackpadPacket->Fingers[Count].X;
-		NormX = (LONG)RawX - (LONG)pDeviceContext->TrackpadInfo.XMin;
-		PtpReport.Contacts[ReportedCount].X =
-			(NormX <= 0)                            ? 0 :
-			(NormX >= (LONG)pDeviceContext->XRange) ? pDeviceContext->XRange :
-			                                          (USHORT)NormX;
-
-		RawY  = pSpiTrackpadPacket->Fingers[Count].Y;
-		NormY = (LONG)pDeviceContext->TrackpadInfo.YMax - (LONG)RawY;
-		PtpReport.Contacts[ReportedCount].Y =
-			(NormY <= 0)                            ? 0 :
-			(NormY >= (LONG)pDeviceContext->YRange) ? pDeviceContext->YRange :
-			                                          (USHORT)NormY;
-
-		PtpReport.Contacts[ReportedCount].TipSwitch =
-			(pSpiTrackpadPacket->Fingers[Count].Pressure >= 1) ? 1 : 0;
-
-		PtpReport.Contacts[ReportedCount].Confidence = 1;
-
-		TraceEvents(TRACE_LEVEL_VERBOSE, TRACE_HID_INPUT,
-			"%!FUNC! Contact[%d->%d] ID=%d X=%d Y=%d P=%d Maj=%d Min=%d",
-			Count, ReportedCount, Count,
-			pSpiTrackpadPacket->Fingers[Count].X,
-			pSpiTrackpadPacket->Fingers[Count].Y,
-			pSpiTrackpadPacket->Fingers[Count].Pressure,
-			pSpiTrackpadPacket->Fingers[Count].TouchMajor,
-			pSpiTrackpadPacket->Fingers[Count].TouchMinor);
-
-		ReportedCount++;
-	}
-
-	PtpReport.ReportID        = REPORTID_MULTITOUCH;
-	PtpReport.ContactCount    = ReportedCount;
-	PtpReport.IsButtonClicked = pSpiTrackpadPacket->ClickOccurred;
-	PtpReport.ScanTime        = (USHORT) CounterDelta;
-
-	Status = WdfRequestRetrieveOutputMemory(PtpRequest, &PtpRequestMemory);
-	if (!NT_SUCCESS(Status)) {
-		TraceEvents(TRACE_LEVEL_ERROR, TRACE_DRIVER,
-			"%!FUNC! WdfRequestRetrieveOutputMemory failed with %!STATUS!", Status);
-		goto exit;
-	}
-
-	Status = WdfMemoryCopyFromBuffer(
-		PtpRequestMemory, 0,
-		(PVOID) &PtpReport,
-		sizeof(PTP_REPORT)
+	RtlZeroMemory(HidPacketBuffer, sizeof(HidPacketBuffer));
+	pHidPacket = (PHID_XFER_PACKET) &HidPacketBuffer;
+	WDF_MEMORY_DESCRIPTOR_INIT_BUFFER(
+		&HidMemoryDescriptor,
+		(PVOID) &HidPacketBuffer,
+		HID_XFER_PACKET_SIZE
 	);
+
+	pHidPacket->reportId        = HID_REPORTID_MOUSE;
+	pHidPacket->reportBufferLen = sizeof(SPI_SET_FEATURE);
+	pHidPacket->reportBuffer    = (PUCHAR) pHidPacket + sizeof(HID_XFER_PACKET);
+	pSpiSetStatus               = (PSPI_SET_FEATURE) pHidPacket->reportBuffer;
+	pSpiSetStatus->BusLocation  = 2;
+	pSpiSetStatus->Status       = DesiredState ? 1 : 0;
+
+	Status = WdfIoTargetSendInternalIoctlSynchronously(
+		pDeviceContext->SpiTrackpadIoTarget,
+		NULL,
+		IOCTL_HID_SET_FEATURE,
+		&HidMemoryDescriptor,
+		NULL,
+		NULL,
+		NULL
+	);
+
 	if (!NT_SUCCESS(Status)) {
 		TraceEvents(TRACE_LEVEL_ERROR, TRACE_DRIVER,
-			"%!FUNC! WdfMemoryCopyFromBuffer failed with %!STATUS!", Status);
-		goto exit;
+			"%!FUNC! WdfIoTargetSendIoctlSynchronously failed with %!STATUS!", Status);
+	} else {
+		TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DRIVER,
+			"%!FUNC! Changed trackpad status to %d", DesiredState);
 	}
-
-	WdfRequestSetInformation(PtpRequest, sizeof(PTP_REPORT));
 
 exit:
-	WdfRequestComplete(PtpRequest, Status);
+	TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DRIVER,
+		"%!FUNC! Exit, Status = %!STATUS!", Status);
+	return Status;
+}
 
-cleanup:
-	// SpiRequest is the pre-allocated pDeviceContext->SpiHidReadRequest —
-	// do NOT delete it here. It is reused via WdfRequestReuse next cycle.
+void AmtPtpPowerRecoveryTimerCallback(
+	WDFTIMER Timer
+)
+{
+	WDFDEVICE Device;
+	PDEVICE_CONTEXT pDeviceContext;
+	NTSTATUS Status = STATUS_SUCCESS;
 
-	// Issue the next SPI read immediately, without waiting for Windows to
-	// send another HID request. This keeps the SPI pipeline full at 125Hz
-	// and prevents scroll from stalling under scheduler jitter.
-	if (pDeviceContext->DeviceStatus == D0ActiveAndConfigured) {
-		AmtPtpSpiInputIssueRequest(pDeviceContext->SpiDevice);
+	TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DRIVER, "%!FUNC! Entry");
+	Device = WdfTimerGetParentObject(Timer);
+	pDeviceContext = DeviceGetContext(Device);
+
+	Status = AmtPtpSpiSetState(Device, TRUE);
+	if (NT_SUCCESS(Status)) {
+		AmtPtpSpiInputIssueRequest(Device);
+		pDeviceContext->DeviceStatus = D0ActiveAndConfigured;
+		AmtPtpResetTrackingState(pDeviceContext);
 	}
+
+	TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DRIVER,
+		"%!FUNC! Exit, Status = %!STATUS!", Status);
 }
