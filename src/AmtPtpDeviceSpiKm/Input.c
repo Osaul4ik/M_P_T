@@ -50,8 +50,11 @@ AmtPtpSpiInputIssueRequest(
 		NULL
 	);
 	if (!RequestStatus) {
+		// FIX: retrieve and log the actual failure status so it appears in
+		// traces instead of a generic "failed" with no diagnostic value.
+		Status = WdfRequestGetStatus(pDeviceContext->SpiHidReadRequest);
 		TraceEvents(TRACE_LEVEL_ERROR, TRACE_DEVICE,
-			"%!FUNC! WdfRequestSend failed");
+			"%!FUNC! WdfRequestSend failed, status = %!STATUS!", Status);
 	}
 }
 
@@ -75,6 +78,7 @@ AmtPtpRequestCompletionRoutine(
 
 	LONG SpiRequestLength;
 	LONG MinPacketLength;
+	SIZE_T BufLen;
 	PSPI_TRACKPAD_PACKET pSpiTrackpadPacket;
 
 	WDFREQUEST PtpRequest;
@@ -85,6 +89,9 @@ AmtPtpRequestCompletionRoutine(
 	LONGLONG CounterDelta;
 	UINT8 AdjustedCount;
 	UINT8 ReportedCount;
+	// Bitmask of ContactIDs written into the current report with TipSwitch=1.
+	// Bit N set => ContactID N is live in this frame.
+	UINT8 CurrentReportedMask;
 	UINT8 Count;
 	UINT8 i;
 	SHORT RawX;
@@ -118,12 +125,38 @@ AmtPtpRequestCompletionRoutine(
 	}
 
 	SpiRequestLength = (LONG) WdfRequestGetInformation(SpiRequest);
+
+	// FIX (buffer safety): retrieve the actual allocated buffer size alongside
+	// the pointer.  Validates that Information (bytes transferred as reported
+	// by the lower driver) does not exceed the memory object's real capacity —
+	// a misbehaving lower driver could report more bytes than the buffer holds.
+	BufLen = 0;
 	pSpiTrackpadPacket = (PSPI_TRACKPAD_PACKET) WdfMemoryGetBuffer(
-		Params->Parameters.Ioctl.Output.Buffer, NULL);
+		Params->Parameters.Ioctl.Output.Buffer, &BufLen);
+
+	if (SpiRequestLength > (LONG)BufLen) {
+		TraceEvents(TRACE_LEVEL_ERROR, TRACE_DRIVER,
+			"%!FUNC! Information (%d) exceeds buffer size (%Iu), rejecting",
+			SpiRequestLength, BufLen);
+		Status = STATUS_BUFFER_OVERFLOW;
+		goto exit;
+	}
 
 	if (SpiRequestLength < 46) {
 		TraceEvents(TRACE_LEVEL_ERROR, TRACE_DRIVER,
 			"%!FUNC! Packet too short for header: %d < 46", SpiRequestLength);
+		Status = STATUS_DEVICE_DATA_ERROR;
+		goto exit;
+	}
+
+	// FIX (OOB): clamp NumOfFingers before using it in the packet length
+	// calculation.  Rejects malformed packets that claim an impossible finger
+	// count before we perform the multiply, and before AdjustedCount clamping
+	// which happens later in the data path.
+	if (pSpiTrackpadPacket->NumOfFingers > SPI_TRACKPAD_MAX_FINGERS) {
+		TraceEvents(TRACE_LEVEL_ERROR, TRACE_DRIVER,
+			"%!FUNC! NumOfFingers %d exceeds maximum %d, rejecting",
+			pSpiTrackpadPacket->NumOfFingers, SPI_TRACKPAD_MAX_FINGERS);
 		Status = STATUS_DEVICE_DATA_ERROR;
 		goto exit;
 	}
@@ -140,17 +173,21 @@ AmtPtpRequestCompletionRoutine(
 
 	// KeQueryInterruptTime returns 100ns units since boot.
 	// Divide by 1000 to convert 100ns -> 100us for HID PTP ScanTime.
-	// Equivalent to KeQueryInterruptTimeToPrecise for ScanTime purposes,
-	// and available on all Windows versions without visibility issues.
-	CurrentTime = KeQueryInterruptTime();
-	CounterDelta = (LONGLONG)((CurrentTime - pDeviceContext->LastReportTime.QuadPart) / 1000);
+	// FIX (sync): LastReportTime is now ULONGLONG — subtract unsigned to
+	// unsigned, avoiding the old signed cast that could produce spurious
+	// negatives on wrap or if the field was corrupted.
+	CurrentTime  = KeQueryInterruptTime();
+	CounterDelta = (LONGLONG)((CurrentTime - pDeviceContext->LastReportTime) / 1000);
 	if (CounterDelta < 0) {
 		CounterDelta = 0;
 	}
 	if (CounterDelta > 0xFFFF) {
 		CounterDelta = 0xFFFF;
 	}
-	pDeviceContext->LastReportTime.QuadPart = (LONGLONG)CurrentTime;
+	// FIX (sync): KeMemoryBarrier() ensures the compiler does not reorder this
+	// store past the DeviceStatus read in the cleanup branch below.
+	pDeviceContext->LastReportTime = CurrentTime;
+	KeMemoryBarrier();
 
 	RtlZeroMemory(&PtpReport, sizeof(PTP_REPORT));
 
@@ -158,18 +195,29 @@ AmtPtpRequestCompletionRoutine(
 		? PTP_MAX_CONTACT_POINTS
 		: pSpiTrackpadPacket->NumOfFingers;
 
-	if (pDeviceContext->PrevAdjustedCount == 0 && AdjustedCount > 0) {
+	// FIX (cursor jump #3): use PrevReportedCount — contacts actually sent to
+	// the host — for the first-frame ScanTime cap, not PrevAdjustedCount.
+	//
+	// When all hardware fingers were palm-suppressed in the previous frame,
+	// PrevAdjustedCount is non-zero but PrevReportedCount is zero.  Using
+	// PrevAdjustedCount skipped the cap in that case, producing an inflated
+	// ScanTime delta that the host interpreted as high-velocity movement and
+	// interpolated as cursor teleportation.
+	if (pDeviceContext->PrevReportedCount == 0 && AdjustedCount > 0) {
 		if (CounterDelta > IDLE_SCANTIME_THRESHOLD) {
 			CounterDelta = FIRST_FRAME_SCANTIME_CAP;
 		}
 	}
+	// Still update PrevAdjustedCount for any code that needs the raw count.
 	pDeviceContext->PrevAdjustedCount = AdjustedCount;
 
 	for (i = 0; i < PTP_MAX_CONTACT_POINTS; i++) {
 		pDeviceContext->SlotIsPalm[i] = FALSE;
 	}
 
-	ReportedCount = 0;
+	ReportedCount       = 0;
+	CurrentReportedMask = 0;
+
 	for (Count = 0; Count < AdjustedCount; Count++) {
 
 		IsPalm = (pSpiTrackpadPacket->Fingers[Count].TouchMajor >= PALM_MAJOR_THRESHOLD &&
@@ -185,7 +233,19 @@ AmtPtpRequestCompletionRoutine(
 			continue;
 		}
 
-		PtpReport.Contacts[ReportedCount].ContactID = Count;
+		// FIX (cursor jump #1): assign ContactID from ReportedCount, not from
+		// the hardware slot index (Count).
+		//
+		// Using Count created gaps when a slot was palm-suppressed:
+		//   Count=0 -> ContactID=0 (reported)
+		//   Count=1 -> palm, skipped
+		//   Count=2 -> ContactID=2 (reported, but slot 1 was never closed)
+		//
+		// The Windows PTP host stack held ContactID=1 open indefinitely with
+		// its last known X/Y.  On the next finger-down the stack re-activated
+		// that ghost contact and the cursor jumped back to the coordinates of
+		// the vanished finger — which is exactly the right-click cursor jump.
+		PtpReport.Contacts[ReportedCount].ContactID = ReportedCount;
 
 		RawX  = pSpiTrackpadPacket->Fingers[Count].X;
 		NormX = (LONG)RawX - (LONG)pDeviceContext->TrackpadInfo.XMin;
@@ -206,9 +266,12 @@ AmtPtpRequestCompletionRoutine(
 
 		PtpReport.Contacts[ReportedCount].Confidence = 1;
 
+		// Mark this ContactID as live in the current frame.
+		CurrentReportedMask |= (UINT8)(1u << ReportedCount);
+
 		TraceEvents(TRACE_LEVEL_VERBOSE, TRACE_HID_INPUT,
-			"%!FUNC! Contact[%d->%d] ID=%d X=%d Y=%d P=%d Maj=%d Min=%d",
-			Count, ReportedCount, Count,
+			"%!FUNC! Contact[hw=%d->rpt=%d] ID=%d X=%d Y=%d P=%d Maj=%d Min=%d",
+			Count, ReportedCount, ReportedCount,
 			pSpiTrackpadPacket->Fingers[Count].X,
 			pSpiTrackpadPacket->Fingers[Count].Y,
 			pSpiTrackpadPacket->Fingers[Count].Pressure,
@@ -218,10 +281,68 @@ AmtPtpRequestCompletionRoutine(
 		ReportedCount++;
 	}
 
+	// FIX (cursor jump #2): emit lift frames (TipSwitch=0, Confidence=0) for
+	// any ContactID that was live in the previous report but absent this frame.
+	//
+	// Without this, the Windows PTP host stack retains the last-known X/Y of
+	// the missing contact indefinitely.  On the next finger-down it
+	// re-activates that stale contact and the cursor teleports back — which is
+	// the second half of the right-click cursor-jump scenario (the first half
+	// is fixed by ContactID = ReportedCount above).
+	//
+	// We compute DroppedMask = bits that were set previously but not now.
+	// Each set bit corresponds to a ContactID that needs a lift frame.
+	{
+		UINT8 DroppedMask = pDeviceContext->PrevReportedMask & ~CurrentReportedMask;
+		UINT8 LiftBit;
+		for (LiftBit = 0; LiftBit < PTP_MAX_CONTACT_POINTS; LiftBit++) {
+			if (!(DroppedMask & (UINT8)(1u << LiftBit))) {
+				continue;
+			}
+			if (ReportedCount >= PTP_MAX_CONTACT_POINTS) {
+				// Contacts[] is full — no room for more lift frames.
+				// This can only happen if PrevReportedMask had more bits than
+				// PTP_MAX_CONTACT_POINTS, which violates our invariant.
+				// Log and stop rather than write out of bounds.
+				TraceEvents(TRACE_LEVEL_WARNING, TRACE_HID_INPUT,
+					"%!FUNC! No room for lift frame ContactID=%d "
+					"(PrevMask=0x%02x CurrMask=0x%02x)",
+					LiftBit,
+					pDeviceContext->PrevReportedMask,
+					CurrentReportedMask);
+				break;
+			}
+			PtpReport.Contacts[ReportedCount].ContactID  = LiftBit;
+			PtpReport.Contacts[ReportedCount].TipSwitch  = 0;
+			PtpReport.Contacts[ReportedCount].Confidence = 0;
+			PtpReport.Contacts[ReportedCount].X          = 0;
+			PtpReport.Contacts[ReportedCount].Y          = 0;
+
+			TraceEvents(TRACE_LEVEL_VERBOSE, TRACE_HID_INPUT,
+				"%!FUNC! Lift frame emitted for ContactID=%d", LiftBit);
+
+			ReportedCount++;
+		}
+	}
+
 	PtpReport.ReportID        = REPORTID_MULTITOUCH;
 	PtpReport.ContactCount    = ReportedCount;
 	PtpReport.IsButtonClicked = pSpiTrackpadPacket->ClickOccurred;
 	PtpReport.ScanTime        = (USHORT) CounterDelta;
+
+	// Update per-frame tracking state.
+	// PrevReportedCount tracks only "real" contacts (not lift frames) because
+	// lift frames are synthetic — they must not influence the first-frame
+	// ScanTime cap on the next touch sequence.
+	// CurrentReportedMask already excludes lift entries by construction
+	// (lift bits are in DroppedMask which is the complement of CurrentReportedMask).
+	{
+		UINT8 LiftCount = (UINT8)__popcnt(
+			pDeviceContext->PrevReportedMask & ~CurrentReportedMask);
+		pDeviceContext->PrevReportedCount =
+			(ReportedCount > LiftCount) ? (ReportedCount - LiftCount) : 0;
+	}
+	pDeviceContext->PrevReportedMask = CurrentReportedMask;
 
 	Status = WdfRequestRetrieveOutputMemory(PtpRequest, &PtpRequestMemory);
 	if (!NT_SUCCESS(Status)) {
@@ -247,7 +368,9 @@ exit:
 	WdfRequestComplete(PtpRequest, Status);
 
 cleanup:
-	if (pDeviceContext->DeviceStatus == D0ActiveAndConfigured) {
+	// FIX (sync): use DEVICE_STATUS_READ (InterlockedCompareExchange) for a
+	// safe cross-IRQL read of DeviceStatus before re-issuing the request.
+	if (DEVICE_STATUS_READ(pDeviceContext) == D0ActiveAndConfigured) {
 		AmtPtpSpiInputIssueRequest(pDeviceContext->SpiDevice);
 	}
 }
