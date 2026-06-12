@@ -34,7 +34,12 @@ typedef struct _DEVICE_CONTEXT
 	// IO content
 	WDFDEVICE	SpiDevice;
 	WDFIOTARGET SpiTrackpadIoTarget;
-	PTP_AAPL_DEVICE_POWER_STATUS DeviceStatus;
+	// FIX (sync): DeviceStatus is written from PnP callbacks (PASSIVE_LEVEL)
+	// and read from the completion routine (DISPATCH_LEVEL).  Declared LONG so
+	// it can be updated with InterlockedExchange / read with
+	// InterlockedCompareExchange for safe cross-IRQL visibility.
+	// Cast to/from PTP_AAPL_DEVICE_POWER_STATUS at call sites.
+	volatile LONG DeviceStatus;
 	WDFQUEUE	HidQueue;
 	// SPI device metadata
 	USHORT HidVendorID;
@@ -46,8 +51,13 @@ typedef struct _DEVICE_CONTEXT
 	BOOLEAN PtpInputOn;
 	BOOLEAN PtpReportTouch;
 	BOOLEAN PtpReportButton;
-	// Timing
-	LARGE_INTEGER LastReportTime;
+	// FIX (sync): LastReportTime is written at DISPATCH_LEVEL inside the
+	// completion routine and read from the same routine (single pre-allocated
+	// request guarantees no concurrent completion).  Stored as ULONGLONG
+	// (unsigned) to avoid signed/unsigned subtraction hazards; the previous
+	// LARGE_INTEGER union forced a cast to LONGLONG which could produce
+	// spurious negatives on wrap or corruption.
+	volatile ULONGLONG LastReportTime;
 	WDFTIMER PowerOnRecoveryTimer;
 	// Performance counter frequency, cached once at D0Entry.
 	// KeQueryPerformanceFrequency returns a hardware constant;
@@ -58,11 +68,24 @@ typedef struct _DEVICE_CONTEXT
 	// Avoids repeated signed arithmetic in the hot completion path.
 	USHORT XRange;
 	USHORT YRange;
-	// Previous finger count, used to cap ScanTime on the first frame
-	// of a new touch sequence (avoids infinite-velocity first frame).
+	// Previous hardware finger count (clamped to PTP_MAX_CONTACT_POINTS).
+	// Kept separate from PrevReportedCount — used only as a raw snapshot
+	// of what the hardware reported.  Do NOT use for lift-frame logic or
+	// ScanTime cap; use PrevReportedCount / PrevReportedMask instead.
+	// Access is safe: only written/read inside AmtPtpRequestCompletionRoutine,
+	// which is serialized by the single pre-allocated request.
 	UINT8 PrevAdjustedCount;
+	// Number of contacts actually emitted to the host in the previous report
+	// (excludes palm-suppressed and lift-frame slots).
+	// Used for the first-frame ScanTime cap condition.
+	UINT8 PrevReportedCount;
+	// Bitmask of ContactIDs emitted with TipSwitch=1 in the previous report.
+	// Bit N set  =>  ContactID N was live in the last HID report.
+	// Used to detect which contacts disappeared so we can emit TipSwitch=0
+	// lift frames, preventing ghost contacts / cursor-jump on re-touch.
+	// Invariant: only bits 0..(PTP_MAX_CONTACT_POINTS-1) are ever set.
+	UINT8 PrevReportedMask;
 	// Per-slot palm state, re-evaluated each frame.
-	// TRUE while the slot's current contact is classified as a palm.
 	BOOLEAN SlotIsPalm[PTP_MAX_CONTACT_POINTS];
 	// Read buffer lookaside list.
 	WDFLOOKASIDE HidReadBufferLookaside;
@@ -70,6 +93,9 @@ typedef struct _DEVICE_CONTEXT
 	// via WdfRequestReuse to avoid per-frame kernel object alloc/free.
 	// Allocated once in AmtPtpDeviceSpiKmCreateDevice, never freed until
 	// device removal (lifetime = Device object).
+	// Invariant: only one outstanding request at a time — completion routine
+	// re-issues it after each frame.  All PrevXxx fields above are safe
+	// without a spinlock solely because of this single-request invariant.
 	WDFREQUEST  SpiHidReadRequest;
 	WDFMEMORY   SpiHidReadOutputMemory;
 } DEVICE_CONTEXT, *PDEVICE_CONTEXT;
@@ -79,6 +105,16 @@ typedef struct _WORKER_REQUEST_CONTEXT {
 	WDFMEMORY RequestMemory;
 } WORKER_REQUEST_CONTEXT, *PWORKER_REQUEST_CONTEXT;
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(WORKER_REQUEST_CONTEXT, WorkerRequestGetContext)
+
+// Helpers for atomic DeviceStatus access.
+// Writers (PnP callbacks, timer): use DEVICE_STATUS_WRITE.
+// Readers (completion routine at DISPATCH_LEVEL): use DEVICE_STATUS_READ.
+#define DEVICE_STATUS_WRITE(ctx, val) \
+	InterlockedExchange(&(ctx)->DeviceStatus, (LONG)(val))
+#define DEVICE_STATUS_READ(ctx) \
+	((PTP_AAPL_DEVICE_POWER_STATUS)InterlockedCompareExchange( \
+		&(ctx)->DeviceStatus, 0, 0))
+
 NTSTATUS
 AmtPtpDeviceSpiKmCreateDevice(
 	_Inout_ PWDFDEVICE_INIT DeviceInit
@@ -102,4 +138,9 @@ AmtPtpSpiSetState(
 void AmtPtpPowerRecoveryTimerCallback(
 	WDFTIMER Timer
 );
+// EvtIoStop handler registered on HidQueue.
+// Required to allow KMDF to drain the queue during power transitions and
+// surprise removal — without it the framework cannot guarantee all requests
+// are complete before the device powers down, risking DRIVER_POWER_STATE_FAILURE (0x9F).
+EVT_WDF_IO_QUEUE_IO_STOP AmtPtpEvtIoStop;
 EXTERN_C_END
