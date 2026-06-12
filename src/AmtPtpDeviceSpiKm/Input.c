@@ -261,9 +261,18 @@ AmtPtpRequestCompletionRoutine(
 			(NormY >= (LONG)pDeviceContext->YRange) ? pDeviceContext->YRange :
 			                                          (USHORT)NormY;
 
-		PtpReport.Contacts[ReportedCount].TipSwitch =
-			(pSpiTrackpadPacket->Fingers[Count].Pressure >= 1) ? 1 : 0;
+		// FIX (inertia): store clamped coordinates as last-known position for
+		// this slot. Lift frames use these instead of (0,0) so the host sees
+		// the finger disappear at its real last position and computes the
+		// correct exit velocity for inertial scroll.
+		pDeviceContext->SlotLastX[ReportedCount] = PtpReport.Contacts[ReportedCount].X;
+		pDeviceContext->SlotLastY[ReportedCount] = PtpReport.Contacts[ReportedCount].Y;
 
+		// FIX (inertia): TipSwitch driven by presence in NumOfFingers, not
+		// Pressure. On edge exits hardware may report Pressure=0 for one or
+		// more frames before dropping the slot — treating that as a lift cuts
+		// the velocity sample the host needs to compute inertial scroll.
+		PtpReport.Contacts[ReportedCount].TipSwitch  = 1;
 		PtpReport.Contacts[ReportedCount].Confidence = 1;
 
 		// Mark this ContactID as live in the current frame.
