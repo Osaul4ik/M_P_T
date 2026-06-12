@@ -12,9 +12,6 @@ Environment:
 #define PTP_MAX_CONTACT_POINTS 5
 #endif
 
-// Keyboard activity suppression window: 1 second in 100-nanosecond units.
-#define KEYBOARD_SUPPRESSION_INTERVAL (10000000LL)
-
 EXTERN_C_START
 
 typedef struct _SPI_TRACKPAD_INFO {
@@ -53,42 +50,37 @@ typedef struct _DEVICE_CONTEXT
 	SPI_TRACKPAD_INFO TrackpadInfo;
 	REPORT_TYPE ReportType;
 
-	// Windows PTP context
+	// Windows PTP mode flags (set via SET_FEATURE from Windows).
 	BOOLEAN PtpInputOn;
 	BOOLEAN PtpReportTouch;
 	BOOLEAN PtpReportButton;
 
-	// Timer
+	// Timing
 	LARGE_INTEGER LastReportTime;
 	WDFTIMER PowerOnRecoveryTimer;
 
-	// Performance counter frequency, cached at D0Entry.
+	// Performance counter frequency, cached once at D0Entry.
+	// KeQueryPerformanceFrequency returns a hardware constant;
+	// caching avoids a kernel call on every SPI completion (~125-250 Hz).
 	LONGLONG PerformanceFrequency;
 
 	// Precomputed coordinate ranges, cached at D0Entry.
+	// XRange = XMax - XMin, YRange = YMax - YMin (both positive).
+	// Avoids repeated signed arithmetic in the hot completion path.
 	USHORT XRange;
 	USHORT YRange;
 
-	// Finger tracking state for stable ContactID assignment.
-	SHORT  PrevOriginalX[PTP_MAX_CONTACT_POINTS];
-	SHORT  PrevOriginalY[PTP_MAX_CONTACT_POINTS];
-	UINT8  SlotContactID[PTP_MAX_CONTACT_POINTS];
-	UINT8  NextContactID;
+	// Previous finger count, used to cap ScanTime on the first frame
+	// of a new touch sequence (avoids infinite-velocity first frame).
+	UINT8 PrevAdjustedCount;
 
-	// ScanTime: track previous finger count to zero delta on new touchdown.
-	UINT8  PrevAdjustedCount;
-
-	// Palm rejection: track per-slot palm state.
-	// TRUE = slot was classified as palm at least once in this touch lifetime.
+	// Per-slot palm state, re-evaluated each frame.
+	// TRUE while the slot's current contact is classified as a palm.
 	BOOLEAN SlotIsPalm[PTP_MAX_CONTACT_POINTS];
 
-	// Keyboard suppression: system time of last key event (100ns units).
-	// Trackpad input is dropped for KEYBOARD_SUPPRESSION_INTERVAL after
-	// any keystroke to prevent accidental cursor movement while typing.
-	LARGE_INTEGER LastKeyboardEventTime;
-
-	// List of buffers
+	// Read buffer lookaside list.
 	WDFLOOKASIDE HidReadBufferLookaside;
+
 } DEVICE_CONTEXT, *PDEVICE_CONTEXT;
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(DEVICE_CONTEXT, DeviceGetContext)
@@ -127,12 +119,6 @@ AmtPtpSpiSetState(
 
 void AmtPtpPowerRecoveryTimerCallback(
 	WDFTIMER Timer
-);
-
-// Called from keyboard filter or HID stack to notify of keystroke.
-VOID
-AmtPtpNotifyKeyboardEvent(
-	_In_ WDFDEVICE Device
 );
 
 EXTERN_C_END
