@@ -416,9 +416,26 @@ AmtPtpEvtDeviceSelfManagedIoInitOrRestart(
 	}
 	else
 	{
+		LARGE_INTEGER Freq;
+
+		// Cache the performance counter frequency once at startup.
+		// This value is a hardware constant; there is no need to call
+		// KeQueryPerformanceFrequency on every SPI completion routine.
+		KeQueryPerformanceFrequency(&Freq);
+		pDeviceContext->PerformanceFrequency = Freq.QuadPart;
+
+		// Precompute coordinate ranges to avoid repeated signed arithmetic
+		// with boundary checks in the completion hot path.
+		pDeviceContext->XRange =
+			(USHORT)((SHORT)pDeviceContext->TrackpadInfo.XMax -
+			         (SHORT)pDeviceContext->TrackpadInfo.XMin);
+		pDeviceContext->YRange =
+			(USHORT)((SHORT)pDeviceContext->TrackpadInfo.YMax -
+			         (SHORT)pDeviceContext->TrackpadInfo.YMin);
+
 		// Set time and status
 		pDeviceContext->DeviceStatus = D0ActiveAndConfigured;
-		KeQueryPerformanceCounter(&pDeviceContext->LastReportTime);
+		pDeviceContext->LastReportTime = KeQueryPerformanceCounter(NULL);
 	}
 
 exit:
