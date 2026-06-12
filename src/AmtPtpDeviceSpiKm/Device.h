@@ -87,13 +87,6 @@ typedef struct _DEVICE_CONTEXT
 	UINT8 PrevReportedMask;
 	// Per-slot palm state, re-evaluated each frame.
 	BOOLEAN SlotIsPalm[PTP_MAX_CONTACT_POINTS];
-	// Last-known normalised coordinates for each ContactID slot.
-	// Updated every frame a contact is live and reported with TipSwitch=1.
-	// Used in lift frames so the host sees the finger disappear at its real
-	// last position rather than at (0,0), which would destroy the velocity
-	// vector Windows uses to compute post-lift inertial scroll.
-	USHORT SlotLastX[PTP_MAX_CONTACT_POINTS];
-	USHORT SlotLastY[PTP_MAX_CONTACT_POINTS];
 	// Read buffer lookaside list.
 	WDFLOOKASIDE HidReadBufferLookaside;
 	// Pre-allocated SPI read request and output memory, reused every frame
