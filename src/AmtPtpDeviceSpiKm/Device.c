@@ -327,14 +327,26 @@ AmtPtpEvtDeviceD0Exit(
 	// barrier — the drain loop below is guaranteed to see D3 on all processors.
 	DEVICE_STATUS_WRITE(pDeviceContext, D3);
 
-	while (NT_SUCCESS(Status)) {
-		Status = WdfIoQueueRetrieveNextRequest(
+	// Drain all pending HID read requests from the manual queue.
+	// Loop on STATUS_SUCCESS only; exit on STATUS_NO_MORE_ENTRIES (queue empty)
+	// or any other error (e.g. STATUS_INVALID_DEVICE_STATE on surprise removal).
+	// Using the specific sentinel avoids silently leaving requests undrained
+	// if a genuine error occurs mid-drain.
+	for (;;) {
+		NTSTATUS DrainStatus = WdfIoQueueRetrieveNextRequest(
 			pDeviceContext->HidQueue,
 			&OutstandingRequest
 		);
-		if (NT_SUCCESS(Status)) {
-			WdfRequestComplete(OutstandingRequest, STATUS_CANCELLED);
+		if (DrainStatus == STATUS_NO_MORE_ENTRIES) {
+			break;
 		}
+		if (!NT_SUCCESS(DrainStatus)) {
+			TraceEvents(TRACE_LEVEL_WARNING, TRACE_DRIVER,
+				"%!FUNC! WdfIoQueueRetrieveNextRequest error %!STATUS! during drain",
+				DrainStatus);
+			break;
+		}
+		WdfRequestComplete(OutstandingRequest, STATUS_CANCELLED);
 	}
 
 	Status = STATUS_SUCCESS;
@@ -521,10 +533,15 @@ AmtPtpEvtIoStop(
 		"%!FUNC! Entry, ActionFlags = 0x%lx", ActionFlags);
 
 	if (ActionFlags & WdfRequestStopActionSuspend) {
-		// Power transition: acknowledge so the framework can proceed with
-		// power-down.  SelfManagedIoRestart will re-queue the request when
-		// the device comes back to D0.
-		WdfRequestStopAcknowledge(Request, FALSE /* re-queue: no */);
+		// Power transition: complete the pending HID read request with
+		// STATUS_CANCELLED so the framework can proceed with power-down.
+		// DO NOT call WdfRequestStopAcknowledge(FALSE): that acknowledges
+		// without re-queuing and without completing, permanently leaking
+		// the request (framework will never touch it again).
+		// Windows HID class driver automatically re-sends
+		// IOCTL_HID_READ_REPORT when the device returns to D0, so
+		// cancelling here is safe and correct.
+		WdfRequestComplete(Request, STATUS_CANCELLED);
 	} else if (ActionFlags & WdfRequestStopActionPurge) {
 		// Device is being removed — cancel the request immediately.
 		WdfRequestComplete(Request, STATUS_CANCELLED);
