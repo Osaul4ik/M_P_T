@@ -22,13 +22,6 @@ AmtPtpSpiInputRoutineWorker(
 		WdfRequestComplete(PtpRequest, Status);
 		return;
 	}
-
-	// The SPI read pipeline is now driven entirely from
-	// AmtPtpRequestCompletionRoutine. The first read is kicked off
-	// from AmtPtpEvtDeviceSelfManagedIoInitOrRestart (or power recovery)
-	// via AmtPtpSpiInputIssueRequest. After that, each completion
-	// immediately issues the next read without waiting for Windows to
-	// send another HID request — this prevents scroll stutter at 125Hz.
 }
 
 VOID
@@ -43,9 +36,6 @@ AmtPtpSpiInputIssueRequest(
 
 	pDeviceContext = DeviceGetContext(Device);
 
-	// Reuse the pre-allocated request.
-	// Format and completion routine are set once at device creation
-	// and survive WdfRequestReuse — no per-frame setup needed.
 	WDF_REQUEST_REUSE_PARAMS_INIT(&ReuseParams, WDF_REQUEST_REUSE_NO_FLAGS, STATUS_SUCCESS);
 	Status = WdfRequestReuse(pDeviceContext->SpiHidReadRequest, &ReuseParams);
 	if (!NT_SUCCESS(Status)) {
@@ -65,21 +55,10 @@ AmtPtpSpiInputIssueRequest(
 	}
 }
 
-// Palm rejection thresholds (Apple SPI raw units, ~0.01mm each).
-// Reject only when BOTH axes are large simultaneously.
-// A finger at an angle: large Major, small Minor — must NOT be rejected.
 #define PALM_MAJOR_THRESHOLD 3500
 #define PALM_MINOR_THRESHOLD 3500
 
-// ScanTime cap for the first frame of a new touch sequence (100us units).
-// 80 = 8ms, a typical 125Hz interval. Only applied when idle >= IDLE_SCANTIME_THRESHOLD.
 #define FIRST_FRAME_SCANTIME_CAP  80
-
-// Idle threshold: only cap ScanTime when the gap exceeds this value.
-// 5000 units * 100us = 500ms — "trackpad was not touched for a while".
-// Below this threshold the real delta is passed through so Windows can
-// correctly distinguish rapid gesture sequences (e.g. triple-tap →
-// two-finger tap → single tap) without swallowing the first click.
 #define IDLE_SCANTIME_THRESHOLD   5000
 
 VOID
@@ -103,7 +82,6 @@ AmtPtpRequestCompletionRoutine(
 	WDFMEMORY PtpRequestMemory;
 
 	ULONGLONG CurrentTime;
-	ULONGLONG QpcBias;
 	LONGLONG CounterDelta;
 	UINT8 AdjustedCount;
 	UINT8 ReportedCount;
@@ -116,15 +94,11 @@ AmtPtpRequestCompletionRoutine(
 	BOOLEAN IsPalm;
 
 	UNREFERENCED_PARAMETER(Target);
-	UNREFERENCED_PARAMETER(SpiRequest); // pre-allocated, not deleted here
+	UNREFERENCED_PARAMETER(SpiRequest);
 
 	RequestContext = (PWORKER_REQUEST_CONTEXT) Context;
 	pDeviceContext = RequestContext->DeviceContext;
 
-	// Retrieve the pending PTP request. If the queue is empty (Windows
-	// hasn't sent a new HID request yet), skip the report and fall through
-	// to cleanup so we still issue the next SPI read. No request is leaked:
-	// there is nothing in the queue to complete.
 	Status = WdfIoQueueRetrieveNextRequest(pDeviceContext->HidQueue, &PtpRequest);
 	if (!NT_SUCCESS(Status)) {
 		TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DRIVER,
@@ -132,8 +106,6 @@ AmtPtpRequestCompletionRoutine(
 		goto cleanup;
 	}
 
-	// If Windows switched to mouse mode or disabled surface reports,
-	// complete with an empty report immediately.
 	if (!pDeviceContext->PtpInputOn || !pDeviceContext->PtpReportTouch) {
 		RtlZeroMemory(&PtpReport, sizeof(PTP_REPORT));
 		PtpReport.ReportID = REPORTID_MULTITOUCH;
@@ -149,7 +121,6 @@ AmtPtpRequestCompletionRoutine(
 	pSpiTrackpadPacket = (PSPI_TRACKPAD_PACKET) WdfMemoryGetBuffer(
 		Params->Parameters.Ioctl.Output.Buffer, NULL);
 
-	// Validate header presence.
 	if (SpiRequestLength < 46) {
 		TraceEvents(TRACE_LEVEL_ERROR, TRACE_DRIVER,
 			"%!FUNC! Packet too short for header: %d < 46", SpiRequestLength);
@@ -157,7 +128,6 @@ AmtPtpRequestCompletionRoutine(
 		goto exit;
 	}
 
-	// Validate that the packet holds all claimed finger records.
 	MinPacketLength = 46 + (LONG)pSpiTrackpadPacket->NumOfFingers *
 	                       (LONG)sizeof(SPI_TRACKPAD_FINGER);
 	if (SpiRequestLength < MinPacketLength) {
@@ -168,12 +138,11 @@ AmtPtpRequestCompletionRoutine(
 		goto exit;
 	}
 
-	// Compute ScanTime (100us units per HID PTP spec).
-	// KeQueryInterruptTimeToPrecise returns 100ns units directly —
-	// no division by PerformanceFrequency needed, and it is cheaper
-	// than KeQueryPerformanceCounter (no RDTSC serialization fence).
-	// Divide by 1000 to convert 100ns → 100us.
-	CurrentTime = KeQueryInterruptTimeToPrecise(&QpcBias);
+	// KeQueryInterruptTime returns 100ns units since boot.
+	// Divide by 1000 to convert 100ns -> 100us for HID PTP ScanTime.
+	// Equivalent to KeQueryInterruptTimeToPrecise for ScanTime purposes,
+	// and available on all Windows versions without visibility issues.
+	CurrentTime = KeQueryInterruptTime();
 	CounterDelta = (LONGLONG)((CurrentTime - pDeviceContext->LastReportTime.QuadPart) / 1000);
 	if (CounterDelta < 0) {
 		CounterDelta = 0;
@@ -189,10 +158,6 @@ AmtPtpRequestCompletionRoutine(
 		? PTP_MAX_CONTACT_POINTS
 		: pSpiTrackpadPacket->NumOfFingers;
 
-	// ScanTime cap: only when truly idle (gap > 500ms).
-	// For short inter-gesture pauses the real delta is preserved so Windows
-	// correctly identifies each new gesture as distinct and does not swallow
-	// the first click of the next tap.
 	if (pDeviceContext->PrevAdjustedCount == 0 && AdjustedCount > 0) {
 		if (CounterDelta > IDLE_SCANTIME_THRESHOLD) {
 			CounterDelta = FIRST_FRAME_SCANTIME_CAP;
@@ -200,7 +165,6 @@ AmtPtpRequestCompletionRoutine(
 	}
 	pDeviceContext->PrevAdjustedCount = AdjustedCount;
 
-	// Clear palm state each frame; re-derive from current touch data.
 	for (i = 0; i < PTP_MAX_CONTACT_POINTS; i++) {
 		pDeviceContext->SlotIsPalm[i] = FALSE;
 	}
@@ -283,12 +247,6 @@ exit:
 	WdfRequestComplete(PtpRequest, Status);
 
 cleanup:
-	// SpiRequest is the pre-allocated pDeviceContext->SpiHidReadRequest —
-	// do NOT delete it here. It is reused via WdfRequestReuse next cycle.
-
-	// Issue the next SPI read immediately, without waiting for Windows to
-	// send another HID request. This keeps the SPI pipeline full at 125Hz
-	// and prevents scroll from stalling under scheduler jitter.
 	if (pDeviceContext->DeviceStatus == D0ActiveAndConfigured) {
 		AmtPtpSpiInputIssueRequest(pDeviceContext->SpiDevice);
 	}
