@@ -362,53 +362,9 @@ AmtPtpServiceTouchInputInterrupt(
 			);
 		#endif
 			}
-			PtpReport.ContactCount = reportSlots;
-		}
-	}
-				BOOLEAN tip = (AmtRawToInteger(f->touch_major) << 1) >= 200;
-
-				if (tip) {
-					PtpReport.Contacts[reportSlots].ContactID = cid;
-					PtpReport.Contacts[reportSlots].X = (USHORT)x;
-					PtpReport.Contacts[reportSlots].Y = (USHORT)y;
-					PtpReport.Contacts[reportSlots].TipSwitch = 1;
-					PtpReport.Contacts[reportSlots].Confidence = (AmtRawToInteger(f->touch_minor) << 1) > 0;
-					DeviceContext->LastNormX[cid] = (USHORT)x;
-					DeviceContext->LastNormY[cid] = (USHORT)y;
-					DeviceContext->WasReported[cid] = TRUE;
-					reportSlots++;
-				} else {
-					if (cid < PTP_MAX_CONTACT_POINTS && DeviceContext->WasReported[cid]) {
-						PtpReport.Contacts[reportSlots].ContactID = cid;
-						PtpReport.Contacts[reportSlots].X = DeviceContext->LastNormX[cid];
-						PtpReport.Contacts[reportSlots].Y = DeviceContext->LastNormY[cid];
-						PtpReport.Contacts[reportSlots].TipSwitch = 0;
-						PtpReport.Contacts[reportSlots].Confidence = 1;
-						DeviceContext->WasReported[cid] = FALSE;
-						reportSlots++;
-					}
-				}
-
-#ifdef INPUT_CONTENT_TRACE
-				TraceEvents(
-					TRACE_LEVEL_INFORMATION,
-					TRACE_INPUT,
-					"%!FUNC!: Point %llu, X = %d, Y = %d, TipSwitch = %d, Confidence = %d, tMajor = %d, tMinor = %d, origin = %d, PTP Origin = %d",
-					i,
-					(int) (tip ? x : DeviceContext->LastNormX[cid]),
-					(int) (tip ? y : DeviceContext->LastNormY[cid]),
-					tip ? 1 : 0,
-					(AmtRawToInteger(f->touch_minor) << 1) > 0,
-					AmtRawToInteger(f->touch_major) << 1,
-					AmtRawToInteger(f->touch_minor) << 1,
-					AmtRawToInteger(f->origin),
-					(UCHAR) i
-				);
-#endif
+				PtpReport.ContactCount = reportSlots;
 			}
-			PtpReport.ContactCount = reportSlots;
 		}
-	}
 
 	// Type 2 touchpad contains integrated trackpad buttons
 	if (DeviceContext->IsButtonReportOn) {

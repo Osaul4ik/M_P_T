@@ -2,6 +2,8 @@
 
 #pragma once
 
+#include "Metadata/WindowsHID.h"
+
 EXTERN_C_START
 
 // {FF969022-3111-4441-8F88-875440172C2E} for the device interface
