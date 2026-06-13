@@ -193,12 +193,30 @@ AmtPtpDispatchReadReportRequests(
 	PDEVICE_CONTEXT pDevContext;
 
 	status = STATUS_SUCCESS;
-	pDevContext = DeviceGetContext(Device);
+	pDevContext = DeviceGetContext(Device);	*Pending = FALSE;
 
+	if (pDevContext->InputQueue == NULL) {
+		TraceEvents(
+			TRACE_LEVEL_ERROR, TRACE_QUEUE,
+			"%!FUNC! InputQueue not initialized"
+		);
+		return STATUS_INVALID_DEVICE_STATE;
+	}
 	status = WdfRequestForwardToIoQueue(
 		Request,
 		pDevContext->InputQueue
 	);
+
+	if (!NT_SUCCESS(status)) {
+		TraceEvents(
+			TRACE_LEVEL_ERROR, TRACE_QUEUE,
+			"%!FUNC! WdfRequestForwardToIoQueue failed %!STATUS!",
+			status
+		);
+		return status;
+	}
+
+	*Pending = TRUE;
 
 	if (!NT_SUCCESS(status)) {
 		TraceEvents(
@@ -273,7 +291,7 @@ Return Value:
     //
     // A driver might choose to take no action in EvtIoStop for requests that are
     // guaranteed to complete in a small amount of time. For example, the driver might
-    // take no action for requests that are completed in one of the driver’s request handlers.
+    // take no action for requests that are completed in one of the driverï¿½s request handlers.
     //
 
     return;

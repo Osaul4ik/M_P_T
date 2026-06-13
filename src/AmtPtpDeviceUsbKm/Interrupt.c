@@ -119,7 +119,7 @@ AmtPtpEvtUsbInterruptPipeReadComplete(
 			"%!FUNC! Malformed input received. Length = %llu",
 			NumBytesTransferred
 		);
-		return;
+		return;  // Note: malformed packets are dropped as they're interrupt-driven
 	}
 
 	// Retrieve packet
@@ -133,7 +133,7 @@ AmtPtpEvtUsbInterruptPipeReadComplete(
 			TRACE_LEVEL_INFORMATION, TRACE_DRIVER,
 			"%!FUNC! Failed to retrieve packet"
 		);
-		return;
+		return;  // Note: malformed interrupt data is dropped
 	}
 
 	// Retrieve next PTP touchpad request.
@@ -147,7 +147,7 @@ AmtPtpEvtUsbInterruptPipeReadComplete(
 			TRACE_LEVEL_INFORMATION, TRACE_DRIVER,
 			"%!FUNC! No pending PTP request. Disposed"
 		);
-		return;
+		return;  // Note: No request queued - drop interrupt data
 	}
 
 	Status = WdfRequestRetrieveOutputMemory(
@@ -161,6 +161,7 @@ AmtPtpEvtUsbInterruptPipeReadComplete(
 			"%!FUNC! WdfRequestRetrieveOutputMemory failed with %!STATUS!",
 			Status
 		);
+		WdfRequestComplete(Request, Status);
 		return;
 	}
 
@@ -194,6 +195,36 @@ AmtPtpEvtUsbInterruptPipeReadComplete(
 		}
 		{
 			UCHAR reportSlots = 0;
+			BOOLEAN contactActive[PTP_MAX_CONTACT_POINTS] = {FALSE};
+			
+			// First pass: Mark which contact IDs are currently active
+			for (i = 0; i < raw_n; i++) {
+				f = (const struct TRACKPAD_FINGER*) (f_base + i * fingerprintSize);
+				BOOLEAN tip = (AmtRawToInteger(f->touch_major) << 1) >= 200 || (AmtRawToInteger(f->touch_minor) << 1) >= 150;
+				if (tip) {
+					unsigned char cid = (unsigned char)i;
+					if (cid < PTP_MAX_CONTACT_POINTS) {
+						contactActive[cid] = TRUE;
+					}
+				}
+			}
+			
+			// Report lift events for contacts that were previously active but are now inactive
+			for (i = 0; i < PTP_MAX_CONTACT_POINTS; i++) {
+				if (!contactActive[i] && pDeviceContext->WasReported[i]) {
+					if (reportSlots < PTP_MAX_CONTACT_POINTS) {
+						PtpReport.Contacts[reportSlots].ContactID = (UCHAR)i;
+						PtpReport.Contacts[reportSlots].X = pDeviceContext->LastNormX[i];
+						PtpReport.Contacts[reportSlots].Y = pDeviceContext->LastNormY[i];
+						PtpReport.Contacts[reportSlots].TipSwitch = 0;
+						PtpReport.Contacts[reportSlots].Confidence = 1;
+						pDeviceContext->WasReported[i] = FALSE;
+						reportSlots++;
+					}
+				}
+			}
+			
+			// Second pass: Report current active contacts
 			for (i = 0; i < raw_n; i++) {
 				f = (const struct TRACKPAD_FINGER*) (f_base + i * fingerprintSize);
 
@@ -203,27 +234,19 @@ AmtPtpEvtUsbInterruptPipeReadComplete(
 				y = (pDeviceContext->DeviceInfo->y.max - AmtRawToInteger(f->abs_y)) > 0 ? 
 					((USHORT)(pDeviceContext->DeviceInfo->y.max - AmtRawToInteger(f->abs_y))) : 0;
 
-				UCHAR cid = (UCHAR)i;
+				unsigned char cid = (unsigned char)i;
 				BOOLEAN tip = (AmtRawToInteger(f->touch_major) << 1) >= 200 || (AmtRawToInteger(f->touch_minor) << 1) >= 150;
 
-				if (tip) {
-					PtpReport.Contacts[reportSlots].ContactID = cid;
-					PtpReport.Contacts[reportSlots].X = (USHORT)x;
-					PtpReport.Contacts[reportSlots].Y = (USHORT)y;
-					PtpReport.Contacts[reportSlots].TipSwitch = 1;
-					PtpReport.Contacts[reportSlots].Confidence = (AmtRawToInteger(f->touch_minor) << 1) > 0;
-					pDeviceContext->LastNormX[cid] = (USHORT)x;
-					pDeviceContext->LastNormY[cid] = (USHORT)y;
-					pDeviceContext->WasReported[cid] = TRUE;
-					reportSlots++;
-				} else {
-					if (cid < PTP_MAX_CONTACT_POINTS && pDeviceContext->WasReported[cid]) {
-						PtpReport.Contacts[reportSlots].ContactID = cid;
-						PtpReport.Contacts[reportSlots].X = pDeviceContext->LastNormX[cid];
-						PtpReport.Contacts[reportSlots].Y = pDeviceContext->LastNormY[cid];
-						PtpReport.Contacts[reportSlots].TipSwitch = 0;
-						PtpReport.Contacts[reportSlots].Confidence = 1;
-						pDeviceContext->WasReported[cid] = FALSE;
+				if (tip && cid < PTP_MAX_CONTACT_POINTS) {
+					if (reportSlots < PTP_MAX_CONTACT_POINTS) {
+						PtpReport.Contacts[reportSlots].ContactID = (UCHAR)cid;
+						PtpReport.Contacts[reportSlots].X = (USHORT)x;
+						PtpReport.Contacts[reportSlots].Y = (USHORT)y;
+						PtpReport.Contacts[reportSlots].TipSwitch = 1;
+						PtpReport.Contacts[reportSlots].Confidence = (AmtRawToInteger(f->touch_minor) << 1) > 0;
+						pDeviceContext->LastNormX[cid] = (USHORT)x;
+						pDeviceContext->LastNormY[cid] = (USHORT)y;
+						pDeviceContext->WasReported[cid] = TRUE;
 						reportSlots++;
 					}
 				}

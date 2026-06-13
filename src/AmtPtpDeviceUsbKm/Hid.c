@@ -61,6 +61,19 @@ AmtPtpGetHidDescriptor(
 		case USB_DEVICE_ID_APPLE_T2_7D:
 		{
 			szCopy = AmtPtpT2DefaultHidDescriptor.bLength;
+			// Validate output buffer size
+			size_t outputBufferSize = 0;
+			WdfMemoryGetLength(requestMemory, &outputBufferSize);
+			if (outputBufferSize < szCopy) {
+				TraceEvents(
+					TRACE_LEVEL_ERROR, TRACE_DRIVER,
+					"%!FUNC! Output buffer too small. Required: %zu, Available: %zu",
+					szCopy,
+					outputBufferSize
+				);
+				status = STATUS_BUFFER_TOO_SMALL;
+				goto exit;
+			}
 			status = WdfMemoryCopyFromBuffer(
 				requestMemory,
 				0,
@@ -88,6 +101,19 @@ AmtPtpGetHidDescriptor(
 			);
 
 			szCopy = AmtPtpT2DefaultHidDescriptor.bLength;
+			// Validate output buffer size
+			size_t outputBufferSize = 0;
+			WdfMemoryGetLength(requestMemory, &outputBufferSize);
+			if (outputBufferSize < szCopy) {
+				TraceEvents(
+					TRACE_LEVEL_ERROR, TRACE_DRIVER,
+					"%!FUNC! Output buffer too small. Required: %zu, Available: %zu",
+					szCopy,
+					outputBufferSize
+				);
+				status = STATUS_BUFFER_TOO_SMALL;
+				goto exit;
+			}
 			status = WdfMemoryCopyFromBuffer(
 				requestMemory,
 				0,
@@ -215,17 +241,20 @@ AmtPtpGetReportDescriptor(
 				goto exit;
 			}
 
-			status = WdfMemoryCopyFromBuffer(
-				requestMemory,
-				0,
-				(PVOID) &AmtPtpT2ReportDescriptor,
-				szCopy
+		// Validate output buffer size before copying
+		size_t outputBufferSize = 0;
+		WdfMemoryGetLength(requestMemory, &outputBufferSize);
+		if (outputBufferSize < szCopy) {
+			TraceEvents(
+				TRACE_LEVEL_ERROR, TRACE_DRIVER,
+				"%!FUNC! Output buffer too small for report descriptor. Required: %zu, Available: %zu",
+				szCopy,
+				outputBufferSize
 			);
+			status = STATUS_BUFFER_TOO_SMALL;
+			goto exit;
+		}
 
-			if (!NT_SUCCESS(status)) {
-
-				TraceEvents(
-					TRACE_LEVEL_ERROR, TRACE_DRIVER,
 					"%!FUNC! WdfMemoryCopyFromBuffer failed with %!STATUS!",
 					status
 				);
@@ -384,6 +413,15 @@ AmtPtpReportFeatures(
 				goto exit;
 			}
 
+			if (pHidPacket->reportBuffer == NULL) {
+				status = STATUS_INVALID_PARAMETER;
+				TraceEvents(
+					TRACE_LEVEL_ERROR, TRACE_DRIVER,
+					"%!FUNC! Report buffer pointer is NULL for PTPHQA"
+				);
+				goto exit;
+			}
+
 			PPTP_DEVICE_HQA_CERTIFICATION_REPORT certReport = (PPTP_DEVICE_HQA_CERTIFICATION_REPORT)pHidPacket->reportBuffer;
 			*certReport->CertificationBlob = DEFAULT_PTP_HQA_BLOB;
 			certReport->ReportID = REPORTID_PTPHQA;
@@ -473,6 +511,15 @@ AmtPtpSetFeatures(
 				"%!FUNC! Report REPORTID_REPORTMODE is requested"
 			);
 
+			if (pHidPacket->reportBuffer == NULL) {
+				status = STATUS_INVALID_PARAMETER;
+				TraceEvents(
+					TRACE_LEVEL_ERROR, TRACE_DRIVER,
+					"%!FUNC! Report buffer pointer is NULL for REPORTMODE"
+				);
+				goto exit;
+			}
+
 			PPTP_DEVICE_INPUT_MODE_REPORT devInputMode = (PPTP_DEVICE_INPUT_MODE_REPORT) pHidPacket->reportBuffer;
 			BOOLEAN bWellspringMode = pDeviceContext->IsWellspringModeOn;
 
@@ -522,6 +569,15 @@ AmtPtpSetFeatures(
 				TRACE_LEVEL_INFORMATION, TRACE_DRIVER,
 				"%!FUNC! Report REPORTID_FUNCSWITCH is requested"
 			);
+
+			if (pHidPacket->reportBuffer == NULL) {
+				status = STATUS_INVALID_PARAMETER;
+				TraceEvents(
+					TRACE_LEVEL_ERROR, TRACE_DRIVER,
+					"%!FUNC! Report buffer pointer is NULL for FUNCSWITCH"
+				);
+				goto exit;
+			}
 
 			PPTP_DEVICE_SELECTIVE_REPORT_MODE_REPORT secInput = (PPTP_DEVICE_SELECTIVE_REPORT_MODE_REPORT) pHidPacket->reportBuffer;
 

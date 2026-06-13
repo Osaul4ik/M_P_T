@@ -191,10 +191,16 @@ Return Value:
     }
 
 	// Retrieve device information
-	WdfUsbTargetDeviceGetDeviceDescriptor(
+	status = WdfUsbTargetDeviceGetDeviceDescriptor(
 		pDeviceContext->UsbDevice,
 		&pDeviceContext->DeviceDescriptor
 	);
+
+	if (!NT_SUCCESS(status)) {
+		TraceEvents(TRACE_LEVEL_ERROR, TRACE_DEVICE,
+			"WdfUsbTargetDeviceGetDeviceDescriptor failed with %!STATUS!", status);
+		return status;
+	}
 
 	// Get correct configuration from conf store
 	pDeviceContext->DeviceInfo = AmtPtpGetDeviceConfig(pDeviceContext->DeviceDescriptor);
@@ -384,11 +390,20 @@ AmtPtpEvtDeviceD0Exit(
 
 	pDeviceContext = DeviceGetContext(Device);
 
-	// Stop IO Pipe.
-	WdfIoTargetStop(WdfUsbTargetPipeGetIoTarget(
-		pDeviceContext->InterruptPipe),
-		WdfIoTargetCancelSentIo
-	);
+	// Validate critical resources before cleanup
+	if (pDeviceContext->InterruptPipe == NULL) {
+		TraceEvents(
+			TRACE_LEVEL_WARNING,
+			TRACE_DRIVER,
+			"%!FUNC! InterruptPipe is NULL, skipping pipe stop"
+		);
+	} else {
+		// Stop IO Pipe.
+		WdfIoTargetStop(WdfUsbTargetPipeGetIoTarget(
+			pDeviceContext->InterruptPipe),
+			WdfIoTargetCancelSentIo
+		);
+	}
 
 	// Cancel Wellspring mode.
 	TraceEvents(
@@ -406,9 +421,11 @@ AmtPtpEvtDeviceD0Exit(
 		TraceEvents(
 			TRACE_LEVEL_WARNING,
 			TRACE_DRIVER,
-			"%!FUNC! -->AmtPtpDeviceEvtDeviceD0Exit - Cancel Wellspring Mode failed with %!STATUS!",
+			"%!FUNC! -->AmtPtpDeviceEvtDeviceD0Exit - Cancel Wellspring Mode failed with %!STATUS!. Device may not be responsive.",
 			status
 		);
+		// Continue anyway - we still need to cleanup
+		status = STATUS_SUCCESS;
 	}
 
 	TraceEvents(
@@ -638,7 +655,10 @@ cleanup:
 		"%!FUNC! Exit"
 	);
 
-	WdfObjectDelete(bufHandle);
-	bufHandle = NULL;
+	// Explicitly check for NULL before deleting to ensure resource safety
+	if (bufHandle != NULL) {
+		WdfObjectDelete(bufHandle);
+		bufHandle = NULL;
+	}
 	return status;
 }
