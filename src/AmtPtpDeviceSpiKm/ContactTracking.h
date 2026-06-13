@@ -6,9 +6,9 @@
 #pragma once
 
 typedef enum _CONTACT_SLOT_STATE {
-    SlotEmpty   = 0,
-    SlotLive    = 1,
-    SlotLifting = 2,
+    ContactSlotEmpty   = 0,
+    ContactSlotLive    = 1,
+    ContactSlotLifting = 2,
 } CONTACT_SLOT_STATE;
 
 typedef struct _CONTACT_SLOT {
@@ -85,7 +85,7 @@ AmtPtpMatchFingers(
     // Build cost matrix.
     for (i = 0; i < HwCount; i++) {
         for (s = 0; s < PTP_MAX_CONTACT_POINTS; s++) {
-            if (pTable->Slots[s].State == SlotLive) {
+            if (pTable->Slots[s].State == ContactSlotLive) {
                 LONG dx = (LONG)pTable->Slots[s].LastRawX - (LONG)HwRawX[i];
                 LONG dy = (LONG)pTable->Slots[s].LastRawY - (LONG)HwRawY[i];
                 cost[i][s] = dx * dx + dy * dy;
@@ -135,7 +135,7 @@ AmtPtpAllocateSlot(_In_ const CONTACT_TABLE* pTable)
 {
     UINT8 i;
     for (i = 0; i < PTP_MAX_CONTACT_POINTS; i++) {
-        if (pTable->Slots[i].State == SlotEmpty) return i;
+        if (pTable->Slots[i].State == ContactSlotEmpty) return i;
     }
     return SLOT_NONE;
 }
