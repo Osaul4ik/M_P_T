@@ -191,16 +191,11 @@ Return Value:
     }
 
 	// Retrieve device information
-	status = WdfUsbTargetDeviceGetDeviceDescriptor(
+	// WdfUsbTargetDeviceGetDeviceDescriptor returns VOID — no status to check.
+	WdfUsbTargetDeviceGetDeviceDescriptor(
 		pDeviceContext->UsbDevice,
 		&pDeviceContext->DeviceDescriptor
 	);
-
-	if (!NT_SUCCESS(status)) {
-		TraceEvents(TRACE_LEVEL_ERROR, TRACE_DEVICE,
-			"WdfUsbTargetDeviceGetDeviceDescriptor failed with %!STATUS!", status);
-		return status;
-	}
 
 	// Get correct configuration from conf store
 	pDeviceContext->DeviceInfo = AmtPtpGetDeviceConfig(pDeviceContext->DeviceDescriptor);
