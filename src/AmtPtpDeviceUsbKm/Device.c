@@ -92,6 +92,23 @@ AmtPtpDeviceUsbKmCreateDevice(
     return status;
 }
 
+// Helper: reset all slot tracking state to idle.
+static VOID
+AmtPtpResetSlotState(
+    _In_ PDEVICE_CONTEXT pDeviceContext
+)
+{
+    RtlZeroMemory(pDeviceContext->SlotInUse,          sizeof(pDeviceContext->SlotInUse));
+    RtlZeroMemory(pDeviceContext->SlotPendingRelease, sizeof(pDeviceContext->SlotPendingRelease));
+    RtlZeroMemory(pDeviceContext->SlotCooldown,       sizeof(pDeviceContext->SlotCooldown));
+    RtlZeroMemory(pDeviceContext->SlotTipConfirmed,   sizeof(pDeviceContext->SlotTipConfirmed));
+    RtlZeroMemory(pDeviceContext->SlotFingerKey,      sizeof(pDeviceContext->SlotFingerKey));
+    RtlZeroMemory(pDeviceContext->LastNormX,          sizeof(pDeviceContext->LastNormX));
+    RtlZeroMemory(pDeviceContext->LastNormY,          sizeof(pDeviceContext->LastNormY));
+    RtlZeroMemory(pDeviceContext->HystX,              sizeof(pDeviceContext->HystX));
+    RtlZeroMemory(pDeviceContext->HystY,              sizeof(pDeviceContext->HystY));
+}
+
 NTSTATUS
 AmtPtpDeviceUsbKmEvtDevicePrepareHardware(
     _In_ WDFDEVICE Device,
@@ -183,12 +200,8 @@ AmtPtpDeviceUsbKmEvtDevicePrepareHardware(
 	pDeviceContext->PtpReportButton = TRUE;
 	pDeviceContext->PtpReportTouch  = TRUE;
 
-	// ---- Slot-based contact state (no cross-frame tracking) ----
-	RtlZeroMemory(pDeviceContext->SlotInUse,  sizeof(pDeviceContext->SlotInUse));
-	RtlZeroMemory(pDeviceContext->LastNormX,  sizeof(pDeviceContext->LastNormX));
-	RtlZeroMemory(pDeviceContext->LastNormY,  sizeof(pDeviceContext->LastNormY));
-	RtlZeroMemory(pDeviceContext->HystX,      sizeof(pDeviceContext->HystX));
-	RtlZeroMemory(pDeviceContext->HystY,      sizeof(pDeviceContext->HystY));
+	// Reset all slot tracking state.
+	AmtPtpResetSlotState(pDeviceContext);
 
     TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DRIVER, "%!FUNC! Exit");
     return status;
@@ -223,12 +236,8 @@ AmtPtpEvtDeviceD0Entry(
 		}
 	}
 
-	// Re-enter D0: clear slot state so stale contacts are not re-reported.
-	RtlZeroMemory(pDeviceContext->SlotInUse, sizeof(pDeviceContext->SlotInUse));
-	RtlZeroMemory(pDeviceContext->LastNormX, sizeof(pDeviceContext->LastNormX));
-	RtlZeroMemory(pDeviceContext->LastNormY, sizeof(pDeviceContext->LastNormY));
-	RtlZeroMemory(pDeviceContext->HystX,     sizeof(pDeviceContext->HystX));
-	RtlZeroMemory(pDeviceContext->HystY,     sizeof(pDeviceContext->HystY));
+	// Re-entering D0: clear all slot state so stale contacts are not re-reported.
+	AmtPtpResetSlotState(pDeviceContext);
 
 	KeQueryPerformanceCounter(&pDeviceContext->LastReportTime);
 

@@ -50,20 +50,37 @@ typedef struct _DEVICE_CONTEXT
     // Slot-based contact tracking
     // ---------------------------------------------------------------
     // Each slot index IS the ContactID reported to Windows.
-    // A slot is "in use" from the first frame a finger is tip-down
-    // until the first frame it is no longer tip-down (lift event).
-    // No cross-frame position matching is performed; slots are
-    // simply assigned by lowest free index on touch-down.
+    //
+    // Lifecycle:
+    //   COOLDOWN → FREE → CONFIRMING → ACTIVE → PENDING_RELEASE → COOLDOWN
+    //
+    // SlotInUse         - slot is ACTIVE: finger confirmed, being reported.
+    // SlotPendingRelease- finger disappeared this frame; hold for 1 frame
+    //                     before actually freeing the slot.
+    // SlotCooldown      - slot was just released; block reassignment for
+    //                     1 frame to prevent flicker-based reuse.
+    // SlotTipConfirmed  - counts consecutive tip-down frames for this slot
+    //                     (debounce: must reach TIP_CONFIRM_FRAMES before
+    //                     SlotInUse is set and the contact is emitted).
+    // SlotFingerKey     - a stable identity key for the physical finger
+    //                     occupying this slot, used to re-bind across frames
+    //                     without relying on USB array index.
+    //                     Currently encoded as: (UCHAR)firstSeenUsbIndex.
+    //                     Set on first confirmation, cleared on release.
     //
     BOOLEAN             SlotInUse[PTP_MAX_CONTACT_POINTS];
+    BOOLEAN             SlotPendingRelease[PTP_MAX_CONTACT_POINTS];
+    BOOLEAN             SlotCooldown[PTP_MAX_CONTACT_POINTS];
+    UCHAR               SlotTipConfirmed[PTP_MAX_CONTACT_POINTS]; // frame counter
+    UCHAR               SlotFingerKey[PTP_MAX_CONTACT_POINTS];    // finger identity
 
-    // Last reported normalised coordinates — used only for the
-    // lift-event report so the final position is stable.
+    // Last reported normalised coordinates — used for lift-event report so
+    // the final position is stable.
     USHORT              LastNormX[PTP_MAX_CONTACT_POINTS];
     USHORT              LastNormY[PTP_MAX_CONTACT_POINTS];
 
-    // Per-slot hysteresis: suppress sub-deadzone jitter while a
-    // finger stays down. No prediction or smoothing is applied.
+    // Per-slot hysteresis: suppress sub-deadzone jitter while a finger stays
+    // down.  No prediction or smoothing is applied.
     USHORT              HystX[PTP_MAX_CONTACT_POINTS];
     USHORT              HystY[PTP_MAX_CONTACT_POINTS];
 

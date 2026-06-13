@@ -3,39 +3,78 @@
 // Contact-ID model
 // ----------------
 // Each PTP_MAX_CONTACT_POINTS slot has a fixed index that IS the ContactID
-// Windows receives.  A slot is acquired on the first frame a physical finger
-// reads as tip-down and released on the first frame it is no longer tip-down.
-// No cross-frame position matching, velocity, smoothing, or prediction is
-// performed.  The handler is fully stateless except for slot occupancy, last
-// reported coordinates (for lift events), and per-slot hysteresis.
+// Windows receives.  The slot lifecycle is:
 //
-// Per-frame algorithm
-// -------------------
-//  1. Walk the USB finger array; determine which fingers are "tip-down" this
-//     frame using the same touch_major / touch_minor threshold as before.
-//  2. Map USB finger[i] → slot: if the finger count equals the last frame's
-//     active slot count AND each active slot is still occupied in the same
-//     order, keep existing assignments.  Otherwise assign slots by lowest
-//     free index (stable sort by USB array position).
-//  3. Emit lift contacts for every slot that was in-use last frame but has no
-//     matching finger this frame.
-//  4. Emit touch contacts for every slot that has an active finger this frame.
-//  5. Apply a 2-unit deadzone hysteresis on X and Y independently to suppress
-//     sub-pixel jitter while a finger stays on the same slot.
+//   FREE → CONFIRMING → ACTIVE → PENDING_RELEASE → COOLDOWN → FREE
+//
+//   FREE            No finger.  Available for new assignments after cooldown.
+//   CONFIRMING      A tip-down was seen but not yet confirmed (debounce).
+//                   SlotTipConfirmed counts consecutive tip-down frames.
+//                   Contact is NOT yet reported to Windows in this state.
+//   ACTIVE          Tip confirmed.  SlotInUse == TRUE.  Contact reported
+//                   every frame while the finger stays down.
+//   PENDING_RELEASE Tip went absent this frame.  SlotPendingRelease == TRUE.
+//                   Lift event NOT yet emitted — wait one more frame to
+//                   distinguish a true lift from a transient gap.
+//   COOLDOWN        Lift event was emitted.  SlotCooldown == TRUE.
+//                   Slot may not be reassigned this frame; cleared next frame.
+//
+// Slot assignment (USB-index independent)
+// ----------------------------------------
+// USB finger array index is treated as INPUT ORDER ONLY, not as identity.
+// Identity is tracked via SlotFingerKey[], which stores a stable key derived
+// from the order the finger first appeared.  On each frame:
+//
+//  1. For each tip-down USB finger, try to find an ACTIVE or CONFIRMING slot
+//     whose SlotFingerKey matches.  If found, keep that slot.
+//  2. If no existing slot matches, assign the lowest FREE (non-cooldown) slot
+//     and store a new key.
+//  3. Slots that are ACTIVE or CONFIRMING but received no match this frame
+//     transition to PENDING_RELEASE.
+//  4. Slots that were PENDING_RELEASE last frame and are still unmatched emit
+//     a lift event and enter COOLDOWN.
+//  5. COOLDOWN slots are cleared unconditionally at the start of each frame.
+//
+// Per-frame algorithm (summary)
+// ------------------------------
+//  Phase 0  Clear cooldown flags set last frame.
+//  Phase 1  Walk USB finger array; compute tip-down + normalised coords.
+//  Phase 2  Match tip-down fingers to existing slots by key; assign new
+//           slots for unmatched fingers.
+//  Phase 3  Process slots with no finger match:
+//             CONFIRMING       → FREE (abort, no event emitted)
+//             ACTIVE           → PENDING_RELEASE
+//             PENDING_RELEASE  → emit lift, enter COOLDOWN
+//  Phase 4  Build PTP_REPORT:
+//             PENDING_RELEASE slots in state transition (see above) are
+//             already handled in Phase 3 and will NOT appear in Phase 4.
+//             ACTIVE slots (newly confirmed or continuing) emit touch contacts.
+//  Phase 5  Update per-slot persistent state.
 
 #include "Driver.h"
 #include "Interrupt.tmh"
 
 // ---- tunables ---------------------------------------------------------------
 
-// Minimum touch_major (doubled) to count as tip-down, matching original code.
+// Minimum touch_major (doubled) to count as tip-down.
 #define TIP_MAJOR_THRESHOLD  200
 #define TIP_MINOR_THRESHOLD  150
+
+// Number of consecutive tip-down frames required before a slot becomes ACTIVE
+// and is reported to Windows.  1 = report immediately on first seen frame
+// (same as original).  2 = require two consecutive frames (debounce).
+#define TIP_CONFIRM_FRAMES   2
 
 // Deadzone: if the new coordinate differs from the hysteresis baseline by
 // fewer than this many raw units, hold the last reported value.
 // Set to 0 to disable.
 #define XY_DEADZONE_UNITS    2
+
+// Sentinel: "no slot" value for slot index fields.
+#define SLOT_NONE  ((UCHAR)PTP_MAX_CONTACT_POINTS)
+
+// Sentinel: "no key assigned" for SlotFingerKey[].
+#define KEY_NONE   ((UCHAR)0xFF)
 
 // -----------------------------------------------------------------------------
 
@@ -45,21 +84,21 @@ AmtRawToInteger(_In_ USHORT x)
     return (signed short)x;
 }
 
-// Clamp a USHORT value to [0, max].  Returns 0 for negative raw coordinates.
+// Clamp a raw signed coordinate to [0, maxVal].
 static inline USHORT
 AmtClampCoord(_In_ INT raw, _In_ INT minVal, _In_ INT maxVal)
 {
     INT v = raw - minVal;
-    if (v < 0)        v = 0;
-    if (v > maxVal)   v = (USHORT)maxVal;
+    if (v < 0)      v = 0;
+    if (v > maxVal) v = maxVal;
     return (USHORT)v;
 }
 
-// Apply deadzone hysteresis.  *pBaseline is updated only when the value moves
-// outside the deadzone.  Returns the value that should be reported.
+// Apply deadzone hysteresis.  *pBaseline is updated only when the new value
+// moves outside the deadzone band.  Returns the value to report.
 static inline USHORT
 AmtApplyDeadzone(
-    _In_    USHORT newVal,
+    _In_    USHORT  newVal,
     _Inout_ USHORT* pBaseline)
 {
 #if XY_DEADZONE_UNITS > 0
@@ -134,11 +173,12 @@ AmtPtpEvtUsbInterruptPipeReadComplete(
 {
     UNREFERENCED_PARAMETER(Pipe);
 
-    PDEVICE_CONTEXT         pDeviceContext  = Context;
-    const size_t            headerSize      = (size_t)pDeviceContext->DeviceInfo->tp_header;
-    const size_t            fingerSize      = (size_t)pDeviceContext->DeviceInfo->tp_fsize;
+    PDEVICE_CONTEXT         pCtx            = Context;
+    const size_t            headerSize      = (size_t)pCtx->DeviceInfo->tp_header;
+    const size_t            fingerSize      = (size_t)pCtx->DeviceInfo->tp_fsize;
     size_t                  raw_n;
     size_t                  i;
+    size_t                  s;
 
     UCHAR*                  TouchBuffer;
     UCHAR*                  f_base;
@@ -168,7 +208,7 @@ AmtPtpEvtUsbInterruptPipeReadComplete(
     }
 
     // ---- dequeue pending HID read request -------------------------------
-    Status = WdfIoQueueRetrieveNextRequest(pDeviceContext->InputQueue, &Request);
+    Status = WdfIoQueueRetrieveNextRequest(pCtx->InputQueue, &Request);
     if (!NT_SUCCESS(Status)) {
         TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DRIVER,
             "%!FUNC! No pending PTP request — dropped");
@@ -185,166 +225,270 @@ AmtPtpEvtUsbInterruptPipeReadComplete(
 
     // ---- prepare report skeleton ----------------------------------------
     RtlZeroMemory(&PtpReport, sizeof(PTP_REPORT));
-    PtpReport.ReportID      = REPORTID_MULTITOUCH;
+    PtpReport.ReportID        = REPORTID_MULTITOUCH;
     PtpReport.IsButtonClicked = 0;
 
-    // Scan time in 100 µs units, clamped to UCHAR.
+    // Scan time in 100 µs units, clamped to USHORT.
     KeQueryPerformanceCounter(&CurrentPerfCounter);
     PerfCounterDelta = (CurrentPerfCounter.QuadPart -
-                        pDeviceContext->LastReportTime.QuadPart) / 100;
+                        pCtx->LastReportTime.QuadPart) / 100;
     if (PerfCounterDelta > 0xFF) PerfCounterDelta = 0xFF;
     PtpReport.ScanTime = (USHORT)PerfCounterDelta;
 
     // ---- touch contacts -------------------------------------------------
-    if (pDeviceContext->PtpReportTouch)
+    UCHAR reportSlots = 0;
+
+    if (pCtx->PtpReportTouch)
     {
         raw_n = (NumBytesTransferred - headerSize) / fingerSize;
         if (raw_n > PTP_MAX_CONTACT_POINTS) raw_n = PTP_MAX_CONTACT_POINTS;
 
-        f_base = TouchBuffer + headerSize + pDeviceContext->DeviceInfo->tp_delta;
+        f_base = TouchBuffer + headerSize + pCtx->DeviceInfo->tp_delta;
 
-        //
-        // Step 1: Determine which USB fingers are tip-down and compute their
-        //         normalised coordinates.  Store results in local arrays.
-        //
-        BOOLEAN fingerTipDown[PTP_MAX_CONTACT_POINTS] = { FALSE };
-        USHORT  fingerNormX  [PTP_MAX_CONTACT_POINTS] = { 0 };
-        USHORT  fingerNormY  [PTP_MAX_CONTACT_POINTS] = { 0 };
+        // =================================================================
+        // Phase 0: Clear cooldown flags that were set in the previous frame.
+        // A slot in cooldown for exactly one frame becomes FREE here.
+        // =================================================================
+        for (s = 0; s < PTP_MAX_CONTACT_POINTS; s++) {
+            if (pCtx->SlotCooldown[s]) {
+                pCtx->SlotCooldown[s]     = FALSE;
+                pCtx->SlotFingerKey[s]    = KEY_NONE;
+                TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_INPUT,
+                    "%!FUNC! Slot %llu cooldown cleared → FREE", (ULONG64)s);
+            }
+        }
+
+        // =================================================================
+        // Phase 1: Walk USB finger array.
+        //          Compute tip-down status and normalised coordinates.
+        //          Assign a per-finger key: 0x00..0x09 in order of first
+        //          appearance — stable within a touch sequence because Apple
+        //          trackpads keep fingers in the same array position while
+        //          they stay on the pad.  A fresh key is derived from the
+        //          USB array index, but only used to FIND an existing slot,
+        //          not to SELECT one.
+        // =================================================================
+        BOOLEAN fingerTipDown [PTP_MAX_CONTACT_POINTS] = { FALSE };
+        USHORT  fingerNormX   [PTP_MAX_CONTACT_POINTS] = { 0 };
+        USHORT  fingerNormY   [PTP_MAX_CONTACT_POINTS] = { 0 };
+        UCHAR   fingerKey     [PTP_MAX_CONTACT_POINTS];
+
+        for (i = 0; i < PTP_MAX_CONTACT_POINTS; i++)
+            fingerKey[i] = KEY_NONE;
 
         for (i = 0; i < raw_n; i++) {
             f = (const struct TRACKPAD_FINGER*)(f_base + i * fingerSize);
 
-            BOOLEAN tip = (AmtRawToInteger(f->touch_major) << 1) >= TIP_MAJOR_THRESHOLD ||
-                          (AmtRawToInteger(f->touch_minor) << 1) >= TIP_MINOR_THRESHOLD;
+            BOOLEAN tip =
+                (AmtRawToInteger(f->touch_major) << 1) >= TIP_MAJOR_THRESHOLD ||
+                (AmtRawToInteger(f->touch_minor) << 1) >= TIP_MINOR_THRESHOLD;
 
             fingerTipDown[i] = tip;
 
             if (tip) {
-                // Clamp X: map [x.min, x.min + range] → [0, range]
-                INT xRange = pDeviceContext->DeviceInfo->x.max -
-                             pDeviceContext->DeviceInfo->x.min;
-                INT yRange = pDeviceContext->DeviceInfo->y.max -
-                             pDeviceContext->DeviceInfo->y.min;
+                INT xRange = pCtx->DeviceInfo->x.max - pCtx->DeviceInfo->x.min;
+                INT yRange = pCtx->DeviceInfo->y.max - pCtx->DeviceInfo->y.min;
 
                 fingerNormX[i] = AmtClampCoord(
                     AmtRawToInteger(f->abs_x),
-                    pDeviceContext->DeviceInfo->x.min,
+                    pCtx->DeviceInfo->x.min,
                     xRange);
 
-                // Y axis is inverted: 0 = bottom of pad in raw, 0 = top in HID.
-                INT normY = pDeviceContext->DeviceInfo->y.max -
-                            AmtRawToInteger(f->abs_y);
+                // Y axis: 0 = bottom of pad in raw, 0 = top in HID.
+                INT normY = pCtx->DeviceInfo->y.max - AmtRawToInteger(f->abs_y);
                 fingerNormY[i] = AmtClampCoord(normY, 0, yRange);
+
+                // Finger key: USB array index cast to byte.
+                // This is stable as long as the finger stays in the same
+                // array position (which Apple trackpads guarantee).
+                fingerKey[i] = (UCHAR)i;
             }
         }
 
+        // =================================================================
+        // Phase 2: Match tip-down fingers to slots.
         //
-        // Step 2: Assign slots.
+        // For each tip-down finger, search for a slot whose SlotFingerKey
+        // matches.  A slot is a candidate if:
+        //   • It is ACTIVE (SlotInUse) or CONFIRMING (SlotTipConfirmed > 0)
+        //   • Its SlotFingerKey equals fingerKey[i]
         //
-        // Strategy: walk active slots first.  For each slot currently in use,
-        // try to find an unmatched tip-down finger in the same USB position
-        // (i.e. fingerIndex == slot, since USB finger ordering is stable within
-        // a touch sequence on Apple trackpads).  If that finger is still
-        // tip-down, keep the slot.  If not, the slot will be freed below.
+        // If no matching slot exists, assign the lowest FREE slot
+        // (SlotInUse == FALSE && SlotPendingRelease == FALSE &&
+        //  SlotCooldown == FALSE && SlotTipConfirmed == 0).
         //
-        // For new fingers (no slot yet), assign the lowest free slot.
-        //
-        // This is deliberately O(n²) with n ≤ PTP_MAX_CONTACT_POINTS (≤ 10),
-        // so the complexity is bounded and acceptable in a DISPATCH_LEVEL path.
-        //
+        // slotForFinger[i] = slot index assigned to USB finger i, or SLOT_NONE.
+        // fingerForSlot[s] = USB finger index matched to slot s, or SLOT_NONE.
+        // =================================================================
+        UCHAR slotForFinger[PTP_MAX_CONTACT_POINTS];
+        UCHAR fingerForSlot[PTP_MAX_CONTACT_POINTS];
 
-        // slotAssignedToFinger[i] = slot index for USB finger i, or
-        //                           PTP_MAX_CONTACT_POINTS if unassigned.
-        UCHAR slotAssignedToFinger[PTP_MAX_CONTACT_POINTS];
-        for (i = 0; i < PTP_MAX_CONTACT_POINTS; i++)
-            slotAssignedToFinger[i] = PTP_MAX_CONTACT_POINTS;
+        for (i = 0; i < PTP_MAX_CONTACT_POINTS; i++) slotForFinger[i] = SLOT_NONE;
+        for (s = 0; s < PTP_MAX_CONTACT_POINTS; s++) fingerForSlot[s] = SLOT_NONE;
 
-        // Working copy of slot occupancy for this frame.
-        BOOLEAN slotActive[PTP_MAX_CONTACT_POINTS];
-        for (i = 0; i < PTP_MAX_CONTACT_POINTS; i++)
-            slotActive[i] = pDeviceContext->SlotInUse[i];
-
-        // Assign tip-down fingers to slots.
+        // 2a. Match by key.
         for (i = 0; i < raw_n; i++) {
             if (!fingerTipDown[i]) continue;
 
-            // Prefer slot == i (USB index matches slot index) if it is free or
-            // already assigned to this USB index from a prior frame.
-            UCHAR preferredSlot = (i < PTP_MAX_CONTACT_POINTS) ? (UCHAR)i
-                                                                 : PTP_MAX_CONTACT_POINTS;
-            if (preferredSlot < PTP_MAX_CONTACT_POINTS && !slotActive[preferredSlot]) {
-                // Free slot at preferred position — take it.
-                slotAssignedToFinger[i] = preferredSlot;
-                slotActive[preferredSlot] = TRUE;
-            } else if (preferredSlot < PTP_MAX_CONTACT_POINTS && slotActive[preferredSlot]) {
-                // Slot already occupied (possibly by us from last frame).
-                // Claim it — if it was already used, it will be re-reported;
-                // any collision is resolved by finding the next free slot below.
-                slotAssignedToFinger[i] = preferredSlot;
-                // slotActive[preferredSlot] already TRUE — no change needed.
-            }
-
-            // If slot still unassigned (e.g. preferred slot taken by another
-            // finger), fall through to free-slot search.
-            if (slotAssignedToFinger[i] == PTP_MAX_CONTACT_POINTS) {
-                for (size_t s = 0; s < PTP_MAX_CONTACT_POINTS; s++) {
-                    if (!slotActive[s]) {
-                        slotAssignedToFinger[i] = (UCHAR)s;
-                        slotActive[s] = TRUE;
-                        break;
-                    }
+            UCHAR key = fingerKey[i];
+            for (s = 0; s < PTP_MAX_CONTACT_POINTS; s++) {
+                if ((pCtx->SlotInUse[s] || pCtx->SlotTipConfirmed[s] > 0) &&
+                    pCtx->SlotFingerKey[s] == key &&
+                    fingerForSlot[s] == SLOT_NONE)
+                {
+                    slotForFinger[i] = (UCHAR)s;
+                    fingerForSlot[s] = (UCHAR)i;
+                    break;
                 }
             }
         }
 
-        //
-        // Step 3: Build the report.
-        //
-        UCHAR reportSlots = 0;
+        // 2b. Assign new slots for unmatched tip-down fingers.
+        for (i = 0; i < raw_n; i++) {
+            if (!fingerTipDown[i]) continue;
+            if (slotForFinger[i] != SLOT_NONE) continue;  // already matched
 
-        // 3a. Lift events: slots that were in-use last frame but are not
-        //     claimed by any tip-down finger this frame.
-        for (size_t s = 0; s < PTP_MAX_CONTACT_POINTS; s++) {
-            if (!pDeviceContext->SlotInUse[s]) continue;  // was not active
+            // Find lowest FREE slot (not in use, not pending release, not in
+            // cooldown, not currently confirming another finger).
+            for (s = 0; s < PTP_MAX_CONTACT_POINTS; s++) {
+                if (!pCtx->SlotInUse[s] &&
+                    !pCtx->SlotPendingRelease[s] &&
+                    !pCtx->SlotCooldown[s] &&
+                    pCtx->SlotTipConfirmed[s] == 0 &&
+                    fingerForSlot[s] == SLOT_NONE)
+                {
+                    slotForFinger[i] = (UCHAR)s;
+                    fingerForSlot[s] = (UCHAR)i;
+                    pCtx->SlotFingerKey[s] = fingerKey[i];
 
-            // Check if any finger claimed this slot.
-            BOOLEAN claimed = FALSE;
-            for (i = 0; i < raw_n; i++) {
-                if (slotAssignedToFinger[i] == (UCHAR)s) {
-                    claimed = TRUE;
+                    TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_INPUT,
+                        "%!FUNC! Finger %llu → new slot %llu (key=%d)",
+                        (ULONG64)i, (ULONG64)s, (INT)fingerKey[i]);
                     break;
                 }
             }
+        }
 
-            if (!claimed) {
-                // Emit lift using last known coordinates (stable final position).
+        // =================================================================
+        // Phase 3: Advance slot state for slots that have NO finger match.
+        //
+        //   CONFIRMING (SlotTipConfirmed > 0, SlotInUse == FALSE)
+        //     → reset tip counter and key; slot returns to FREE silently.
+        //
+        //   ACTIVE (SlotInUse == TRUE)
+        //     → set SlotPendingRelease, clear SlotInUse.
+        //       Lift event is NOT emitted yet — wait one frame.
+        //
+        //   PENDING_RELEASE (SlotPendingRelease == TRUE)
+        //     → emit lift event now, clear pending flag, set cooldown.
+        //
+        // Note: a slot in PENDING_RELEASE can also receive a new finger match
+        // (e.g. rapid re-touch).  In that case fingerForSlot[s] != SLOT_NONE
+        // and we skip Phase 3 for that slot, resurrecting it as ACTIVE.
+        // =================================================================
+        for (s = 0; s < PTP_MAX_CONTACT_POINTS; s++) {
+
+            if (fingerForSlot[s] != SLOT_NONE) {
+                // Slot has a live finger this frame — no release processing.
+                // If the slot was pending release (rapid re-touch), resurrect it.
+                if (pCtx->SlotPendingRelease[s]) {
+                    pCtx->SlotPendingRelease[s] = FALSE;
+                    TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_INPUT,
+                        "%!FUNC! Slot %llu re-touched during pending release", (ULONG64)s);
+                }
+                continue;
+            }
+
+            // ---- PENDING_RELEASE → emit lift, enter COOLDOWN ----
+            if (pCtx->SlotPendingRelease[s]) {
                 if (reportSlots < PTP_MAX_CONTACT_POINTS) {
                     PtpReport.Contacts[reportSlots].ContactID  = (UCHAR)s;
-                    PtpReport.Contacts[reportSlots].X          = pDeviceContext->LastNormX[s];
-                    PtpReport.Contacts[reportSlots].Y          = pDeviceContext->LastNormY[s];
+                    PtpReport.Contacts[reportSlots].X          = pCtx->LastNormX[s];
+                    PtpReport.Contacts[reportSlots].Y          = pCtx->LastNormY[s];
                     PtpReport.Contacts[reportSlots].TipSwitch  = 0;
                     PtpReport.Contacts[reportSlots].Confidence = 1;
                     reportSlots++;
                 }
-
-                // Release slot.
-                pDeviceContext->SlotInUse[s] = FALSE;
+                pCtx->SlotPendingRelease[s] = FALSE;
+                pCtx->SlotCooldown[s]       = TRUE;
+                // SlotTipConfirmed and SlotFingerKey are cleared in Phase 0
+                // next frame, together with SlotCooldown.
 
                 TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_INPUT,
-                    "%!FUNC! Slot %llu lifted", (ULONG64)s);
+                    "%!FUNC! Slot %llu lift emitted → COOLDOWN", (ULONG64)s);
+                continue;
+            }
+
+            // ---- ACTIVE → PENDING_RELEASE ----
+            if (pCtx->SlotInUse[s]) {
+                pCtx->SlotInUse[s]          = FALSE;
+                pCtx->SlotPendingRelease[s] = TRUE;
+                TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_INPUT,
+                    "%!FUNC! Slot %llu ACTIVE → PENDING_RELEASE", (ULONG64)s);
+                continue;
+            }
+
+            // ---- CONFIRMING (no match this frame) → FREE ----
+            if (pCtx->SlotTipConfirmed[s] > 0) {
+                pCtx->SlotTipConfirmed[s] = 0;
+                pCtx->SlotFingerKey[s]    = KEY_NONE;
+                TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_INPUT,
+                    "%!FUNC! Slot %llu CONFIRMING aborted → FREE", (ULONG64)s);
+                continue;
             }
         }
 
-        // 3b. Touch events: active fingers this frame.
+        // =================================================================
+        // Phase 4: Build touch contact records for active fingers.
+        //
+        //   For each tip-down finger with an assigned slot:
+        //     • Increment SlotTipConfirmed.
+        //     • If SlotTipConfirmed reaches TIP_CONFIRM_FRAMES, mark the
+        //       slot ACTIVE (SlotInUse = TRUE) and emit a touch contact.
+        //     • If already ACTIVE (SlotInUse was TRUE before Phase 3 cleared
+        //       it — but wait: Phase 3 only clears SlotInUse for unmatched
+        //       slots, so matched ACTIVE slots still have SlotInUse == TRUE
+        //       here), emit a touch contact directly.
+        // =================================================================
         for (i = 0; i < raw_n; i++) {
             if (!fingerTipDown[i]) continue;
 
-            UCHAR slot = slotAssignedToFinger[i];
-            if (slot >= PTP_MAX_CONTACT_POINTS) continue;  // ran out of slots
+            UCHAR slot = slotForFinger[i];
+            if (slot >= PTP_MAX_CONTACT_POINTS) continue;  // no free slot found
+
+            // Advance tip confirmation counter.
+            if (pCtx->SlotTipConfirmed[slot] < TIP_CONFIRM_FRAMES) {
+                pCtx->SlotTipConfirmed[slot]++;
+            }
+
+            // Check if confirmed or already active.
+            BOOLEAN alreadyActive    = pCtx->SlotInUse[slot];
+            BOOLEAN justConfirmed    = (!alreadyActive &&
+                                        pCtx->SlotTipConfirmed[slot] >= TIP_CONFIRM_FRAMES);
+
+            if (!alreadyActive && !justConfirmed) {
+                // Still in CONFIRMING state; do not emit yet.
+                TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_INPUT,
+                    "%!FUNC! Slot %d confirming (%d/%d)",
+                    (INT)slot,
+                    (INT)pCtx->SlotTipConfirmed[slot],
+                    TIP_CONFIRM_FRAMES);
+                continue;
+            }
+
+            if (justConfirmed) {
+                pCtx->SlotInUse[slot] = TRUE;
+                // Reset hysteresis baseline on activation so deadzone starts
+                // from the first confirmed position.
+                pCtx->HystX[slot] = fingerNormX[i];
+                pCtx->HystY[slot] = fingerNormY[i];
+                TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_INPUT,
+                    "%!FUNC! Slot %d confirmed → ACTIVE", (INT)slot);
+            }
 
             // Apply per-slot deadzone hysteresis.
-            USHORT reportX = AmtApplyDeadzone(fingerNormX[i], &pDeviceContext->HystX[slot]);
-            USHORT reportY = AmtApplyDeadzone(fingerNormY[i], &pDeviceContext->HystY[slot]);
+            USHORT reportX = AmtApplyDeadzone(fingerNormX[i], &pCtx->HystX[slot]);
+            USHORT reportY = AmtApplyDeadzone(fingerNormY[i], &pCtx->HystY[slot]);
 
             if (reportSlots < PTP_MAX_CONTACT_POINTS) {
                 f = (const struct TRACKPAD_FINGER*)(f_base + i * fingerSize);
@@ -358,21 +502,22 @@ AmtPtpEvtUsbInterruptPipeReadComplete(
                 reportSlots++;
             }
 
-            // Update per-slot state.
-            pDeviceContext->SlotInUse[slot]  = TRUE;
-            pDeviceContext->LastNormX[slot]  = reportX;
-            pDeviceContext->LastNormY[slot]  = reportY;
+            // =================================================================
+            // Phase 5: Update persistent per-slot state.
+            // =================================================================
+            pCtx->LastNormX[slot] = reportX;
+            pCtx->LastNormY[slot] = reportY;
 
             TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_INPUT,
-                "%!FUNC! Slot %d  x=%d  y=%d", (INT)slot, (INT)reportX, (INT)reportY);
+                "%!FUNC! Slot %d x=%d y=%d", (INT)slot, (INT)reportX, (INT)reportY);
         }
 
         PtpReport.ContactCount = reportSlots;
     }
 
     // ---- button ---------------------------------------------------------
-    if (pDeviceContext->PtpReportButton) {
-        if (TouchBuffer[pDeviceContext->DeviceInfo->tp_button]) {
+    if (pCtx->PtpReportButton) {
+        if (TouchBuffer[pCtx->DeviceInfo->tp_button]) {
             PtpReport.IsButtonClicked = TRUE;
             TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_INPUT,
                 "%!FUNC! Trackpad button clicked");
@@ -380,6 +525,9 @@ AmtPtpEvtUsbInterruptPipeReadComplete(
     }
 
     // ---- write report back to HID stack ---------------------------------
+    // Update scan time baseline BEFORE completing the request.
+    pCtx->LastReportTime = CurrentPerfCounter;
+
     Status = WdfMemoryCopyFromBuffer(
         RequestMemory, 0, (PVOID)&PtpReport, sizeof(PTP_REPORT));
 
