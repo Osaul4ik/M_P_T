@@ -277,6 +277,12 @@ Return Value:
 	RtlZeroMemory(pDeviceContext->LastNormY, sizeof(pDeviceContext->LastNormY));
 	RtlZeroMemory(pDeviceContext->WasReported, sizeof(pDeviceContext->WasReported));
 
+	// Initialize contact tracking
+	RtlZeroMemory(pDeviceContext->FingerIndexToContactId, sizeof(pDeviceContext->FingerIndexToContactId));
+	RtlZeroMemory(pDeviceContext->PreviousRawX, sizeof(pDeviceContext->PreviousRawX));
+	RtlZeroMemory(pDeviceContext->PreviousRawY, sizeof(pDeviceContext->PreviousRawY));
+	pDeviceContext->PreviousFingerCount = 0;
+
     TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DRIVER, "%!FUNC! Exit");
 
     return status;

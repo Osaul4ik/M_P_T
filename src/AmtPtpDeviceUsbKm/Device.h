@@ -50,6 +50,13 @@ typedef struct _DEVICE_CONTEXT
 	USHORT LastNormY[PTP_MAX_CONTACT_POINTS];
 	BOOLEAN WasReported[PTP_MAX_CONTACT_POINTS];
 
+	// Contact tracking for proper multi-touch handling
+	// Maps USB frame finger index to persistent contact ID
+	UCHAR FingerIndexToContactId[PTP_MAX_CONTACT_POINTS];
+	UCHAR PreviousFingerCount;
+	INT PreviousRawX[PTP_MAX_CONTACT_POINTS];
+	INT PreviousRawY[PTP_MAX_CONTACT_POINTS];
+
 } DEVICE_CONTEXT, *PDEVICE_CONTEXT;
 
 //

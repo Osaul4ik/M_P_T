@@ -2,6 +2,7 @@
 
 #include "Driver.h"
 #include "Interrupt.tmh"
+#include <limits.h>
 
 // Helper function for numberic operation
 static inline INT AmtRawToInteger(
@@ -196,15 +197,65 @@ AmtPtpEvtUsbInterruptPipeReadComplete(
 		{
 			UCHAR reportSlots = 0;
 			BOOLEAN contactActive[PTP_MAX_CONTACT_POINTS] = {FALSE};
+			UCHAR fingerToContactId[PTP_MAX_CONTACT_POINTS];
+			INT currentRawX[PTP_MAX_CONTACT_POINTS];
+			INT currentRawY[PTP_MAX_CONTACT_POINTS];
 			
-			// First pass: Mark which contact IDs are currently active
+			// Maximum distance threshold for matching contacts between frames (in raw units)
+			#define CONTACT_MATCH_DISTANCE 100
+			
+			// First pass: Store current finger data and match to previous frame
+			RtlZeroMemory(fingerToContactId, sizeof(fingerToContactId));
+			
 			for (i = 0; i < raw_n; i++) {
 				f = (const struct TRACKPAD_FINGER*) (f_base + i * fingerprintSize);
+				INT raw_x = AmtRawToInteger(f->abs_x);
+				INT raw_y = AmtRawToInteger(f->abs_y);
 				BOOLEAN tip = (AmtRawToInteger(f->touch_major) << 1) >= 200 || (AmtRawToInteger(f->touch_minor) << 1) >= 150;
+				
+				currentRawX[i] = raw_x;
+				currentRawY[i] = raw_y;
+				
 				if (tip) {
-					unsigned char cid = (unsigned char)i;
-					if (cid < PTP_MAX_CONTACT_POINTS) {
-						contactActive[cid] = TRUE;
+					// Try to match this finger to a previous frame finger
+					UCHAR bestContactId = PTP_MAX_CONTACT_POINTS;
+					INT bestDistance = INT_MAX;
+					
+					// Search for closest previous finger position
+					for (size_t j = 0; j < pDeviceContext->PreviousFingerCount; j++) {
+						// Check if this previous contact is already matched
+						BOOLEAN already_matched = FALSE;
+						for (size_t k = 0; k < i; k++) {
+							if (fingerToContactId[k] == j) {
+								already_matched = TRUE;
+								break;
+							}
+						}
+						if (already_matched) continue;
+						
+						INT dx = currentRawX[i] - pDeviceContext->PreviousRawX[j];
+						INT dy = currentRawY[i] - pDeviceContext->PreviousRawY[j];
+						INT distance = (dx * dx + dy * dy); // Squared distance
+						
+						if (distance < bestDistance && distance < (CONTACT_MATCH_DISTANCE * CONTACT_MATCH_DISTANCE)) {
+							bestDistance = distance;
+							bestContactId = (UCHAR)j;
+						}
+					}
+					
+					// If no match found, find a free contact ID
+					if (bestContactId >= PTP_MAX_CONTACT_POINTS) {
+						for (size_t j = 0; j < PTP_MAX_CONTACT_POINTS; j++) {
+							if (!contactActive[j]) {
+								bestContactId = (UCHAR)j;
+								break;
+							}
+						}
+					}
+					
+					if (bestContactId < PTP_MAX_CONTACT_POINTS) {
+						fingerToContactId[i] = bestContactId;
+						contactActive[bestContactId] = TRUE;
 					}
 				}
 			}
@@ -219,6 +270,12 @@ AmtPtpEvtUsbInterruptPipeReadComplete(
 						PtpReport.Contacts[reportSlots].TipSwitch = 0;
 						PtpReport.Contacts[reportSlots].Confidence = 1;
 						pDeviceContext->WasReported[i] = FALSE;
+						
+						TraceEvents(
+							TRACE_LEVEL_INFORMATION, TRACE_INPUT,
+							\"%!FUNC! Contact %d lifted\",
+							i
+						);
 						reportSlots++;
 					}
 				}
@@ -234,12 +291,12 @@ AmtPtpEvtUsbInterruptPipeReadComplete(
 				y = (pDeviceContext->DeviceInfo->y.max - AmtRawToInteger(f->abs_y)) > 0 ? 
 					((USHORT)(pDeviceContext->DeviceInfo->y.max - AmtRawToInteger(f->abs_y))) : 0;
 
-				unsigned char cid = (unsigned char)i;
 				BOOLEAN tip = (AmtRawToInteger(f->touch_major) << 1) >= 200 || (AmtRawToInteger(f->touch_minor) << 1) >= 150;
+				UCHAR cid = fingerToContactId[i];
 
 				if (tip && cid < PTP_MAX_CONTACT_POINTS) {
 					if (reportSlots < PTP_MAX_CONTACT_POINTS) {
-						PtpReport.Contacts[reportSlots].ContactID = (UCHAR)cid;
+						PtpReport.Contacts[reportSlots].ContactID = cid;
 						PtpReport.Contacts[reportSlots].X = (USHORT)x;
 						PtpReport.Contacts[reportSlots].Y = (USHORT)y;
 						PtpReport.Contacts[reportSlots].TipSwitch = 1;
@@ -251,6 +308,15 @@ AmtPtpEvtUsbInterruptPipeReadComplete(
 					}
 				}
 			}
+			
+			// Save current frame data for next frame matching
+			pDeviceContext->PreviousFingerCount = (UCHAR)raw_n;
+			for (i = 0; i < raw_n; i++) {
+				f = (const struct TRACKPAD_FINGER*) (f_base + i * fingerprintSize);
+				pDeviceContext->PreviousRawX[i] = AmtRawToInteger(f->abs_x);
+				pDeviceContext->PreviousRawY[i] = AmtRawToInteger(f->abs_y);
+			}
+			
 			PtpReport.ContactCount = reportSlots;
 		}
 	}
