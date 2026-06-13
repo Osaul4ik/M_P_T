@@ -268,6 +268,15 @@ AmtPtpEvtUsbInterruptPipeReadComplete(
                 pCtx->SlotCooldown[s]--;
                 if (pCtx->SlotCooldown[s] == 0) {
                     pCtx->SlotFingerKey[s] = KEY_NONE;
+                    // Wipe coordinate state so a future gesture on this slot
+                    // cannot inherit the previous gesture's LastNormX/Y.
+                    // LastNormX/Y are used for the lift-event position report;
+                    // if they carry a stale value from an earlier gesture the
+                    // HID stack sees a phantom position snap on the new touch.
+                    pCtx->LastNormX[s] = 0;
+                    pCtx->LastNormY[s] = 0;
+                    pCtx->HystX[s]     = 0;
+                    pCtx->HystY[s]     = 0;
                     TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_INPUT,
                         "%!FUNC! Slot %llu cooldown expired → FREE", (ULONG64)s);
                 } else {
@@ -410,12 +419,10 @@ AmtPtpEvtUsbInterruptPipeReadComplete(
 
             if (fingerForSlot[s] != SLOT_NONE) {
                 // Slot has a live finger this frame — no release processing.
-                // If the slot was pending release (rapid re-touch), resurrect it.
-                if (pCtx->SlotPendingRelease[s]) {
-                    pCtx->SlotPendingRelease[s] = FALSE;
-                    TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_INPUT,
-                        "%!FUNC! Slot %llu re-touched during pending release", (ULONG64)s);
-                }
+                // Note: a PENDING_RELEASE slot cannot reach here because:
+                //   • Phase 2a: SlotFingerKey was cleared on ACTIVE→PENDING_RELEASE
+                //   • Phase 2b: !SlotPendingRelease guard blocks assignment
+                // Both paths are closed, so no resurrection is possible.
                 continue;
             }
 
@@ -444,6 +451,17 @@ AmtPtpEvtUsbInterruptPipeReadComplete(
             if (pCtx->SlotInUse[s]) {
                 pCtx->SlotInUse[s]          = FALSE;
                 pCtx->SlotPendingRelease[s] = TRUE;
+                // Invalidate the finger key immediately so Phase 2a cannot
+                // match a rapid re-tap (same USB array index) to this slot
+                // while it is still draining through PENDING_RELEASE.
+                // Leaving the key alive is the root cause of the identity
+                // leakage: new tap → same key → Phase 2a match → slot
+                // "resurrected" with stale LastNormX/HystX → position snap.
+                pCtx->SlotFingerKey[s]    = KEY_NONE;
+                // Reset tip counter — non-zero value here would make Phase 4
+                // treat the very first frame of a new touch as already-
+                // confirmed, bypassing the debounce and inheriting stale state.
+                pCtx->SlotTipConfirmed[s] = 0;
                 TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_INPUT,
                     "%!FUNC! Slot %llu ACTIVE → PENDING_RELEASE", (ULONG64)s);
                 continue;
