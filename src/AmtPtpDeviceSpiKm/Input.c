@@ -289,7 +289,7 @@ AmtPtpRequestCompletionRoutine(
                 // cursor snap-back on the next touch sequence.
                 pReport->Contacts[ReportSlots].ContactID  = s;
                 pReport->Contacts[ReportSlots].TipSwitch  = 0;
-                pReport->Contacts[ReportSlots].Confidence = 0;
+                pReport->Contacts[ReportSlots].Confidence = 1;
                 pReport->Contacts[ReportSlots].X          = sl->LastNormX;
                 pReport->Contacts[ReportSlots].Y          = sl->LastNormY;
                 TraceEvents(TRACE_LEVEL_VERBOSE, TRACE_HID_INPUT,
