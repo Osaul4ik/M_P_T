@@ -81,6 +81,7 @@ AmtPtpRequestCompletionRoutine(
     PTP_REPORT*             pReport;   // direct pointer — avoids extra WDF copy
     SIZE_T                  OutLen;
     UINT8                   ReportSlots;
+    UINT8                   LiveSlots;
 
     ULONGLONG               Now;
     ULONGLONG               Delta100us;
@@ -257,6 +258,7 @@ AmtPtpRequestCompletionRoutine(
 
     RtlZeroMemory(pReport, sizeof(PTP_REPORT));
     ReportSlots = 0;
+    LiveSlots   = 0;
 
     for (s = 0; s < PTP_MAX_CONTACT_POINTS && ReportSlots < PTP_MAX_CONTACT_POINTS; s++) {
         CONTACT_SLOT* sl = &pCtx->Contacts.Slots[s];
@@ -270,6 +272,7 @@ AmtPtpRequestCompletionRoutine(
             TraceEvents(TRACE_LEVEL_VERBOSE, TRACE_HID_INPUT,
                 "%!FUNC! ID=%d LIVE X=%u Y=%u", s, sl->LastNormX, sl->LastNormY);
             ReportSlots++;
+            LiveSlots++;
 
         } else if (sl->State == ContactSlotLifting) {
             if (sl->IsPalm) {
@@ -299,7 +302,8 @@ AmtPtpRequestCompletionRoutine(
     }
 
     pReport->ReportID        = REPORTID_MULTITOUCH;
-    pReport->ContactCount    = ReportSlots;
+    // Windows PTP: ContactCount counts only TipSwitch=1 contacts in this report.
+    pReport->ContactCount    = LiveSlots;
     pReport->IsButtonClicked = pPkt->ClickOccurred;
     pReport->ScanTime        = (USHORT)Delta100us;
 
