@@ -246,15 +246,35 @@ AmtPtpEvtUsbInterruptPipeReadComplete(
         f_base = TouchBuffer + headerSize + pCtx->DeviceInfo->tp_delta;
 
         // =================================================================
-        // Phase 0: Clear cooldown flags that were set in the previous frame.
-        // A slot in cooldown for exactly one frame becomes FREE here.
+        // Phase 0: Decrement cooldown counters set in the previous frame.
+        //
+        // SlotCooldown is now a UCHAR counter, not a BOOLEAN.
+        // A slot with SlotCooldown > 0 is BLOCKED from reassignment.
+        // The counter is decremented HERE (start of frame) but a slot
+        // is only truly FREE when it reaches 0 BEFORE Phase 2b runs.
+        //
+        // To guarantee the slot is blocked for at least one full frame,
+        // the counter is set to 2 on release (Phase 3): the frame in
+        // which the lift is emitted decrements it to 1 (still blocked),
+        // and only on the NEXT frame does it reach 0 (FREE).
+        //
+        // Timeline (SlotCooldown values):
+        //   Frame N  : lift emitted → set to 2
+        //   Frame N+1: Phase 0 → 1  (still blocked in Phase 2b)
+        //   Frame N+2: Phase 0 → 0  (FREE, assignable in Phase 2b)
         // =================================================================
         for (s = 0; s < PTP_MAX_CONTACT_POINTS; s++) {
-            if (pCtx->SlotCooldown[s]) {
-                pCtx->SlotCooldown[s]     = FALSE;
-                pCtx->SlotFingerKey[s]    = KEY_NONE;
-                TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_INPUT,
-                    "%!FUNC! Slot %llu cooldown cleared → FREE", (ULONG64)s);
+            if (pCtx->SlotCooldown[s] > 0) {
+                pCtx->SlotCooldown[s]--;
+                if (pCtx->SlotCooldown[s] == 0) {
+                    pCtx->SlotFingerKey[s] = KEY_NONE;
+                    TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_INPUT,
+                        "%!FUNC! Slot %llu cooldown expired → FREE", (ULONG64)s);
+                } else {
+                    TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_INPUT,
+                        "%!FUNC! Slot %llu cooldown remaining=%d", (ULONG64)s,
+                        (INT)pCtx->SlotCooldown[s]);
+                }
             }
         }
 
@@ -410,9 +430,10 @@ AmtPtpEvtUsbInterruptPipeReadComplete(
                     reportSlots++;
                 }
                 pCtx->SlotPendingRelease[s] = FALSE;
-                pCtx->SlotCooldown[s]       = TRUE;
-                // SlotTipConfirmed and SlotFingerKey are cleared in Phase 0
-                // next frame, together with SlotCooldown.
+                pCtx->SlotCooldown[s]       = 2;   // blocks THIS frame's Phase 2b
+                                                    // and the entire next frame;
+                                                    // reaches 0 in frame N+2.
+                // SlotFingerKey is cleared when cooldown reaches 0 in Phase 0.
 
                 TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_INPUT,
                     "%!FUNC! Slot %llu lift emitted → COOLDOWN", (ULONG64)s);

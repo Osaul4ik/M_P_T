@@ -70,9 +70,9 @@ typedef struct _DEVICE_CONTEXT
     //
     BOOLEAN             SlotInUse[PTP_MAX_CONTACT_POINTS];
     BOOLEAN             SlotPendingRelease[PTP_MAX_CONTACT_POINTS];
-    BOOLEAN             SlotCooldown[PTP_MAX_CONTACT_POINTS];
-    UCHAR               SlotTipConfirmed[PTP_MAX_CONTACT_POINTS]; // frame counter
-    UCHAR               SlotFingerKey[PTP_MAX_CONTACT_POINTS];    // finger identity
+    UCHAR               SlotCooldown[PTP_MAX_CONTACT_POINTS];     // >0 = blocked; set to 2 on lift, decremented each frame
+    UCHAR               SlotTipConfirmed[PTP_MAX_CONTACT_POINTS]; // consecutive tip-down frame counter
+    UCHAR               SlotFingerKey[PTP_MAX_CONTACT_POINTS];    // finger identity (USB array index at first touch)
 
     // Last reported normalised coordinates — used for lift-event report so
     // the final position is stable.
