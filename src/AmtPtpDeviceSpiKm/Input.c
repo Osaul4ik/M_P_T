@@ -214,12 +214,7 @@ AmtPtpRequestCompletionRoutine(
     for (s = 0; s < PTP_MAX_CONTACT_POINTS; s++) {
         CONTACT_SLOT* sl = &pCtx->Contacts.Slots[s];
 
-        if (sl->State == ContactSlotLifting) {
-            // Already emitted TipSwitch=0 last frame — free the slot.
-            sl->State  = ContactSlotEmpty;
-            sl->IsPalm = FALSE;
-            continue;
-        }
+        if (sl->State == ContactSlotLifting) continue; // will be freed in Pass B after lift is sent
 
         if (sl->State != ContactSlotLive) continue; // ContactSlotEmpty: nothing to do
 
@@ -295,6 +290,10 @@ AmtPtpRequestCompletionRoutine(
                 TraceEvents(TRACE_LEVEL_VERBOSE, TRACE_HID_INPUT,
                     "%!FUNC! ID=%d LIFT X=%u Y=%u", s, sl->LastNormX, sl->LastNormY);
                 ReportSlots++;
+                // Free slot here — after lift is sent — so AmtPtpAllocateSlot
+                // in Pass A cannot reuse it in the same frame and skip the lift.
+                sl->State  = ContactSlotEmpty;
+                sl->IsPalm = FALSE;
             }
         }
     }
