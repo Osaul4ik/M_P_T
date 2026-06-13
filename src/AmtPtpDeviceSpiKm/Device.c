@@ -19,13 +19,9 @@ AmtPtpResetTrackingState(
 	_In_ PDEVICE_CONTEXT pDeviceContext
 )
 {
-	UINT8 k;
-	pDeviceContext->PrevAdjustedCount = 0;
-	pDeviceContext->PrevReportedCount = 0;
-	pDeviceContext->PrevReportedMask  = 0;
-	for (k = 0; k < PTP_MAX_CONTACT_POINTS; k++) {
-		pDeviceContext->SlotIsPalm[k] = FALSE;
-	}
+	// Delegate to the contact-table API defined in ContactTracking.h.
+	// Resets all slots to Empty, clears LiveCount.
+	AmtPtpResetContactTable(&pDeviceContext->Contacts);
 }
 
 NTSTATUS
