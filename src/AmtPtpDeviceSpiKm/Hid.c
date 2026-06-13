@@ -843,6 +843,7 @@ AmtPtpSetFeatures(
 					);
 
 					pDeviceContext->PtpInputOn = FALSE;
+					AmtPtpResetContactTable(&pDeviceContext->Contacts);
 					break;
 				}
 				case PTP_COLLECTION_WINDOWS:
@@ -855,6 +856,7 @@ AmtPtpSetFeatures(
 					);
 
 					pDeviceContext->PtpInputOn = TRUE;
+					AmtPtpResetContactTable(&pDeviceContext->Contacts);
 					break;
 				}
 			}
@@ -877,6 +879,7 @@ AmtPtpSetFeatures(
 			PPTP_DEVICE_SELECTIVE_REPORT_MODE_REPORT InputSelection = (PPTP_DEVICE_SELECTIVE_REPORT_MODE_REPORT) pHidPacket->reportBuffer;
 			pDeviceContext->PtpReportButton = InputSelection->ButtonReport;
 			pDeviceContext->PtpReportTouch = InputSelection->SurfaceReport;
+			AmtPtpResetContactTable(&pDeviceContext->Contacts);
 
 			TraceEvents(
 				TRACE_LEVEL_INFORMATION,

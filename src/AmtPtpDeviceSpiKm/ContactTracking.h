@@ -14,6 +14,9 @@ typedef enum _CONTACT_SLOT_STATE {
 typedef struct _CONTACT_SLOT {
     CONTACT_SLOT_STATE  State;
     BOOLEAN             IsPalm;
+    // TRUE once TipSwitch=1 was sent for this slot lifecycle.
+    // Suppresses orphan TipSwitch=0 frames Windows never saw a down for.
+    BOOLEAN             WasReported;
     // Last known position stored in RAW SPI units (signed SHORT range).
     // Stored raw so proximity matching uses consistent coordinate space.
     // NormalizeX/Y is applied only when writing to the PTP report.
@@ -85,12 +88,12 @@ AmtPtpMatchFingers(
     // Build cost matrix.
     for (i = 0; i < HwCount; i++) {
         for (s = 0; s < PTP_MAX_CONTACT_POINTS; s++) {
-            if (pTable->Slots[s].State == ContactSlotLive) {
+            if (pTable->Slots[s].State == ContactSlotLive && !pTable->Slots[s].IsPalm) {
                 LONG dx = (LONG)pTable->Slots[s].LastRawX - (LONG)HwRawX[i];
                 LONG dy = (LONG)pTable->Slots[s].LastRawY - (LONG)HwRawY[i];
                 cost[i][s] = dx * dx + dy * dy;
             } else {
-                cost[i][s] = 0x7FFFFFFFL; // unavailable
+                cost[i][s] = 0x7FFFFFFFL; // unavailable (Empty, Lifting, or palm)
             }
         }
     }

@@ -81,7 +81,6 @@ AmtPtpRequestCompletionRoutine(
     PTP_REPORT*             pReport;   // direct pointer — avoids extra WDF copy
     SIZE_T                  OutLen;
     UINT8                   ReportSlots;
-    UINT8                   LiveSlots;
 
     ULONGLONG               Now;
     ULONGLONG               Delta100us;
@@ -109,6 +108,7 @@ AmtPtpRequestCompletionRoutine(
 
     // ── Mode check ────────────────────────────────────────────────────────
     if (!pCtx->PtpInputOn || !pCtx->PtpReportTouch) {
+        AmtPtpResetContactTable(&pCtx->Contacts);
         // Retrieve output buffer directly — avoids WdfMemoryCopyFromBuffer DDI
         // overhead for this trivial zero-report path.
         Status = WdfRequestRetrieveOutputBuffer(
@@ -193,7 +193,8 @@ AmtPtpRequestCompletionRoutine(
                 "%!FUNC! Table full, dropping finger %d", i);
             continue;
         }
-        pCtx->Contacts.Slots[s].State   = ContactSlotLive;
+        pCtx->Contacts.Slots[s].State       = ContactSlotLive;
+        pCtx->Contacts.Slots[s].WasReported = FALSE;
         pCtx->Contacts.Slots[s].IsPalm  =
             (pPkt->Fingers[i].TouchMajor >= PALM_MAJOR_THRESHOLD &&
              pPkt->Fingers[i].TouchMinor >= PALM_MINOR_THRESHOLD);
@@ -223,19 +224,18 @@ AmtPtpRequestCompletionRoutine(
             // No HW finger matched this slot → finger disappeared.
             sl->State = ContactSlotLifting;
         } else {
-            // Matched. Check pressure.
+            // Matched: always capture current HW position (including release frame).
             UINT8 hw = slot_to_hw[s];
+            sl->LastRawX  = HwRawX[hw];
+            sl->LastRawY  = HwRawY[hw];
+            if (!sl->IsPalm) {
+                sl->LastNormX = NormalizeX(pCtx, HwRawX[hw]);
+                sl->LastNormY = NormalizeY(pCtx, HwRawY[hw]);
+            }
             if (pPkt->Fingers[hw].Pressure < 1) {
                 // Pressure=0 transitional frame (finger releasing).
                 sl->State = ContactSlotLifting;
-            } else {
-                // Still live: update position.
-                sl->LastRawX  = HwRawX[hw];
-                sl->LastRawY  = HwRawY[hw];
-                if (!sl->IsPalm) {
-                    sl->LastNormX = NormalizeX(pCtx, HwRawX[hw]);
-                    sl->LastNormY = NormalizeY(pCtx, HwRawY[hw]);
-                }
+            } else if (!sl->IsPalm) {
                 pCtx->Contacts.LiveCount++;
             }
         }
@@ -258,7 +258,6 @@ AmtPtpRequestCompletionRoutine(
 
     RtlZeroMemory(pReport, sizeof(PTP_REPORT));
     ReportSlots = 0;
-    LiveSlots   = 0;
 
     for (s = 0; s < PTP_MAX_CONTACT_POINTS && ReportSlots < PTP_MAX_CONTACT_POINTS; s++) {
         CONTACT_SLOT* sl = &pCtx->Contacts.Slots[s];
@@ -271,14 +270,15 @@ AmtPtpRequestCompletionRoutine(
             pReport->Contacts[ReportSlots].Y          = sl->LastNormY;
             TraceEvents(TRACE_LEVEL_VERBOSE, TRACE_HID_INPUT,
                 "%!FUNC! ID=%d LIVE X=%u Y=%u", s, sl->LastNormX, sl->LastNormY);
+            sl->WasReported = TRUE;
             ReportSlots++;
-            LiveSlots++;
 
         } else if (sl->State == ContactSlotLifting) {
-            if (sl->IsPalm) {
-                // Palm: no TipSwitch=1 was ever sent, no lift needed.
-                sl->State  = ContactSlotEmpty;
-                sl->IsPalm = FALSE;
+            if (sl->IsPalm || !sl->WasReported) {
+                // Palm or never-reported contact: Windows saw no down — skip lift.
+                sl->State       = ContactSlotEmpty;
+                sl->IsPalm      = FALSE;
+                sl->WasReported = FALSE;
             } else {
                 // CRITICAL: use LastNormX/Y — NOT (0,0).
                 // Windows updates its internal "last position" for this
@@ -295,15 +295,16 @@ AmtPtpRequestCompletionRoutine(
                 ReportSlots++;
                 // Free slot here — after lift is sent — so AmtPtpAllocateSlot
                 // in Pass A cannot reuse it in the same frame and skip the lift.
-                sl->State  = ContactSlotEmpty;
-                sl->IsPalm = FALSE;
+                sl->State       = ContactSlotEmpty;
+                sl->IsPalm      = FALSE;
+                sl->WasReported = FALSE;
             }
         }
     }
 
     pReport->ReportID        = REPORTID_MULTITOUCH;
-    // Windows PTP: ContactCount counts only TipSwitch=1 contacts in this report.
-    pReport->ContactCount    = LiveSlots;
+    // Windows PTP: ContactCount = all contacts in this frame (live + lift).
+    pReport->ContactCount    = ReportSlots;
     pReport->IsButtonClicked = pPkt->ClickOccurred;
     pReport->ScanTime        = (USHORT)Delta100us;
 
