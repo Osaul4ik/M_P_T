@@ -273,7 +273,7 @@ AmtPtpEvtUsbInterruptPipeReadComplete(
 						
 						TraceEvents(
 							TRACE_LEVEL_INFORMATION, TRACE_INPUT,
-							\"%!FUNC! Contact %d lifted\",
+							"%!FUNC! Contact %d lifted",
 							i
 						);
 						reportSlots++;
