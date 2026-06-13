@@ -2,8 +2,6 @@
 
 #pragma once
 
-#include "Metadata/WindowsHID.h"
-
 EXTERN_C_START
 
 // {FF969022-3111-4441-8F88-875440172C2E} for the device interface
@@ -59,10 +57,6 @@ typedef struct _DEVICE_CONTEXT
     BOOLEAN         PtpInputOn;
     BOOLEAN         PtpReportTouch;
     BOOLEAN         PtpReportButton;
-    // Per-contact last known normalized coordinates and reported flag.
-    USHORT          LastNormX[PTP_MAX_CONTACT_POINTS];
-    USHORT          LastNormY[PTP_MAX_CONTACT_POINTS];
-    BOOLEAN         WasReported[PTP_MAX_CONTACT_POINTS];
 } DEVICE_CONTEXT, *PDEVICE_CONTEXT;
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(DEVICE_CONTEXT, PtpFilterGetContext)

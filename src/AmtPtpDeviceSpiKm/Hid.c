@@ -240,11 +240,7 @@ AmtPtpGetHidDescriptor(
 			break;
 		}
 		// MacBookPro 13, 14 (15-inch)
-		// MacBookPro 15,x (2018 T2), MacBookPro 16,x (2019/2020 T2) - 15/16-inch
 		case 0x0278:
-		case 0x027a:
-		case 0x027b:
-		case 0x0280:
 		{
 			TraceEvents(
 				TRACE_LEVEL_INFORMATION,
@@ -257,38 +253,6 @@ AmtPtpGetHidDescriptor(
 				RequestMemory,
 				0,
 				(PVOID)&AmtPtpSpiFamily3bDefaultHidDescriptor,
-				CopiedSize
-			);
-
-			if (!NT_SUCCESS(Status))
-			{
-				TraceEvents(
-					TRACE_LEVEL_ERROR,
-					TRACE_DRIVER,
-					"%!FUNC! WdfMemoryCopyFromBuffer failed with %!STATUS!",
-					Status
-				);
-				return Status;
-			}
-			break;
-		}
-		// MacBookPro 15,2 / 16,2 / 16,3 (13-inch T2)
-		case 0x027c:
-		case 0x027d:
-		case 0x0281:
-		case 0x0282:
-		{
-			TraceEvents(
-				TRACE_LEVEL_INFORMATION,
-				TRACE_DRIVER,
-				"%!FUNC! Request HID Report Descriptor for Apple SPI Trackpad, Family 3A (T2 13-inch)"
-			);
-
-			CopiedSize = AmtPtpSpiFamily3aDefaultHidDescriptor.bLength;
-			Status = WdfMemoryCopyFromBuffer(
-				RequestMemory,
-				0,
-				(PVOID)&AmtPtpSpiFamily3aDefaultHidDescriptor,
 				CopiedSize
 			);
 
@@ -490,11 +454,7 @@ AmtPtpGetReportDescriptor(
 			break;
 		}
 		// MacBookPro 13, 14 (15-inch)
-		// MacBookPro 15,x (2018 T2), MacBookPro 16,x (2019/2020 T2) - 15/16-inch
 		case 0x0278:
-		case 0x027a:
-		case 0x027b:
-		case 0x0280:
 		{
 			if (pDeviceContext->ReportType == PrecisionTouchpad)
 			{
@@ -505,24 +465,6 @@ AmtPtpGetReportDescriptor(
 			{
 				CopiedSize = AmtPtpSpiFamily3bDefaultHidDescriptor.DescriptorList[0].wReportLength;
 				Descriptor = (PVOID)&AmtPtpSpiFamily3bTouchscreenReportDescriptor;
-			}
-			break;
-		}
-		// MacBookPro 15,2 / 16,2 / 16,3 (13-inch T2)
-		case 0x027c:
-		case 0x027d:
-		case 0x0281:
-		case 0x0282:
-		{
-			if (pDeviceContext->ReportType == PrecisionTouchpad)
-			{
-				CopiedSize = AmtPtpSpiFamily3aDefaultHidDescriptor.DescriptorList[0].wReportLength;
-				Descriptor = (PVOID)&AmtPtpSpiFamily3aReportDescriptor;
-			}
-			else if (pDeviceContext->ReportType == Touchscreen)
-			{
-				CopiedSize = AmtPtpSpiFamily3aDefaultHidDescriptor.DescriptorList[0].wReportLength;
-				Descriptor = (PVOID)&AmtPtpSpiFamily3aTouchscreenReportDescriptor;
 			}
 			break;
 		}
@@ -843,7 +785,6 @@ AmtPtpSetFeatures(
 					);
 
 					pDeviceContext->PtpInputOn = FALSE;
-					AmtPtpResetContactTable(&pDeviceContext->Contacts);
 					break;
 				}
 				case PTP_COLLECTION_WINDOWS:
@@ -856,7 +797,6 @@ AmtPtpSetFeatures(
 					);
 
 					pDeviceContext->PtpInputOn = TRUE;
-					AmtPtpResetContactTable(&pDeviceContext->Contacts);
 					break;
 				}
 			}
@@ -879,7 +819,6 @@ AmtPtpSetFeatures(
 			PPTP_DEVICE_SELECTIVE_REPORT_MODE_REPORT InputSelection = (PPTP_DEVICE_SELECTIVE_REPORT_MODE_REPORT) pHidPacket->reportBuffer;
 			pDeviceContext->PtpReportButton = InputSelection->ButtonReport;
 			pDeviceContext->PtpReportTouch = InputSelection->SurfaceReport;
-			AmtPtpResetContactTable(&pDeviceContext->Contacts);
 
 			TraceEvents(
 				TRACE_LEVEL_INFORMATION,

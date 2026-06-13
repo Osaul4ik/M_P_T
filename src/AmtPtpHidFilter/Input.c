@@ -193,9 +193,8 @@ PtpFilterInputRequestCompletionCallback(
 	// Touch
 	raw_n = (responseLength - headerSize) / fingerprintSize;
 	if (raw_n >= PTP_MAX_CONTACT_POINTS) raw_n = PTP_MAX_CONTACT_POINTS;
-	{
-		UCHAR reportSlots = 0;
-		for (size_t i = 0; i < raw_n; i++) {
+	ptpOutputReport.ContactCount = (UCHAR) raw_n;
+	for (size_t i = 0; i < raw_n; i++) {
 		PUCHAR f_base = responseBuffer + headerSize + deviceContext->InputFingerDelta;
 		f = (const TRACKPAD_FINGER*)(f_base + i * fingerprintSize);
 		f_type5 = (const TRACKPAD_FINGER_TYPE5*)f;
@@ -208,37 +207,16 @@ PtpFilterInputRequestCompletionCallback(
 		x = (x - deviceContext->X.min) > 0 ? (x - deviceContext->X.min) : 0;
 		y = (y - deviceContext->Y.min) > 0 ? (y - deviceContext->Y.min) : 0;
 
-		UCHAR cid = f_type5->OrientationAndOrigin.ContactIdentifier.Id;
-		BOOLEAN tip = ((signed short)(f_type5->TouchMajor) << 1) > 0;
-			if (tip) {
-				// Active contact: report current coordinates and remember them.
-				ptpOutputReport.Contacts[reportSlots].ContactID = cid;
-				ptpOutputReport.Contacts[reportSlots].X = (USHORT)x;
-				ptpOutputReport.Contacts[reportSlots].Y = (USHORT)y;
-				ptpOutputReport.Contacts[reportSlots].TipSwitch = 1;
-				ptpOutputReport.Contacts[reportSlots].Confidence = ((signed short)(f_type5->TouchMinor) << 1) < 345 && ((signed short)(f_type5->TouchMinor) << 1) < 345;
-				if (cid < PTP_MAX_CONTACT_POINTS) {
-					deviceContext->LastNormX[cid] = (USHORT)x;
-					deviceContext->LastNormY[cid] = (USHORT)y;
-					deviceContext->WasReported[cid] = TRUE;
-				}
-				reportSlots++;
-			} else {
-			// Lift frame: only report if we previously reported this contact.
-			if (cid < PTP_MAX_CONTACT_POINTS && deviceContext->WasReported[cid]) {
-				ptpOutputReport.Contacts[reportSlots].ContactID = cid;
-				ptpOutputReport.Contacts[reportSlots].X = deviceContext->LastNormX[cid];
-				ptpOutputReport.Contacts[reportSlots].Y = deviceContext->LastNormY[cid];
-				ptpOutputReport.Contacts[reportSlots].TipSwitch = 0;
-				ptpOutputReport.Contacts[reportSlots].Confidence = 1;
-				// clear reported flag since lift is being sent
-				deviceContext->WasReported[cid] = FALSE;
-				reportSlots++;
-			}
-		}
+		ptpOutputReport.Contacts[i].ContactID = f_type5->OrientationAndOrigin.ContactIdentifier.Id;
+		ptpOutputReport.Contacts[i].X = (USHORT)x;
+		ptpOutputReport.Contacts[i].Y = (USHORT)y;
+		ptpOutputReport.Contacts[i].TipSwitch = ((signed short) (f_type5->TouchMajor) << 1) > 0;
+		// The Microsoft spec says reject any input larger than 25mm. This is not ideal
+		// for Magic Trackpad 2 - so we raised the threshold a bit higher.
+		// Or maybe I used the wrong unit? IDK
+		ptpOutputReport.Contacts[i].Confidence = ((signed short) (f_type5->TouchMinor) << 1) < 345 && ((signed short) (f_type5->TouchMinor) << 1) < 345;
 	}
-		ptpOutputReport.ContactCount = reportSlots;
-	}
+
 	// Button
 	if ((responseBuffer[deviceContext->InputButtonDelta] & 1) != 0) {
 		ptpOutputReport.IsButtonClicked = TRUE;

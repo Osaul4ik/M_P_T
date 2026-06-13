@@ -1,10 +1,17 @@
 /*++
+
 Module Name:
+
     queue.c
+
 Abstract:
+
     This file contains the queue entry points and callbacks.
+
 Environment:
+
     Kernel-mode Driver Framework
+
 --*/
 
 #include "driver.h"
@@ -26,23 +33,21 @@ AmtPtpDeviceSpiKmQueueInitialize(
 
     PAGED_CODE();
 
+	// By the time this is being called, it should exist
 	pDeviceContext = DeviceGetContext(Device);
 
-	//
-	// Default queue: receives all IOCTLs that are not forwarded elsewhere.
-	// Parallel dispatch — each IOCTL handler is responsible for its own
-	// synchronization.  EvtIoStop is intentionally minimal here: the default
-	// queue only handles short synchronous IOCTLs (descriptor fetch, feature
-	// get/set) that complete before the framework's power-down timeout, so
-	// taking no action is safe and avoids complexity.
-	//
+    //
+    // Configure a default queue so that requests that are not
+    // configure-fowarded using WdfDeviceConfigureRequestDispatching to goto
+    // other queues get dispatched here.
+    //
     WDF_IO_QUEUE_CONFIG_INIT_DEFAULT_QUEUE(
         &QueueConfig,
         WdfIoQueueDispatchParallel
     );
 
 	QueueConfig.EvtIoInternalDeviceControl = AmtPtpDeviceSpiKmEvtIoInternalDeviceControl;
-    QueueConfig.EvtIoStop                  = AmtPtpDeviceSpiKmEvtIoStop;
+    QueueConfig.EvtIoStop = AmtPtpDeviceSpiKmEvtIoStop;
 
     Status = WdfIoQueueCreate(
         Device,
@@ -51,26 +56,16 @@ AmtPtpDeviceSpiKmQueueInitialize(
         &Queue
     );
 
-    if (!NT_SUCCESS(Status)) {
-        TraceEvents(TRACE_LEVEL_ERROR, TRACE_QUEUE,
-			"WdfIoQueueCreate (default) failed %!STATUS!", Status);
+    if(!NT_SUCCESS(Status)) 
+	{
+        TraceEvents(TRACE_LEVEL_ERROR, TRACE_QUEUE, "WdfIoQueueCreate failed %!STATUS!", Status);
 		goto exit;
     }
 
 	//
-	// Manual HID read queue: holds pending IOCTL_HID_READ_REPORT requests
-	// until the SPI completion routine dequeues and satisfies them.
-	// PowerManaged = WdfFalse because we manage power transitions ourselves
-	// via SelfManagedIo callbacks and the PowerOnRecoveryTimer.
-	//
-	// FIX: register AmtPtpEvtIoStop so KMDF can drain this queue during
-	// power transitions (S3/S4) and surprise removal.  Without it the
-	// framework cannot guarantee all requests complete before power-down,
-	// which causes DRIVER_POWER_STATE_FAILURE (Bug Check 0x9F).
-	// AmtPtpEvtIoStop is implemented in device.c.
+	// Create secondary queues for touch read requests.
 	//
 	WDF_IO_QUEUE_CONFIG_INIT(&QueueConfig, WdfIoQueueDispatchManual);
-	QueueConfig.EvtIoStop    = AmtPtpEvtIoStop;  // FIX: was "queueConfig" (typo, would not compile)
 	QueueConfig.PowerManaged = WdfFalse;
 
 	Status = WdfIoQueueCreate(
@@ -82,8 +77,8 @@ AmtPtpDeviceSpiKmQueueInitialize(
 
 	if (!NT_SUCCESS(Status)) {
 		TraceEvents(
-			TRACE_LEVEL_ERROR, TRACE_QUEUE,
-			"%!FUNC! WdfIoQueueCreate (HidQueue) failed %!STATUS!",
+			TRACE_LEVEL_ERROR, TRACE_QUEUE, 
+			"%!FUNC! WdfIoQueueCreate (Input) failed %!STATUS!",
 			Status
 		);
 	}
@@ -97,24 +92,41 @@ DbgIoControlGetString(
 	_In_ ULONG IoControlCode
 )
 {
+
 	switch (IoControlCode)
 	{
-	case IOCTL_HID_GET_DEVICE_DESCRIPTOR:           return "IOCTL_HID_GET_DEVICE_DESCRIPTOR";
-	case IOCTL_HID_GET_DEVICE_ATTRIBUTES:           return "IOCTL_HID_GET_DEVICE_ATTRIBUTES";
-	case IOCTL_HID_GET_REPORT_DESCRIPTOR:           return "IOCTL_HID_GET_REPORT_DESCRIPTOR";
-	case IOCTL_HID_GET_STRING:                      return "IOCTL_HID_GET_STRING";
-	case IOCTL_HID_READ_REPORT:                     return "IOCTL_HID_READ_REPORT";
-	case IOCTL_HID_WRITE_REPORT:                    return "IOCTL_HID_WRITE_REPORT";
-	case IOCTL_UMDF_HID_GET_INPUT_REPORT:           return "IOCTL_UMDF_HID_GET_INPUT_REPORT";
-	case IOCTL_UMDF_HID_SET_OUTPUT_REPORT:          return "IOCTL_UMDF_HID_SET_OUTPUT_REPORT";
-	case IOCTL_UMDF_HID_GET_FEATURE:                return "IOCTL_UMDF_HID_GET_FEATURE";
-	case IOCTL_UMDF_HID_SET_FEATURE:                return "IOCTL_UMDF_HID_SET_FEATURE";
-	case IOCTL_HID_ACTIVATE_DEVICE:                 return "IOCTL_HID_ACTIVATE_DEVICE";
-	case IOCTL_HID_DEACTIVATE_DEVICE:               return "IOCTL_HID_DEACTIVATE_DEVICE";
-	case IOCTL_HID_SEND_IDLE_NOTIFICATION_REQUEST:  return "IOCTL_HID_SEND_IDLE_NOTIFICATION_REQUEST";
-	case IOCTL_HID_GET_FEATURE:                     return "IOCTL_HID_GET_FEATURE";
-	case IOCTL_HID_SET_FEATURE:                     return "IOCTL_HID_SET_FEATURE";
-	default:                                        return "IOCTL_UNKNOWN";
+	case IOCTL_HID_GET_DEVICE_DESCRIPTOR:
+		return "IOCTL_HID_GET_DEVICE_DESCRIPTOR";
+	case IOCTL_HID_GET_DEVICE_ATTRIBUTES:
+		return "IOCTL_HID_GET_DEVICE_ATTRIBUTES";
+	case IOCTL_HID_GET_REPORT_DESCRIPTOR:
+		return "IOCTL_HID_GET_REPORT_DESCRIPTOR";
+	case IOCTL_HID_GET_STRING:
+		return "IOCTL_HID_GET_STRING";
+	case IOCTL_HID_READ_REPORT:
+		return "IOCTL_HID_READ_REPORT";
+	case IOCTL_HID_WRITE_REPORT:
+		return "IOCTL_HID_WRITE_REPORT";
+	case IOCTL_UMDF_HID_GET_INPUT_REPORT:
+		return "IOCTL_UMDF_HID_GET_INPUT_REPORT";
+	case IOCTL_UMDF_HID_SET_OUTPUT_REPORT:
+		return "IOCTL_UMDF_HID_SET_OUTPUT_REPORT";
+	case IOCTL_UMDF_HID_GET_FEATURE:
+		return "IOCTL_UMDF_HID_GET_FEATURE";
+	case IOCTL_UMDF_HID_SET_FEATURE:
+		return "IOCTL_UMDF_HID_SET_FEATURE";
+	case IOCTL_HID_ACTIVATE_DEVICE:
+		return "IOCTL_HID_ACTIVATE_DEVICE";
+	case IOCTL_HID_DEACTIVATE_DEVICE:
+		return "IOCTL_HID_DEACTIVATE_DEVICE";
+	case IOCTL_HID_SEND_IDLE_NOTIFICATION_REQUEST:
+		return "IOCTL_HID_SEND_IDLE_NOTIFICATION_REQUEST";
+	case IOCTL_HID_GET_FEATURE:
+		return "IOCTL_HID_GET_FEATURE";
+	case IOCTL_HID_SET_FEATURE:
+		return "IOCTL_HID_SET_FEATURE";
+	default:
+		return "IOCTL_UNKNOWN";
 	}
 }
 
@@ -134,32 +146,52 @@ AmtPtpDeviceSpiKmEvtIoInternalDeviceControl(
 	WDFDEVICE Device = WdfIoQueueGetDevice(Queue);
 	BOOLEAN RequestPending = FALSE;
 
-	TraceEvents(TRACE_LEVEL_VERBOSE, TRACE_QUEUE,
-		"%!FUNC! %s", DbgIoControlGetString(IoControlCode));
-
+	// Dispatch IOCTL to handler
 	switch (IoControlCode)
 	{
 	case IOCTL_HID_GET_DEVICE_DESCRIPTOR:
-		Status = AmtPtpGetHidDescriptor(Device, Request);
+		Status = AmtPtpGetHidDescriptor(
+			Device,
+			Request
+		);
 		break;
 	case IOCTL_HID_GET_DEVICE_ATTRIBUTES:
-		Status = AmtPtpGetDeviceAttribs(Device, Request);
+		Status = AmtPtpGetDeviceAttribs(
+			Device,
+			Request
+		);
 		break;
 	case IOCTL_HID_GET_REPORT_DESCRIPTOR:
-		Status = AmtPtpGetReportDescriptor(Device, Request);
+		Status = AmtPtpGetReportDescriptor(
+			Device,
+			Request
+		);
 		break;
 	case IOCTL_HID_GET_STRING:
-		Status = AmtPtpGetStrings(Device, Request, &RequestPending);
+		Status = AmtPtpGetStrings(
+			Device,
+			Request,
+			&RequestPending
+		);
 		break;
 	case IOCTL_HID_READ_REPORT:
-		AmtPtpSpiInputRoutineWorker(Device, Request);
+		AmtPtpSpiInputRoutineWorker(
+			Device,
+			Request
+		);
 		RequestPending = TRUE;
 		break;
 	case IOCTL_HID_GET_FEATURE:
-		Status = AmtPtpReportFeatures(Device, Request);
+		Status = AmtPtpReportFeatures(
+			Device,
+			Request
+		);
 		break;
 	case IOCTL_HID_SET_FEATURE:
-		Status = AmtPtpSetFeatures(Device, Request);
+		Status = AmtPtpSetFeatures(
+			Device,
+			Request
+		);
 		break;
 	case IOCTL_HID_WRITE_REPORT:
 	case IOCTL_UMDF_HID_SET_OUTPUT_REPORT:
@@ -169,26 +201,26 @@ AmtPtpDeviceSpiKmEvtIoInternalDeviceControl(
 	case IOCTL_HID_SEND_IDLE_NOTIFICATION_REQUEST:
 	default:
 		Status = STATUS_NOT_SUPPORTED;
-		TraceEvents(TRACE_LEVEL_WARNING, TRACE_QUEUE,
-			"%!FUNC!: %s is not supported",
-			DbgIoControlGetString(IoControlCode));
+		TraceEvents(
+			TRACE_LEVEL_WARNING,
+			TRACE_QUEUE,
+			"%!FUNC!: %s is not yet implemented",
+			DbgIoControlGetString(IoControlCode)
+		);
 		break;
 	}
 
-	if (RequestPending != TRUE) {
-		WdfRequestComplete(Request, Status);
+	if (RequestPending != TRUE) 
+	{
+		WdfRequestComplete(
+			Request,
+			Status
+		);
 	}
 
     return;
 }
 
-// EvtIoStop for the default (IOCTL dispatch) queue.
-// All IOCTLs on this queue are synchronous and short-lived — they complete
-// well within the framework's power-transition timeout.  Taking no action
-// here is correct: the framework will wait for the in-flight request to
-// complete naturally before proceeding with power-down or removal.
-// This will NOT cause Bug Check 0x9F because the default queue only holds
-// requests for the brief duration of a descriptor fetch or feature get/set.
 VOID
 AmtPtpDeviceSpiKmEvtIoStop(
     _In_ WDFQUEUE Queue,
@@ -200,9 +232,43 @@ AmtPtpDeviceSpiKmEvtIoStop(
 	UNREFERENCED_PARAMETER(Request);
 	UNREFERENCED_PARAMETER(ActionFlags);
 
-	TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_QUEUE,
-		"%!FUNC! ActionFlags=0x%lx, allowing request to complete naturally",
-		ActionFlags);
+    //
+    // In most cases, the EvtIoStop callback function completes, cancels, or postpones
+    // further processing of the I/O request.
+    //
+    // Typically, the driver uses the following rules:
+    //
+    // - If the driver owns the I/O request, it calls WdfRequestUnmarkCancelable
+    //   (if the request is cancelable) and either calls WdfRequestStopAcknowledge
+    //   with a Requeue value of TRUE, or it calls WdfRequestComplete with a
+    //   completion status value of STATUS_SUCCESS or STATUS_CANCELLED.
+    //
+    //   Before it can call these methods safely, the driver must make sure that
+    //   its implementation of EvtIoStop has exclusive access to the request.
+    //
+    //   In order to do that, the driver must synchronize access to the request
+    //   to prevent other threads from manipulating the request concurrently.
+    //   The synchronization method you choose will depend on your driver's design.
+    //
+    //   For example, if the request is held in a shared context, the EvtIoStop callback
+    //   might acquire an internal driver lock, take the request from the shared context,
+    //   and then release the lock. At this point, the EvtIoStop callback owns the request
+    //   and can safely complete or requeue the request.
+    //
+    // - If the driver has forwarded the I/O request to an I/O target, it either calls
+    //   WdfRequestCancelSentRequest to attempt to cancel the request, or it postpones
+    //   further processing of the request and calls WdfRequestStopAcknowledge with
+    //   a Requeue value of FALSE.
+    //
+    // A driver might choose to take no action in EvtIoStop for requests that are
+    // guaranteed to complete in a small amount of time.
+    //
+    // In this case, the framework waits until the specified request is complete
+    // before moving the device (or system) to a lower power state or removing the device.
+    // Potentially, this inaction can prevent a system from entering its hibernation state
+    // or another low system power state. In extreme cases, it can cause the system
+    // to crash with bugcheck code 9F.
+    //
 
     return;
 }

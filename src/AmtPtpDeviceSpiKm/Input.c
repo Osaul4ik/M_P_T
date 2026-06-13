@@ -2,319 +2,320 @@
 #include "Input.tmh"
 
 VOID
-AmtPtpSpiInputRoutineWorker(WDFDEVICE Device, WDFREQUEST PtpRequest)
+AmtPtpSpiInputRoutineWorker(
+	WDFDEVICE Device,
+	WDFREQUEST PtpRequest
+)
 {
-    NTSTATUS        Status;
-    PDEVICE_CONTEXT pCtx = DeviceGetContext(Device);
-    Status = WdfRequestForwardToIoQueue(PtpRequest, pCtx->HidQueue);
-    if (!NT_SUCCESS(Status)) {
-        TraceEvents(TRACE_LEVEL_ERROR, TRACE_DRIVER,
-            "%!FUNC! WdfRequestForwardToIoQueue %!STATUS!", Status);
-        WdfRequestComplete(PtpRequest, Status);
-    }
+	NTSTATUS Status;
+	PDEVICE_CONTEXT pDeviceContext;
+	pDeviceContext = DeviceGetContext(Device);
+
+	Status = WdfRequestForwardToIoQueue(
+		PtpRequest,
+		pDeviceContext->HidQueue
+	);
+
+	if (!NT_SUCCESS(Status)) {
+		TraceEvents(
+			TRACE_LEVEL_INFORMATION,
+			TRACE_DRIVER,
+			"%!FUNC! WdfRequestForwardToIoQueue fails, status = %!STATUS!",
+			Status
+		);
+
+		WdfRequestComplete(PtpRequest, Status);
+		return;
+	}
+
+	// Only issue request when fully configured.
+	// Otherwise we will let power recovery process to triage it
+	if (pDeviceContext->DeviceStatus == D0ActiveAndConfigured) {
+		AmtPtpSpiInputIssueRequest(Device);
+	}
 }
 
 VOID
-AmtPtpSpiInputIssueRequest(WDFDEVICE Device)
+AmtPtpSpiInputIssueRequest(
+	WDFDEVICE Device
+)
 {
-    NTSTATUS             Status;
-    PDEVICE_CONTEXT      pCtx = DeviceGetContext(Device);
-    WDF_REQUEST_REUSE_PARAMS ReuseParams;
+	NTSTATUS Status;
+	PDEVICE_CONTEXT pDeviceContext;
+	WDF_OBJECT_ATTRIBUTES Attributes;
+	BOOLEAN RequestStatus = FALSE;
+	WDFREQUEST SpiHidReadRequest;
+	WDFMEMORY SpiHidReadOutputMemory;
+	PWORKER_REQUEST_CONTEXT RequestContext;
+	pDeviceContext = DeviceGetContext(Device);
 
-    WDF_REQUEST_REUSE_PARAMS_INIT(&ReuseParams, WDF_REQUEST_REUSE_NO_FLAGS,
-                                  STATUS_SUCCESS);
-    Status = WdfRequestReuse(pCtx->SpiHidReadRequest, &ReuseParams);
-    if (!NT_SUCCESS(Status)) {
-        TraceEvents(TRACE_LEVEL_ERROR, TRACE_DEVICE,
-            "%!FUNC! WdfRequestReuse %!STATUS!", Status);
-        return;
-    }
-    if (!WdfRequestSend(pCtx->SpiHidReadRequest,
-                        pCtx->SpiTrackpadIoTarget, NULL)) {
-        TraceEvents(TRACE_LEVEL_ERROR, TRACE_DEVICE,
-            "%!FUNC! WdfRequestSend %!STATUS!",
-            WdfRequestGetStatus(pCtx->SpiHidReadRequest));
-    }
+	WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&Attributes, WORKER_REQUEST_CONTEXT);
+	Attributes.ParentObject = Device;
+
+	Status = WdfRequestCreate(
+		&Attributes,
+		pDeviceContext->SpiTrackpadIoTarget,
+		&SpiHidReadRequest
+	);
+
+	if (!NT_SUCCESS(Status))
+	{
+		TraceEvents(
+			TRACE_LEVEL_INFORMATION,
+			TRACE_DEVICE,
+			"%!FUNC! WdfRequestCreate fails, status = %!STATUS!",
+			Status
+		);
+
+		return;
+	}
+
+	Status = WdfMemoryCreateFromLookaside(
+		pDeviceContext->HidReadBufferLookaside,
+		&SpiHidReadOutputMemory
+	);
+
+	if (!NT_SUCCESS(Status))
+	{
+		TraceEvents(
+			TRACE_LEVEL_INFORMATION,
+			TRACE_DEVICE,
+			"%!FUNC! WdfMemoryCreateFromLookaside fails, status = %!STATUS!",
+			Status
+		);
+
+		WdfObjectDelete(SpiHidReadRequest);
+		return;
+	}
+
+	// Assign context information
+	RequestContext = WorkerRequestGetContext(SpiHidReadRequest);
+	RequestContext->DeviceContext = pDeviceContext;
+	RequestContext->RequestMemory = SpiHidReadOutputMemory;
+
+	// Invoke HID read request to the device.
+	Status = WdfIoTargetFormatRequestForInternalIoctl(
+		pDeviceContext->SpiTrackpadIoTarget,
+		SpiHidReadRequest,
+		IOCTL_HID_READ_REPORT,
+		NULL,
+		0,
+		SpiHidReadOutputMemory,
+		0
+	);
+
+	if (!NT_SUCCESS(Status))
+	{
+		TraceEvents(
+			TRACE_LEVEL_INFORMATION,
+			TRACE_DEVICE,
+			"%!FUNC! WdfIoTargetFormatRequestForInternalIoctl fails, status = %!STATUS!",
+			Status
+		);
+
+		if (SpiHidReadOutputMemory != NULL) {
+			WdfObjectDelete(SpiHidReadOutputMemory);
+		}
+
+		if (SpiHidReadRequest != NULL) {
+			WdfObjectDelete(SpiHidReadRequest);
+		}
+
+		return;
+	}
+
+	WdfRequestSetCompletionRoutine(
+		SpiHidReadRequest,
+		AmtPtpRequestCompletionRoutine,
+		RequestContext
+	);
+
+	RequestStatus = WdfRequestSend(
+		SpiHidReadRequest,
+		pDeviceContext->SpiTrackpadIoTarget,
+		NULL
+	);
+
+	if (!RequestStatus)
+	{
+		TraceEvents(
+			TRACE_LEVEL_INFORMATION,
+			TRACE_DEVICE,
+			"%!FUNC! AmtPtpSpiInputRoutineWorker request failed to sent"
+		);
+
+		if (SpiHidReadOutputMemory != NULL) {
+			WdfObjectDelete(SpiHidReadOutputMemory);
+		}
+
+		if (SpiHidReadRequest != NULL) {
+			WdfObjectDelete(SpiHidReadRequest);
+		}
+	}
 }
 
-// Saturating normalize: [XMin..XMax] → [0..XRange], clamped.
-FORCEINLINE USHORT NormalizeX(_In_ const DEVICE_CONTEXT* c, _In_ SHORT x)
-{
-    LONG n = (LONG)x - (LONG)c->TrackpadInfo.XMin;
-    if (n <= 0)                  return 0;
-    if (n >= (LONG)c->XRange)    return c->XRange;
-    return (USHORT)n;
-}
-
-// Apple Y grows downward; PTP Y grows upward → invert.
-FORCEINLINE USHORT NormalizeY(_In_ const DEVICE_CONTEXT* c, _In_ SHORT y)
-{
-    LONG n = (LONG)c->TrackpadInfo.YMax - (LONG)y;
-    if (n <= 0)                  return 0;
-    if (n >= (LONG)c->YRange)    return c->YRange;
-    return (USHORT)n;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// AmtPtpRequestCompletionRoutine — DISPATCH_LEVEL, serialised by single-request
-// invariant (only one SPI read outstanding at a time).
-//
-// Two-pass design:
-//   Pass A (match + transition):  O(H²·S) matching, O(S) state updates.
-//   Pass B (report build):        O(S) single scan, fills PTP_REPORT.
-// ─────────────────────────────────────────────────────────────────────────────
 VOID
 AmtPtpRequestCompletionRoutine(
-    WDFREQUEST                     SpiRequest,
-    WDFIOTARGET                    Target,
-    PWDF_REQUEST_COMPLETION_PARAMS Params,
-    WDFCONTEXT                     Context)
+	WDFREQUEST SpiRequest,
+	WDFIOTARGET Target,
+	PWDF_REQUEST_COMPLETION_PARAMS Params,
+	WDFCONTEXT Context
+)
 {
-    NTSTATUS                Status;
-    PDEVICE_CONTEXT         pCtx;
-    PSPI_TRACKPAD_PACKET    pPkt;
-    SIZE_T                  BufLen;
-    LONG                    SpiLen;
-    UINT8                   HwCount;
+	NTSTATUS Status;
+	PWORKER_REQUEST_CONTEXT RequestContext;
+	PDEVICE_CONTEXT pDeviceContext;
 
-    WDFREQUEST              PtpRequest;
-    PTP_REPORT*             pReport;   // direct pointer — avoids extra WDF copy
-    SIZE_T                  OutLen;
-    UINT8                   ReportSlots;
+	LONG SpiRequestLength;
+	PSPI_TRACKPAD_PACKET pSpiTrackpadPacket;
 
-    ULONGLONG               Now;
-    ULONGLONG               Delta100us;
-    UINT8                   i, s;
+	WDFREQUEST PtpRequest;
+	PTP_REPORT PtpReport;
+	WDFMEMORY PtpRequestMemory;
 
-    // Pass-A temporaries:
-    //   hw_to_slot[i] = slot assigned to HW finger i (SLOT_NONE if unmatched).
-    //   slot_to_hw[s] = HW finger index matched to slot s (SLOT_NONE if none).
-    UINT8  hw_to_slot[SPI_TRACKPAD_MAX_FINGERS];
-    UINT8  slot_to_hw[PTP_MAX_CONTACT_POINTS];
-    SHORT  HwRawX[SPI_TRACKPAD_MAX_FINGERS];
-    SHORT  HwRawY[SPI_TRACKPAD_MAX_FINGERS];
+	LARGE_INTEGER CurrentCounter;
+	LONGLONG CounterDelta;
 
-    UNREFERENCED_PARAMETER(Target);
+	UNREFERENCED_PARAMETER(Target);
 
-    pCtx = ((PWORKER_REQUEST_CONTEXT)Context)->DeviceContext;
+	// Get context
+	RequestContext = (PWORKER_REQUEST_CONTEXT) Context;
+	pDeviceContext = RequestContext->DeviceContext;
 
-    // ── Step 1: dequeue PTP request ───────────────────────────────────────
-    Status = WdfIoQueueRetrieveNextRequest(pCtx->HidQueue, &PtpRequest);
-    if (!NT_SUCCESS(Status)) {
-        TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DRIVER,
-            "%!FUNC! No pending PTP request (%!STATUS!)", Status);
-        goto cleanup;
-    }
+	// Read report and fulfill PTP request.
+	// If no report is found, just exit.
+	Status = WdfIoQueueRetrieveNextRequest(pDeviceContext->HidQueue, &PtpRequest);
+	if (!NT_SUCCESS(Status)) {
+		TraceEvents(
+			TRACE_LEVEL_ERROR,
+			TRACE_DRIVER,
+			"%!FUNC! WdfIoQueueRetrieveNextRequest failed with %!STATUS!",
+			Status
+		);
 
-    // ── Mode check ────────────────────────────────────────────────────────
-    if (!pCtx->PtpInputOn || !pCtx->PtpReportTouch) {
-        AmtPtpResetContactTable(&pCtx->Contacts);
-        // Retrieve output buffer directly — avoids WdfMemoryCopyFromBuffer DDI
-        // overhead for this trivial zero-report path.
-        Status = WdfRequestRetrieveOutputBuffer(
-                     PtpRequest, sizeof(PTP_REPORT), (PVOID*)&pReport, &OutLen);
-        if (NT_SUCCESS(Status)) {
-            RtlZeroMemory(pReport, sizeof(PTP_REPORT));
-            pReport->ReportID = REPORTID_MULTITOUCH;
-            WdfRequestSetInformation(PtpRequest, sizeof(PTP_REPORT));
-        }
-        goto exit;
-    }
+		goto cleanup;
+	}
 
-    // ── Step 2: validate SPI packet ───────────────────────────────────────
-    SpiLen = (LONG)WdfRequestGetInformation(SpiRequest);
-    BufLen = 0;
-    pPkt   = (PSPI_TRACKPAD_PACKET)WdfMemoryGetBuffer(
-                 Params->Parameters.Ioctl.Output.Buffer, &BufLen);
+	SpiRequestLength = (LONG) WdfRequestGetInformation(SpiRequest);
+	pSpiTrackpadPacket = (PSPI_TRACKPAD_PACKET) WdfMemoryGetBuffer(Params->Parameters.Ioctl.Output.Buffer, NULL);
 
-    if (SpiLen > (LONG)BufLen) {
-        TraceEvents(TRACE_LEVEL_ERROR, TRACE_DRIVER,
-            "%!FUNC! SpiLen %d > BufLen %Iu", SpiLen, BufLen);
-        Status = STATUS_BUFFER_OVERFLOW; goto exit;
-    }
-    if (SpiLen < 46) {
-        TraceEvents(TRACE_LEVEL_ERROR, TRACE_DRIVER,
-            "%!FUNC! Header truncated %d < 46", SpiLen);
-        Status = STATUS_DEVICE_DATA_ERROR; goto exit;
-    }
-    if (pPkt->NumOfFingers > SPI_TRACKPAD_MAX_FINGERS) {
-        TraceEvents(TRACE_LEVEL_ERROR, TRACE_DRIVER,
-            "%!FUNC! NumOfFingers %d > %d",
-            pPkt->NumOfFingers, SPI_TRACKPAD_MAX_FINGERS);
-        Status = STATUS_DEVICE_DATA_ERROR; goto exit;
-    }
-    {
-        LONG MinLen = 46L + (LONG)pPkt->NumOfFingers
-                          * (LONG)sizeof(SPI_TRACKPAD_FINGER);
-        if (SpiLen < MinLen) {
-            TraceEvents(TRACE_LEVEL_ERROR, TRACE_DRIVER,
-                "%!FUNC! Packet truncated %d < %d (%d fingers)",
-                SpiLen, MinLen, pPkt->NumOfFingers);
-            Status = STATUS_DEVICE_DATA_ERROR; goto exit;
-        }
-    }
+	// Safe measurement for buffer overrun and device state reset
+	if (SpiRequestLength < 46) {
+		TraceEvents(
+			TRACE_LEVEL_ERROR,
+			TRACE_DRIVER,
+			"%!FUNC! Input too small: %d < 46. Attempt to re-enable the device.",
+			SpiRequestLength
+		);
 
-    HwCount = (pPkt->NumOfFingers > PTP_MAX_CONTACT_POINTS)
-              ? PTP_MAX_CONTACT_POINTS : (UINT8)pPkt->NumOfFingers;
+		Status = STATUS_DEVICE_DATA_ERROR;
+		goto exit;
+	}
 
-    // ── Step 3: ScanTime ─────────────────────────────────────────────────
-    Now        = KeQueryInterruptTime();
-    Delta100us = (Now - pCtx->LastReportTime) / 1000ULL;
-    if (Delta100us > 0xFFFFULL) Delta100us = 0xFFFF;
-    if (pCtx->Contacts.LiveCount == 0 && HwCount > 0 &&
-        Delta100us > IDLE_SCANTIME_THRESHOLD) {
-        Delta100us = FIRST_FRAME_SCANTIME_CAP;
-    }
-    pCtx->LastReportTime = Now;
+	// Get Counter
+	KeQueryPerformanceCounter(
+		&CurrentCounter
+	);
 
-    // ── PASS A: match + state transitions ────────────────────────────────
-    //
-    // A1. Collect raw HW coordinates (avoid repeated field access).
-    for (i = 0; i < HwCount; i++) {
-        HwRawX[i] = pPkt->Fingers[i].X;
-        HwRawY[i] = pPkt->Fingers[i].Y;
-    }
+	CounterDelta = (CurrentCounter.QuadPart - pDeviceContext->LastReportTime.QuadPart) / 100;
+	pDeviceContext->LastReportTime.QuadPart = CurrentCounter.QuadPart;
 
-    // A2. Pre-fill slot_to_hw with SLOT_NONE.
-    RtlFillMemory(slot_to_hw, sizeof(slot_to_hw), SLOT_NONE);
+	// Write report
+	PtpReport.ReportID = REPORTID_MULTITOUCH;
+	PtpReport.ContactCount = pSpiTrackpadPacket->NumOfFingers;
+	PtpReport.IsButtonClicked = pSpiTrackpadPacket->ClickOccurred;
 
-    // A3. Optimal bipartite matching: HW fingers ↔ Live slots.
-    //     Uses raw SPI coordinates on both sides — no DC bias.
-    AmtPtpMatchFingers(&pCtx->Contacts, HwCount,
-                       HwRawX, HwRawY, hw_to_slot, slot_to_hw);
+	UINT8 AdjustedCount = (pSpiTrackpadPacket->NumOfFingers > 5) ? 5 : pSpiTrackpadPacket->NumOfFingers;
+	for (UINT8 Count = 0; Count < AdjustedCount; Count++)
+	{
+		PtpReport.Contacts[Count].ContactID = Count;
+		PtpReport.Contacts[Count].X = ((pSpiTrackpadPacket->Fingers[Count].X - pDeviceContext->TrackpadInfo.XMin) > 0) ? 
+			(USHORT)(pSpiTrackpadPacket->Fingers[Count].X - pDeviceContext->TrackpadInfo.XMin) : 0;
+		PtpReport.Contacts[Count].Y = ((pDeviceContext->TrackpadInfo.YMax - pSpiTrackpadPacket->Fingers[Count].Y) > 0) ? 
+			(USHORT)(pDeviceContext->TrackpadInfo.YMax - pSpiTrackpadPacket->Fingers[Count].Y) : 0;
+		PtpReport.Contacts[Count].TipSwitch = (pSpiTrackpadPacket->Fingers[Count].Pressure > 0) ? 1 : 0;
 
-    // A4. Allocate new slots for unmatched HW fingers.
-    for (i = 0; i < HwCount; i++) {
-        if (hw_to_slot[i] != SLOT_NONE) continue; // already matched
+		// $S = \pi * (Touch_{Major} * Touch_{Minor}) / 4$
+		// $S = \pi * r^2$
+		// $r^2 = (Touch_{Major} * Touch_{Minor}) / 4$
+		// Using i386 in 2018 is evil
+		PtpReport.Contacts[Count].Confidence = (pSpiTrackpadPacket->Fingers[Count].TouchMajor < 2500 &&
+			pSpiTrackpadPacket->Fingers[Count].TouchMinor < 2500) ? 1 : 0;
 
-        s = AmtPtpAllocateSlot(&pCtx->Contacts);
-        if (s == SLOT_NONE) {
-            TraceEvents(TRACE_LEVEL_WARNING, TRACE_HID_INPUT,
-                "%!FUNC! Table full, dropping finger %d", i);
-            continue;
-        }
-        pCtx->Contacts.Slots[s].State       = ContactSlotLive;
-        pCtx->Contacts.Slots[s].WasReported = FALSE;
-        pCtx->Contacts.Slots[s].IsPalm  =
-            (pPkt->Fingers[i].TouchMajor >= PALM_MAJOR_THRESHOLD &&
-             pPkt->Fingers[i].TouchMinor >= PALM_MINOR_THRESHOLD);
-        pCtx->Contacts.Slots[s].LastRawX  = HwRawX[i];
-        pCtx->Contacts.Slots[s].LastRawY  = HwRawY[i];
-        pCtx->Contacts.Slots[s].LastNormX = NormalizeX(pCtx, HwRawX[i]);
-        pCtx->Contacts.Slots[s].LastNormY = NormalizeY(pCtx, HwRawY[i]);
+		TraceEvents(
+			TRACE_LEVEL_INFORMATION,
+			TRACE_HID_INPUT,
+			"%!FUNC! PTP Contact %d OX %d, OY %d, X %d, Y %d",
+			Count,
+			pSpiTrackpadPacket->Fingers[Count].OriginalX,
+			pSpiTrackpadPacket->Fingers[Count].OriginalY,
+			pSpiTrackpadPacket->Fingers[Count].X,
+			pSpiTrackpadPacket->Fingers[Count].Y
+		);
+	}
 
-        hw_to_slot[i]  = s;
-        slot_to_hw[s]  = i;
+	if (CounterDelta >= 0xFF)
+	{
+		PtpReport.ScanTime = 0xFF;
+	}
+	else
+	{
+		PtpReport.ScanTime = (USHORT) CounterDelta;
+	}
 
-        TraceEvents(TRACE_LEVEL_VERBOSE, TRACE_HID_INPUT,
-            "%!FUNC! New slot %d %s", s,
-            pCtx->Contacts.Slots[s].IsPalm ? "(palm)" : "");
-    }
+	Status = WdfRequestRetrieveOutputMemory(
+		PtpRequest,
+		&PtpRequestMemory
+	);
 
-    // A5. Single pass over all slots: update Live, transition to Lifting/Empty.
-    pCtx->Contacts.LiveCount = 0;
-    for (s = 0; s < PTP_MAX_CONTACT_POINTS; s++) {
-        CONTACT_SLOT* sl = &pCtx->Contacts.Slots[s];
+	if (!NT_SUCCESS(Status))
+	{
+		TraceEvents(
+			TRACE_LEVEL_ERROR,
+			TRACE_DRIVER,
+			"%!FUNC! WdfRequestRetrieveOutputBuffer failed with %!STATUS!",
+			Status
+		);
 
-        if (sl->State == ContactSlotLifting) continue; // will be freed in Pass B after lift is sent
+		goto exit;
+	}
 
-        if (sl->State != ContactSlotLive) continue; // ContactSlotEmpty: nothing to do
+	Status = WdfMemoryCopyFromBuffer(
+		PtpRequestMemory,
+		0,
+		(PVOID) &PtpReport,
+		sizeof(PTP_REPORT)
+	);
 
-        if (slot_to_hw[s] == SLOT_NONE) {
-            // No HW finger matched this slot → finger disappeared.
-            sl->State = ContactSlotLifting;
-        } else {
-            // Matched: always capture current HW position (including release frame).
-            UINT8 hw = slot_to_hw[s];
-            sl->LastRawX  = HwRawX[hw];
-            sl->LastRawY  = HwRawY[hw];
-            if (!sl->IsPalm) {
-                sl->LastNormX = NormalizeX(pCtx, HwRawX[hw]);
-                sl->LastNormY = NormalizeY(pCtx, HwRawY[hw]);
-            }
-            if (pPkt->Fingers[hw].Pressure < 1) {
-                // Pressure=0 transitional frame (finger releasing).
-                sl->State = ContactSlotLifting;
-            } else if (!sl->IsPalm) {
-                pCtx->Contacts.LiveCount++;
-            }
-        }
-    }
+	if (!NT_SUCCESS(Status))
+	{
+		TraceEvents(
+			TRACE_LEVEL_ERROR,
+			TRACE_DRIVER,
+			"%!FUNC! WdfMemoryCopyFromBuffer failed with %!STATUS!",
+			Status
+		);
 
-    // ── PASS B: build PTP_REPORT ──────────────────────────────────────────
-    //
-    // Single pass. Live non-palm → TipSwitch=1. Lifting non-palm → TipSwitch=0
-    // at LastNormX/Y. Palm lifting → silent Empty (no HID entry).
-    //
-    // Direct output-buffer pointer avoids WdfMemoryCopyFromBuffer DDI overhead
-    // (~100 cycles) for this 30-byte copy.
-    Status = WdfRequestRetrieveOutputBuffer(
-                 PtpRequest, sizeof(PTP_REPORT), (PVOID*)&pReport, &OutLen);
-    if (!NT_SUCCESS(Status)) {
-        TraceEvents(TRACE_LEVEL_ERROR, TRACE_DRIVER,
-            "%!FUNC! WdfRequestRetrieveOutputBuffer %!STATUS!", Status);
-        goto exit;
-    }
+		goto exit;
+	}
 
-    RtlZeroMemory(pReport, sizeof(PTP_REPORT));
-    ReportSlots = 0;
-
-    for (s = 0; s < PTP_MAX_CONTACT_POINTS && ReportSlots < PTP_MAX_CONTACT_POINTS; s++) {
-        CONTACT_SLOT* sl = &pCtx->Contacts.Slots[s];
-
-        if (sl->State == ContactSlotLive && !sl->IsPalm) {
-            pReport->Contacts[ReportSlots].ContactID  = s;
-            pReport->Contacts[ReportSlots].TipSwitch  = 1;
-            pReport->Contacts[ReportSlots].Confidence = 1;
-            pReport->Contacts[ReportSlots].X          = sl->LastNormX;
-            pReport->Contacts[ReportSlots].Y          = sl->LastNormY;
-            TraceEvents(TRACE_LEVEL_VERBOSE, TRACE_HID_INPUT,
-                "%!FUNC! ID=%d LIVE X=%u Y=%u", s, sl->LastNormX, sl->LastNormY);
-            sl->WasReported = TRUE;
-            ReportSlots++;
-
-        } else if (sl->State == ContactSlotLifting) {
-            if (sl->IsPalm || !sl->WasReported) {
-                // Palm or never-reported contact: Windows saw no down — skip lift.
-                sl->State       = ContactSlotEmpty;
-                sl->IsPalm      = FALSE;
-                sl->WasReported = FALSE;
-            } else {
-                // CRITICAL: use LastNormX/Y — NOT (0,0).
-                // Windows updates its internal "last position" for this
-                // ContactID even from TipSwitch=0 frames.  Sending (0,0)
-                // anchors gesture termination at trackpad origin, causing
-                // cursor snap-back on the next touch sequence.
-                pReport->Contacts[ReportSlots].ContactID  = s;
-                pReport->Contacts[ReportSlots].TipSwitch  = 0;
-                pReport->Contacts[ReportSlots].Confidence = 1;
-                pReport->Contacts[ReportSlots].X          = sl->LastNormX;
-                pReport->Contacts[ReportSlots].Y          = sl->LastNormY;
-                TraceEvents(TRACE_LEVEL_VERBOSE, TRACE_HID_INPUT,
-                    "%!FUNC! ID=%d LIFT X=%u Y=%u", s, sl->LastNormX, sl->LastNormY);
-                ReportSlots++;
-                // Free slot here — after lift is sent — so AmtPtpAllocateSlot
-                // in Pass A cannot reuse it in the same frame and skip the lift.
-                sl->State       = ContactSlotEmpty;
-                sl->IsPalm      = FALSE;
-                sl->WasReported = FALSE;
-            }
-        }
-    }
-
-    pReport->ReportID        = REPORTID_MULTITOUCH;
-    // Windows PTP: ContactCount = all contacts in this frame (live + lift).
-    pReport->ContactCount    = ReportSlots;
-    pReport->IsButtonClicked = pPkt->ClickOccurred;
-    pReport->ScanTime        = (USHORT)Delta100us;
-
-    WdfRequestSetInformation(PtpRequest, sizeof(PTP_REPORT));
+	// Set information
+	WdfRequestSetInformation(
+		PtpRequest,
+		sizeof(PTP_REPORT)
+	);
 
 exit:
-    WdfRequestComplete(PtpRequest, Status);
+	WdfRequestComplete(
+		PtpRequest,
+		Status
+	);
 
 cleanup:
-    if (DEVICE_STATUS_READ(pCtx) == D0ActiveAndConfigured) {
-        AmtPtpSpiInputIssueRequest(pCtx->SpiDevice);
-    }
+	// Clean up
+	pSpiTrackpadPacket = NULL;
+	WdfObjectDelete(SpiRequest);
+	if (RequestContext->RequestMemory != NULL) {
+		WdfObjectDelete(RequestContext->RequestMemory);
+	}
 }

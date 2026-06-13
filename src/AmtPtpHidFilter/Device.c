@@ -56,15 +56,10 @@ PtpFilterCreateDevice(
     }
 
     // Initialize read buffer
-    {
-        WDF_OBJECT_ATTRIBUTES lookasideAttributes;
-        WDF_OBJECT_ATTRIBUTES_INIT(&lookasideAttributes);
-        lookasideAttributes.ParentObject = device;
-        status = WdfLookasideListCreate(&lookasideAttributes, REPORT_BUFFER_SIZE,
-            NonPagedPoolNx, WDF_NO_OBJECT_ATTRIBUTES, PTP_LIST_POOL_TAG,
-            &deviceContext->HidReadBufferLookaside
-        );
-    }
+    status = WdfLookasideListCreate(WDF_NO_OBJECT_ATTRIBUTES, REPORT_BUFFER_SIZE,
+        NonPagedPoolNx, WDF_NO_OBJECT_ATTRIBUTES, PTP_LIST_POOL_TAG,
+        &deviceContext->HidReadBufferLookaside
+    );
     if (!NT_SUCCESS(status)) {
         TraceEvents(TRACE_LEVEL_ERROR, TRACE_DEVICE, "WdfLookasideListCreate failed: %!STATUS!", status);
     }
@@ -94,10 +89,6 @@ PtpFilterCreateDevice(
     deviceContext->ProductID = 0;
     deviceContext->VersionNumber = 0;
     deviceContext->DeviceConfigured = FALSE;
-    // Initialize PTP per-contact state
-    RtlZeroMemory(deviceContext->LastNormX, sizeof(deviceContext->LastNormX));
-    RtlZeroMemory(deviceContext->LastNormY, sizeof(deviceContext->LastNormY));
-    RtlZeroMemory(deviceContext->WasReported, sizeof(deviceContext->WasReported));
 
     // Initialize IO queue
     status = PtpFilterIoQueueInitialize(device);
