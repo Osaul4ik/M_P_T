@@ -210,6 +210,10 @@ PtpFilterInputRequestCompletionCallback(
 
 		UCHAR cid = f_type5->OrientationAndOrigin.ContactIdentifier.Id;
 		BOOLEAN tip = ((signed short)(f_type5->TouchMajor) << 1) > 0;
+		if (cid >= PTP_MAX_CONTACT_POINTS) {
+			// Ignore invalid contact identifiers to avoid memory corruption
+			continue;
+		}
 		if (tip) {
 			// Active contact: report current coordinates and remember them.
 			ptpOutputReport.Contacts[reportSlots].ContactID = cid;
@@ -223,7 +227,7 @@ PtpFilterInputRequestCompletionCallback(
 			reportSlots++;
 		} else {
 			// Lift frame: only report if we previously reported this contact.
-			if (cid < PTP_MAX_CONTACT_POINTS && deviceContext->WasReported[cid]) {
+			if (deviceContext->WasReported[cid]) {
 				ptpOutputReport.Contacts[reportSlots].ContactID = cid;
 				ptpOutputReport.Contacts[reportSlots].X = deviceContext->LastNormX[cid];
 				ptpOutputReport.Contacts[reportSlots].Y = deviceContext->LastNormY[cid];
