@@ -192,7 +192,7 @@ AmtPtpRequestCompletionRoutine(
                 "%!FUNC! Table full, dropping finger %d", i);
             continue;
         }
-        pCtx->Contacts.Slots[s].State   = SlotLive;
+        pCtx->Contacts.Slots[s].State   = ContactSlotLive;
         pCtx->Contacts.Slots[s].IsPalm  =
             (pPkt->Fingers[i].TouchMajor >= PALM_MAJOR_THRESHOLD &&
              pPkt->Fingers[i].TouchMinor >= PALM_MINOR_THRESHOLD);
@@ -214,24 +214,24 @@ AmtPtpRequestCompletionRoutine(
     for (s = 0; s < PTP_MAX_CONTACT_POINTS; s++) {
         CONTACT_SLOT* sl = &pCtx->Contacts.Slots[s];
 
-        if (sl->State == SlotLifting) {
+        if (sl->State == ContactSlotLifting) {
             // Already emitted TipSwitch=0 last frame — free the slot.
-            sl->State  = SlotEmpty;
+            sl->State  = ContactSlotEmpty;
             sl->IsPalm = FALSE;
             continue;
         }
 
-        if (sl->State != SlotLive) continue; // SlotEmpty: nothing to do
+        if (sl->State != ContactSlotLive) continue; // ContactSlotEmpty: nothing to do
 
         if (slot_to_hw[s] == SLOT_NONE) {
             // No HW finger matched this slot → finger disappeared.
-            sl->State = SlotLifting;
+            sl->State = ContactSlotLifting;
         } else {
             // Matched. Check pressure.
             UINT8 hw = slot_to_hw[s];
             if (pPkt->Fingers[hw].Pressure < 1) {
                 // Pressure=0 transitional frame (finger releasing).
-                sl->State = SlotLifting;
+                sl->State = ContactSlotLifting;
             } else {
                 // Still live: update position.
                 sl->LastRawX  = HwRawX[hw];
@@ -266,7 +266,7 @@ AmtPtpRequestCompletionRoutine(
     for (s = 0; s < PTP_MAX_CONTACT_POINTS && ReportSlots < PTP_MAX_CONTACT_POINTS; s++) {
         CONTACT_SLOT* sl = &pCtx->Contacts.Slots[s];
 
-        if (sl->State == SlotLive && !sl->IsPalm) {
+        if (sl->State == ContactSlotLive && !sl->IsPalm) {
             pReport->Contacts[ReportSlots].ContactID  = s;
             pReport->Contacts[ReportSlots].TipSwitch  = 1;
             pReport->Contacts[ReportSlots].Confidence = 1;
@@ -276,10 +276,10 @@ AmtPtpRequestCompletionRoutine(
                 "%!FUNC! ID=%d LIVE X=%u Y=%u", s, sl->LastNormX, sl->LastNormY);
             ReportSlots++;
 
-        } else if (sl->State == SlotLifting) {
+        } else if (sl->State == ContactSlotLifting) {
             if (sl->IsPalm) {
                 // Palm: no TipSwitch=1 was ever sent, no lift needed.
-                sl->State  = SlotEmpty;
+                sl->State  = ContactSlotEmpty;
                 sl->IsPalm = FALSE;
             } else {
                 // CRITICAL: use LastNormX/Y — NOT (0,0).
