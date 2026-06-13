@@ -15,17 +15,6 @@ Environment:
 
 EXTERN_C_START
 
-// ── Hardware descriptor ───────────────────────────────────────────────────
-
-typedef struct _SPI_TRACKPAD_INFO {
-    USHORT VendorId;
-    USHORT ProductId;
-    SHORT  XMin;
-    SHORT  XMax;
-    SHORT  YMin;
-    SHORT  YMax;
-} SPI_TRACKPAD_INFO, *PSPI_TRACKPAD_INFO;
-
 // ── Enumerations ──────────────────────────────────────────────────────────
 
 typedef enum _REPORT_TYPE {
