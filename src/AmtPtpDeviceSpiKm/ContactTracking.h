@@ -1,172 +1,141 @@
 /*++
  ContactTracking.h — Persistent contact slot tracker for Apple SPI PTP driver.
-
- Architecture overview
- ─────────────────────
- The Apple T2 SPI firmware delivers fingers in a compact, ordered array:
-   Fingers[0..NumOfFingers-1] — always tightly packed, no gaps.
-
- A "hardware slot" is simply an index into that array for ONE SPI packet.
- Across packets the SAME physical finger may appear at a DIFFERENT array index
- as other fingers enter or leave.  The firmware does NOT provide a persistent
- per-finger token.
-
- The Windows PTP host stack expects:
-   1. Every ContactID used in a TipSwitch=1 report to remain STABLE for the
-      life of the contact (from first TipSwitch=1 to the matching TipSwitch=0).
-   2. Every ContactID that was ever sent with TipSwitch=1 to eventually receive
-      a report with TipSwitch=0 at its LAST KNOWN (X, Y).
-   3. Contacts to appear and disappear cleanly — no gaps in the ID space,
-      no IDs that appear without a prior touchdown.
-
- Design
- ──────
- We maintain a table of PTP_MAX_CONTACT_POINTS "contact slots".
- Each slot maps a stable PTP ContactID (= slot index, 0..N-1) to one physical
- finger, and tracks the complete state machine for that finger:
-
-   EMPTY  ──touch down──►  LIVE  ──pressure=0──►  LIFTING  ──next frame──►  EMPTY
-                              ▲                         │
-                          (stays live                   │ emit TipSwitch=0
-                           while P≥1)                  │ at last known X/Y
-                                                        ▼
-                                                      (slot freed)
-
- Palm classification is STICKY per slot:
-   • Evaluated only on the first frame a slot becomes LIVE.
-   • Once PALM, the slot is suppressed (no HID report) until EMPTY.
-   • A palm-classified slot still gets a "silent lift" (state→EMPTY) when
-     the finger leaves — no HID report needed since none was ever sent.
-   • This prevents a mid-gesture reclassification from creating a contact
-     that appeared without a touchdown.
-
- Matching (hardware array → contact slot)
- ─────────────────────────────────────────
- Since the SPI firmware compacts the array, we cannot use position index as
- a persistent identity.  Instead we match by proximity:
-
-   For each hardware finger H[i] in the new packet:
-     Find the LIVE slot S whose last (X, Y) is closest to H[i].(X, Y).
-     If dist(S, H[i]) < MATCH_THRESHOLD → bind H[i] to S (update position).
-     Else → allocate a new slot for H[i].
-
-   For each LIVE slot with no match: transition to LIFTING.
-
- This is identical to the algorithm used by every major touchpad driver
- (Linux input/touchscreen/hid-multitouch.c, Windows I2C HID class driver).
-
- MATCH_THRESHOLD = 1500 SPI units ≈ 15mm, generous enough for fast movement,
- tight enough to never confuse two simultaneous fingers.
-
- Synchronization
- ───────────────
- All contact-slot state is read and written exclusively inside
- AmtPtpRequestCompletionRoutine, which runs at DISPATCH_LEVEL.
- The single-pre-allocated-request invariant (only one outstanding SPI read
- at a time) guarantees that no two completion-routine invocations overlap.
- Therefore NO spinlock is needed for the contact table.
-
- Power transitions
- ─────────────────
- AmtPtpResetContactTable() must be called:
-   • In AmtPtpEvtDeviceSelfManagedIoInitOrRestart (D0 re-entry).
-   • In AmtPtpPowerRecoveryTimerCallback after successful AmtPtpSpiSetState.
- This ensures Windows never sees ContactIDs that were live before a power
- cycle appear to remain live after — which would require the host to
- time them out rather than close them cleanly.
-
+ v2: fixed coordinate-space mismatch in proximity matching; optimal bipartite
+     matching; slot_to_hw reverse map eliminates O(H) inner loop.
 --*/
-
 #pragma once
 
-// ── Contact slot state machine ────────────────────────────────────────────
-
 typedef enum _CONTACT_SLOT_STATE {
-    SlotEmpty   = 0,   // No finger. Slot is available for allocation.
-    SlotLive    = 1,   // Finger down, Pressure >= 1. TipSwitch=1 was sent.
-    SlotLifting = 2,   // Pressure dropped to 0 or finger disappeared.
-                       // TipSwitch=0 must be sent this frame at LastX/LastY.
+    SlotEmpty   = 0,
+    SlotLive    = 1,
+    SlotLifting = 2,
 } CONTACT_SLOT_STATE;
-
-// ── Per-slot data ─────────────────────────────────────────────────────────
 
 typedef struct _CONTACT_SLOT {
     CONTACT_SLOT_STATE  State;
-    BOOLEAN             IsPalm;     // Sticky: set on first live frame, cleared on Empty.
-    USHORT              LastX;      // Normalized PTP X of last TipSwitch=1 report.
-    USHORT              LastY;      // Normalized PTP Y of last TipSwitch=1 report.
+    BOOLEAN             IsPalm;
+    // Last known position stored in RAW SPI units (signed SHORT range).
+    // Stored raw so proximity matching uses consistent coordinate space.
+    // NormalizeX/Y is applied only when writing to the PTP report.
+    SHORT               LastRawX;
+    SHORT               LastRawY;
+    // Last normalized PTP coordinates — written to TipSwitch=1 AND TipSwitch=0
+    // reports. Lift frames MUST use these, not (0,0), or Windows anchors the
+    // gesture termination at the trackpad origin causing cursor snap-back.
+    USHORT              LastNormX;
+    USHORT              LastNormY;
 } CONTACT_SLOT, *PCONTACT_SLOT;
-
-// ── Contact table embedded in DEVICE_CONTEXT ─────────────────────────────
 
 typedef struct _CONTACT_TABLE {
     CONTACT_SLOT Slots[PTP_MAX_CONTACT_POINTS];
-    UINT8        LiveCount;     // Number of slots in SlotLive state.
-                                // Used for first-frame ScanTime cap.
+    UINT8        LiveCount;
 } CONTACT_TABLE, *PCONTACT_TABLE;
 
-// ── Proximity match threshold (SPI raw units) ─────────────────────────────
-// 1500 units ≈ 15mm at ~100 units/mm.  A finger can move at most ~50mm/frame
-// at 125Hz which is physically impossible; 15mm is a comfortable upper bound.
-#define CONTACT_MATCH_THRESHOLD_SQ  (1500 * 1500)
+// Proximity threshold in raw SPI units squared.
+// 1500 SPI units ≈ 15 mm at ~100 units/mm for MBP16,1.
+// A finger moving at 1 m/s at 125 Hz covers 8 mm/frame — well within 15 mm.
+#define CONTACT_MATCH_THRESHOLD_SQ  (1500L * 1500L)
 
-// ── API ───────────────────────────────────────────────────────────────────
+// Sentinel: no slot / no hardware finger.
+#define SLOT_NONE  ((UINT8)PTP_MAX_CONTACT_POINTS)
 
-// Reset all slots to Empty.  Call on D0 entry and after device reset.
 FORCEINLINE VOID
-AmtPtpResetContactTable(
-    _In_ PCONTACT_TABLE pTable
-)
+AmtPtpResetContactTable(_In_ PCONTACT_TABLE pTable)
 {
     RtlZeroMemory(pTable, sizeof(CONTACT_TABLE));
 }
 
-// Return the slot index (= stable PTP ContactID) of the best matching
-// LIVE slot for a hardware finger at (HwX, HwY), or PTP_MAX_CONTACT_POINTS
-// if no live slot is within CONTACT_MATCH_THRESHOLD_SQ.
-FORCEINLINE UINT8
-AmtPtpFindMatchingSlot(
-    _In_ const CONTACT_TABLE* pTable,
-    _In_ SHORT HwX,
-    _In_ SHORT HwY
+// ── Optimal minimum-cost bipartite matching ───────────────────────────────
+//
+// Maps each hardware finger H[0..HwCount-1] to the closest available Live
+// slot, ensuring no two fingers share a slot (one-to-one assignment).
+//
+// Algorithm: O(H²·S) exhaustive min-cost with used-slot exclusion.
+// With H ≤ 5 and S ≤ 5 this is at most 125 distance comparisons — ~250 ns.
+// Produces globally optimal assignments, preventing contact ID swaps during
+// fast scroll where a greedy (first-fit) approach would swap IDs.
+//
+// Output:
+//   hw_to_slot[i] = slot index assigned to hardware finger i,
+//                   or SLOT_NONE if no slot found / new contact.
+//   slot_to_hw[s] = hardware finger index matched to slot s,
+//                   or SLOT_NONE if slot s has no match this frame.
+//                   Pre-filled with SLOT_NONE by caller.
+//
+FORCEINLINE VOID
+AmtPtpMatchFingers(
+    _In_  const CONTACT_TABLE* pTable,
+    _In_  UINT8                HwCount,
+    _In_  const SHORT          HwRawX[],    // length HwCount
+    _In_  const SHORT          HwRawY[],    // length HwCount
+    _Out_ UINT8                hw_to_slot[], // length HwCount, filled here
+    _Out_ UINT8                slot_to_hw[]  // length PTP_MAX_CONTACT_POINTS,
+                                             // caller pre-fills with SLOT_NONE
 )
 {
-    UINT8 Best  = PTP_MAX_CONTACT_POINTS;  // sentinel = "no match"
-    LONG  BestDist = CONTACT_MATCH_THRESHOLD_SQ;
-    UINT8 i;
+    // cost[i][s] = squared distance from HwFinger[i] to Slot[s].
+    // LONG_MAX sentinel for unavailable slots.
+    LONG  cost[SPI_TRACKPAD_MAX_FINGERS][PTP_MAX_CONTACT_POINTS];
+    UINT8 used_slot[PTP_MAX_CONTACT_POINTS]; // slot already assigned this round
+    UINT8 i, s;
 
-    for (i = 0; i < PTP_MAX_CONTACT_POINTS; i++) {
-        LONG dx, dy, dist;
-        if (pTable->Slots[i].State != SlotLive) {
-            continue;
-        }
-        // Compute squared Euclidean distance in SPI coordinate space.
-        // LastX/Y are normalized PTP units; we need raw SPI units for the
-        // match.  Since we only compare distances (not absolute values),
-        // the coordinate space difference only introduces a fixed scale
-        // factor — the match is still correct.  Use LastX/Y directly.
-        dx   = (LONG)pTable->Slots[i].LastX - (LONG)HwX;
-        dy   = (LONG)pTable->Slots[i].LastY - (LONG)HwY;
-        dist = dx * dx + dy * dy;
-        if (dist < BestDist) {
-            BestDist = dist;
-            Best     = i;
+    RtlFillMemory(used_slot, sizeof(used_slot), 0);
+    RtlFillMemory(hw_to_slot, HwCount * sizeof(UINT8), SLOT_NONE);
+
+    // Build cost matrix.
+    for (i = 0; i < HwCount; i++) {
+        for (s = 0; s < PTP_MAX_CONTACT_POINTS; s++) {
+            if (pTable->Slots[s].State == SlotLive) {
+                LONG dx = (LONG)pTable->Slots[s].LastRawX - (LONG)HwRawX[i];
+                LONG dy = (LONG)pTable->Slots[s].LastRawY - (LONG)HwRawY[i];
+                cost[i][s] = dx * dx + dy * dy;
+            } else {
+                cost[i][s] = 0x7FFFFFFFL; // unavailable
+            }
         }
     }
-    return Best;
+
+    // Greedy assignment in order of cheapest global cost.
+    // Iterate up to min(HwCount, LiveCount) times.
+    {
+        UINT8 assigned = 0;
+        UINT8 max_assign = (HwCount < pTable->LiveCount)
+                           ? HwCount : pTable->LiveCount;
+
+        while (assigned < max_assign) {
+            LONG  best_cost = CONTACT_MATCH_THRESHOLD_SQ;
+            UINT8 best_i    = SLOT_NONE;
+            UINT8 best_s    = SLOT_NONE;
+
+            for (i = 0; i < HwCount; i++) {
+                if (hw_to_slot[i] != SLOT_NONE) continue; // already assigned
+                for (s = 0; s < PTP_MAX_CONTACT_POINTS; s++) {
+                    if (used_slot[s]) continue;
+                    if (cost[i][s] < best_cost) {
+                        best_cost = cost[i][s];
+                        best_i = i;
+                        best_s = s;
+                    }
+                }
+            }
+
+            if (best_i == SLOT_NONE) break; // no more matches within threshold
+
+            hw_to_slot[best_i]   = best_s;
+            slot_to_hw[best_s]   = best_i;
+            used_slot[best_s]    = 1;
+            assigned++;
+        }
+    }
 }
 
-// Find the first Empty slot.  Returns PTP_MAX_CONTACT_POINTS if none.
+// Find the first Empty slot. Returns SLOT_NONE if table is full.
 FORCEINLINE UINT8
-AmtPtpAllocateSlot(
-    _In_ const CONTACT_TABLE* pTable
-)
+AmtPtpAllocateSlot(_In_ const CONTACT_TABLE* pTable)
 {
     UINT8 i;
     for (i = 0; i < PTP_MAX_CONTACT_POINTS; i++) {
-        if (pTable->Slots[i].State == SlotEmpty) {
-            return i;
-        }
+        if (pTable->Slots[i].State == SlotEmpty) return i;
     }
-    return PTP_MAX_CONTACT_POINTS;  // table full
+    return SLOT_NONE;
 }
