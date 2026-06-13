@@ -1,192 +1,126 @@
-/*++
-Module Name:
-    Input.c
-Abstract:
-    SPI read pipeline and PTP report generation for the Apple T2 touchpad.
-    Contact tracking uses the persistent slot / proximity-match architecture
-    defined in ContactTracking.h.
-Environment:
-    Kernel-mode Driver Framework, DISPATCH_LEVEL in completion routine.
---*/
-
 #include "driver.h"
 #include "Input.tmh"
 
-// ─────────────────────────────────────────────────────────────────────────────
-// AmtPtpSpiInputRoutineWorker
-//
-// Called by Queue.c when Windows sends IOCTL_HID_READ_REPORT.
-// Forwards the request to HidQueue (manual, not power-managed).
-// Does NOT issue the SPI read here — that happens at the end of the
-// completion routine once the device is fully configured.
-// ─────────────────────────────────────────────────────────────────────────────
 VOID
-AmtPtpSpiInputRoutineWorker(
-    WDFDEVICE   Device,
-    WDFREQUEST  PtpRequest
-)
+AmtPtpSpiInputRoutineWorker(WDFDEVICE Device, WDFREQUEST PtpRequest)
 {
     NTSTATUS        Status;
-    PDEVICE_CONTEXT pDeviceContext = DeviceGetContext(Device);
-
-    Status = WdfRequestForwardToIoQueue(PtpRequest, pDeviceContext->HidQueue);
+    PDEVICE_CONTEXT pCtx = DeviceGetContext(Device);
+    Status = WdfRequestForwardToIoQueue(PtpRequest, pCtx->HidQueue);
     if (!NT_SUCCESS(Status)) {
         TraceEvents(TRACE_LEVEL_ERROR, TRACE_DRIVER,
-            "%!FUNC! WdfRequestForwardToIoQueue failed %!STATUS!", Status);
+            "%!FUNC! WdfRequestForwardToIoQueue %!STATUS!", Status);
         WdfRequestComplete(PtpRequest, Status);
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// AmtPtpSpiInputIssueRequest
-//
-// Reuse the pre-allocated SPI read request and send it to the lower driver.
-// Must only be called when DeviceStatus == D0ActiveAndConfigured.
-// ─────────────────────────────────────────────────────────────────────────────
 VOID
-AmtPtpSpiInputIssueRequest(
-    WDFDEVICE Device
-)
+AmtPtpSpiInputIssueRequest(WDFDEVICE Device)
 {
     NTSTATUS             Status;
-    PDEVICE_CONTEXT      pDeviceContext = DeviceGetContext(Device);
+    PDEVICE_CONTEXT      pCtx = DeviceGetContext(Device);
     WDF_REQUEST_REUSE_PARAMS ReuseParams;
-    BOOLEAN              Sent;
 
     WDF_REQUEST_REUSE_PARAMS_INIT(&ReuseParams, WDF_REQUEST_REUSE_NO_FLAGS,
                                   STATUS_SUCCESS);
-    Status = WdfRequestReuse(pDeviceContext->SpiHidReadRequest, &ReuseParams);
+    Status = WdfRequestReuse(pCtx->SpiHidReadRequest, &ReuseParams);
     if (!NT_SUCCESS(Status)) {
         TraceEvents(TRACE_LEVEL_ERROR, TRACE_DEVICE,
-            "%!FUNC! WdfRequestReuse failed %!STATUS!", Status);
+            "%!FUNC! WdfRequestReuse %!STATUS!", Status);
         return;
     }
-
-    Sent = WdfRequestSend(pDeviceContext->SpiHidReadRequest,
-                          pDeviceContext->SpiTrackpadIoTarget,
-                          NULL);
-    if (!Sent) {
-        Status = WdfRequestGetStatus(pDeviceContext->SpiHidReadRequest);
+    if (!WdfRequestSend(pCtx->SpiHidReadRequest,
+                        pCtx->SpiTrackpadIoTarget, NULL)) {
         TraceEvents(TRACE_LEVEL_ERROR, TRACE_DEVICE,
-            "%!FUNC! WdfRequestSend failed %!STATUS!", Status);
+            "%!FUNC! WdfRequestSend %!STATUS!",
+            WdfRequestGetStatus(pCtx->SpiHidReadRequest));
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// NormalizeX / NormalizeY
-//
-// Map a raw SPI coordinate to a PTP logical coordinate with saturating clamp.
-// Uses LONG arithmetic to avoid signed SHORT overflow before comparison.
-// ─────────────────────────────────────────────────────────────────────────────
-
-FORCEINLINE USHORT
-NormalizeX(
-    _In_ const DEVICE_CONTEXT* pCtx,
-    _In_ SHORT                 RawX
-)
+// Saturating normalize: [XMin..XMax] → [0..XRange], clamped.
+FORCEINLINE USHORT NormalizeX(_In_ const DEVICE_CONTEXT* c, _In_ SHORT x)
 {
-    LONG N = (LONG)RawX - (LONG)pCtx->TrackpadInfo.XMin;
-    if (N <= 0)                         return 0;
-    if (N >= (LONG)pCtx->XRange)        return pCtx->XRange;
-    return (USHORT)N;
+    LONG n = (LONG)x - (LONG)c->TrackpadInfo.XMin;
+    if (n <= 0)                  return 0;
+    if (n >= (LONG)c->XRange)    return c->XRange;
+    return (USHORT)n;
 }
 
-FORCEINLINE USHORT
-NormalizeY(
-    _In_ const DEVICE_CONTEXT* pCtx,
-    _In_ SHORT                 RawY
-)
+// Apple Y grows downward; PTP Y grows upward → invert.
+FORCEINLINE USHORT NormalizeY(_In_ const DEVICE_CONTEXT* c, _In_ SHORT y)
 {
-    // Apple Y increases downward; PTP Y increases upward.
-    LONG N = (LONG)pCtx->TrackpadInfo.YMax - (LONG)RawY;
-    if (N <= 0)                         return 0;
-    if (N >= (LONG)pCtx->YRange)        return pCtx->YRange;
-    return (USHORT)N;
+    LONG n = (LONG)c->TrackpadInfo.YMax - (LONG)y;
+    if (n <= 0)                  return 0;
+    if (n >= (LONG)c->YRange)    return c->YRange;
+    return (USHORT)n;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// AmtPtpRequestCompletionRoutine
+// AmtPtpRequestCompletionRoutine — DISPATCH_LEVEL, serialised by single-request
+// invariant (only one SPI read outstanding at a time).
 //
-// Runs at DISPATCH_LEVEL when the lower SPI driver completes a read.
-// Serialised by the single-pre-allocated-request invariant:
-//   only one invocation is outstanding at any time.
-//
-// Algorithm
-// ─────────
-//  1. Retrieve pending PTP request from HidQueue.
-//  2. Validate SPI packet.
-//  3. Compute ScanTime.
-//  4. Match hardware fingers to contact slots (proximity algorithm).
-//  5. Transition slot states (Empty→Live, Live→Lifting, Lifting→Empty).
-//  6. Build PTP_REPORT:
-//     a. For each Live slot: TipSwitch=1, X/Y from current frame.
-//     b. For each Lifting slot: TipSwitch=0, X/Y from LAST LIVE position.
-//     c. Palm slots: suppressed (no HID entry while palm, silent lift on drop).
-//  7. Complete PTP request.
-//  8. Re-issue SPI read.
+// Two-pass design:
+//   Pass A (match + transition):  O(H²·S) matching, O(S) state updates.
+//   Pass B (report build):        O(S) single scan, fills PTP_REPORT.
 // ─────────────────────────────────────────────────────────────────────────────
 VOID
 AmtPtpRequestCompletionRoutine(
-    WDFREQUEST                  SpiRequest,
-    WDFIOTARGET                 Target,
+    WDFREQUEST                     SpiRequest,
+    WDFIOTARGET                    Target,
     PWDF_REQUEST_COMPLETION_PARAMS Params,
-    WDFCONTEXT                  Context
-)
+    WDFCONTEXT                     Context)
 {
-    NTSTATUS                 Status;
-    PWORKER_REQUEST_CONTEXT  pReqCtx;
-    PDEVICE_CONTEXT          pCtx;
+    NTSTATUS                Status;
+    PDEVICE_CONTEXT         pCtx;
+    PSPI_TRACKPAD_PACKET    pPkt;
+    SIZE_T                  BufLen;
+    LONG                    SpiLen;
+    UINT8                   HwCount;
 
-    // ── SPI packet ────────────────────────────────────────────────────────
-    LONG                     SpiLen;
-    SIZE_T                   BufLen;
-    PSPI_TRACKPAD_PACKET     pPkt;
-    UINT8                    HwCount;    // hardware finger count (clamped)
+    WDFREQUEST              PtpRequest;
+    PTP_REPORT*             pReport;   // direct pointer — avoids extra WDF copy
+    SIZE_T                  OutLen;
+    UINT8                   ReportSlots;
 
-    // ── PTP report ────────────────────────────────────────────────────────
-    WDFREQUEST               PtpRequest;
-    WDFMEMORY                PtpMemory;
-    PTP_REPORT               Report;
-    UINT8                    ReportSlots; // total slots written (live + lifting)
+    ULONGLONG               Now;
+    ULONGLONG               Delta100us;
+    UINT8                   i, s;
 
-    // ── Timing ───────────────────────────────────────────────────────────
-    ULONGLONG                Now;
-    ULONGLONG                Delta100us;
-
-    // ── Matching temporaries ──────────────────────────────────────────────
-    UINT8                    i, j;
-    // matched[i] = slot index that hardware finger i was matched/allocated to,
-    // or PTP_MAX_CONTACT_POINTS if the finger was dropped (table full, palm).
-    UINT8                    matched[SPI_TRACKPAD_MAX_FINGERS];
-    // touched[s] = TRUE if slot s was matched to a hardware finger this frame.
-    BOOLEAN                  touched[PTP_MAX_CONTACT_POINTS];
+    // Pass-A temporaries:
+    //   hw_to_slot[i] = slot assigned to HW finger i (SLOT_NONE if unmatched).
+    //   slot_to_hw[s] = HW finger index matched to slot s (SLOT_NONE if none).
+    UINT8  hw_to_slot[SPI_TRACKPAD_MAX_FINGERS];
+    UINT8  slot_to_hw[PTP_MAX_CONTACT_POINTS];
+    SHORT  HwRawX[SPI_TRACKPAD_MAX_FINGERS];
+    SHORT  HwRawY[SPI_TRACKPAD_MAX_FINGERS];
 
     UNREFERENCED_PARAMETER(Target);
 
-    pReqCtx = (PWORKER_REQUEST_CONTEXT)Context;
-    pCtx    = pReqCtx->DeviceContext;
+    pCtx = ((PWORKER_REQUEST_CONTEXT)Context)->DeviceContext;
 
-    // ── Step 1: retrieve pending PTP request ─────────────────────────────
+    // ── Step 1: dequeue PTP request ───────────────────────────────────────
     Status = WdfIoQueueRetrieveNextRequest(pCtx->HidQueue, &PtpRequest);
     if (!NT_SUCCESS(Status)) {
         TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DRIVER,
-            "%!FUNC! No pending PTP request (%!STATUS!), skipping", Status);
+            "%!FUNC! No pending PTP request (%!STATUS!)", Status);
         goto cleanup;
     }
 
-    // ── Mode check: if PTP input is disabled, send empty report ──────────
+    // ── Mode check ────────────────────────────────────────────────────────
     if (!pCtx->PtpInputOn || !pCtx->PtpReportTouch) {
-        RtlZeroMemory(&Report, sizeof(Report));
-        Report.ReportID = REPORTID_MULTITOUCH;
-        Status = WdfRequestRetrieveOutputMemory(PtpRequest, &PtpMemory);
+        // Retrieve output buffer directly — avoids WdfMemoryCopyFromBuffer DDI
+        // overhead for this trivial zero-report path.
+        Status = WdfRequestRetrieveOutputBuffer(
+                     PtpRequest, sizeof(PTP_REPORT), (PVOID*)&pReport, &OutLen);
         if (NT_SUCCESS(Status)) {
-            WdfMemoryCopyFromBuffer(PtpMemory, 0, &Report, sizeof(Report));
-            WdfRequestSetInformation(PtpRequest, sizeof(Report));
+            RtlZeroMemory(pReport, sizeof(PTP_REPORT));
+            pReport->ReportID = REPORTID_MULTITOUCH;
+            WdfRequestSetInformation(PtpRequest, sizeof(PTP_REPORT));
         }
         goto exit;
     }
 
-    // ── Step 2: validate SPI packet ──────────────────────────────────────
+    // ── Step 2: validate SPI packet ───────────────────────────────────────
     SpiLen = (LONG)WdfRequestGetInformation(SpiRequest);
     BufLen = 0;
     pPkt   = (PSPI_TRACKPAD_PACKET)WdfMemoryGetBuffer(
@@ -195,246 +129,187 @@ AmtPtpRequestCompletionRoutine(
     if (SpiLen > (LONG)BufLen) {
         TraceEvents(TRACE_LEVEL_ERROR, TRACE_DRIVER,
             "%!FUNC! SpiLen %d > BufLen %Iu", SpiLen, BufLen);
-        Status = STATUS_BUFFER_OVERFLOW;
-        goto exit;
+        Status = STATUS_BUFFER_OVERFLOW; goto exit;
     }
     if (SpiLen < 46) {
         TraceEvents(TRACE_LEVEL_ERROR, TRACE_DRIVER,
-            "%!FUNC! Header truncated: %d < 46", SpiLen);
-        Status = STATUS_DEVICE_DATA_ERROR;
-        goto exit;
+            "%!FUNC! Header truncated %d < 46", SpiLen);
+        Status = STATUS_DEVICE_DATA_ERROR; goto exit;
     }
     if (pPkt->NumOfFingers > SPI_TRACKPAD_MAX_FINGERS) {
         TraceEvents(TRACE_LEVEL_ERROR, TRACE_DRIVER,
-            "%!FUNC! NumOfFingers %d > max %d",
+            "%!FUNC! NumOfFingers %d > %d",
             pPkt->NumOfFingers, SPI_TRACKPAD_MAX_FINGERS);
-        Status = STATUS_DEVICE_DATA_ERROR;
-        goto exit;
+        Status = STATUS_DEVICE_DATA_ERROR; goto exit;
     }
     {
-        LONG MinLen = 46 + (LONG)pPkt->NumOfFingers * (LONG)sizeof(SPI_TRACKPAD_FINGER);
+        LONG MinLen = 46L + (LONG)pPkt->NumOfFingers
+                          * (LONG)sizeof(SPI_TRACKPAD_FINGER);
         if (SpiLen < MinLen) {
             TraceEvents(TRACE_LEVEL_ERROR, TRACE_DRIVER,
-                "%!FUNC! Packet truncated: %d < %d (%d fingers)",
+                "%!FUNC! Packet truncated %d < %d (%d fingers)",
                 SpiLen, MinLen, pPkt->NumOfFingers);
-            Status = STATUS_DEVICE_DATA_ERROR;
-            goto exit;
+            Status = STATUS_DEVICE_DATA_ERROR; goto exit;
         }
     }
 
     HwCount = (pPkt->NumOfFingers > PTP_MAX_CONTACT_POINTS)
-              ? PTP_MAX_CONTACT_POINTS : pPkt->NumOfFingers;
+              ? PTP_MAX_CONTACT_POINTS : (UINT8)pPkt->NumOfFingers;
 
     // ── Step 3: ScanTime ─────────────────────────────────────────────────
-    Now         = KeQueryInterruptTime();
-    Delta100us  = (Now - pCtx->LastReportTime) / 1000ULL;
+    Now        = KeQueryInterruptTime();
+    Delta100us = (Now - pCtx->LastReportTime) / 1000ULL;
     if (Delta100us > 0xFFFFULL) Delta100us = 0xFFFF;
-
-    // First-frame cap: if nothing was live before and fingers appear now,
-    // the delta since last report reflects idle time (possibly seconds).
-    // Cap to one 125 Hz period to give the gesture engine a sane start.
-    if (pCtx->Contacts.LiveCount == 0 && HwCount > 0) {
-        if (Delta100us > IDLE_SCANTIME_THRESHOLD) {
-            Delta100us = FIRST_FRAME_SCANTIME_CAP;
-        }
+    if (pCtx->Contacts.LiveCount == 0 && HwCount > 0 &&
+        Delta100us > IDLE_SCANTIME_THRESHOLD) {
+        Delta100us = FIRST_FRAME_SCANTIME_CAP;
     }
     pCtx->LastReportTime = Now;
 
-    // ── Step 4: proximity matching ────────────────────────────────────────
+    // ── PASS A: match + state transitions ────────────────────────────────
     //
-    // For each hardware finger, find the closest Live slot within
-    // CONTACT_MATCH_THRESHOLD_SQ.  Use a greedy O(H×S) algorithm:
-    // with max 5 slots and max 5 hardware fingers this is at most 25
-    // comparisons per frame — negligible at DISPATCH_LEVEL.
-    //
-    // matched[i] = slot assigned to hardware finger i.
-    // touched[s] = slot s has been claimed by a hardware finger.
-    RtlFillMemory(matched, sizeof(matched), PTP_MAX_CONTACT_POINTS);
-    RtlZeroMemory(touched, sizeof(touched));
-
+    // A1. Collect raw HW coordinates (avoid repeated field access).
     for (i = 0; i < HwCount; i++) {
-        SHORT HwX = pPkt->Fingers[i].X;
-        SHORT HwY = pPkt->Fingers[i].Y;
-        UINT8 slot;
-
-        // Try to match to an existing Live slot.
-        slot = AmtPtpFindMatchingSlot(&pCtx->Contacts, HwX, HwY);
-
-        if (slot == PTP_MAX_CONTACT_POINTS) {
-            // No Live slot close enough → new contact, allocate a slot.
-            slot = AmtPtpAllocateSlot(&pCtx->Contacts);
-            if (slot == PTP_MAX_CONTACT_POINTS) {
-                // Table full.  Drop this finger (no ID available).
-                TraceEvents(TRACE_LEVEL_WARNING, TRACE_HID_INPUT,
-                    "%!FUNC! Contact table full, dropping finger %d", i);
-                continue;
-            }
-            // Initialise the new slot.
-            pCtx->Contacts.Slots[slot].State  = SlotLive;
-            pCtx->Contacts.Slots[slot].IsPalm = FALSE;
-            pCtx->Contacts.Slots[slot].LastX  = NormalizeX(pCtx, HwX);
-            pCtx->Contacts.Slots[slot].LastY  = NormalizeY(pCtx, HwY);
-
-            // ── Palm classification (sticky, evaluated once at touchdown) ─
-            //
-            // Evaluated ONLY when the slot transitions Empty→Live.
-            // Once classified as palm, IsPalm stays TRUE until SlotEmpty.
-            // This prevents a mid-gesture reclassification from emitting a
-            // TipSwitch=1 report for a contact that had no prior touchdown.
-            if (pPkt->Fingers[i].TouchMajor >= PALM_MAJOR_THRESHOLD &&
-                pPkt->Fingers[i].TouchMinor >= PALM_MINOR_THRESHOLD)
-            {
-                pCtx->Contacts.Slots[slot].IsPalm = TRUE;
-                TraceEvents(TRACE_LEVEL_VERBOSE, TRACE_HID_INPUT,
-                    "%!FUNC! Slot %d: new contact classified as palm "
-                    "(Maj=%d Min=%d)", slot,
-                    pPkt->Fingers[i].TouchMajor,
-                    pPkt->Fingers[i].TouchMinor);
-            }
-        }
-
-        matched[i] = slot;
-        touched[slot] = TRUE;
+        HwRawX[i] = pPkt->Fingers[i].X;
+        HwRawY[i] = pPkt->Fingers[i].Y;
     }
 
-    // ── Step 5: state transitions ─────────────────────────────────────────
-    //
-    // Slots not touched this frame transition Live→Lifting.
-    // Lifting slots from the previous frame transition Lifting→Empty.
-    //
-    // We also handle the case where the hardware delivers a Pressure=0 frame
-    // while the finger is still reported (NumOfFingers > 0):
-    //   Pressure=0 → TipSwitch=0 → treat as Lifting immediately.
-    //
-    // First: advance existing Lifting slots to Empty.
-    for (i = 0; i < PTP_MAX_CONTACT_POINTS; i++) {
-        if (pCtx->Contacts.Slots[i].State == SlotLifting) {
-            pCtx->Contacts.Slots[i].State  = SlotEmpty;
-            pCtx->Contacts.Slots[i].IsPalm = FALSE;
-            // LastX/Y can be left stale — slot is Empty, nothing reads them.
+    // A2. Pre-fill slot_to_hw with SLOT_NONE.
+    RtlFillMemory(slot_to_hw, sizeof(slot_to_hw), SLOT_NONE);
+
+    // A3. Optimal bipartite matching: HW fingers ↔ Live slots.
+    //     Uses raw SPI coordinates on both sides — no DC bias.
+    AmtPtpMatchFingers(&pCtx->Contacts, HwCount,
+                       HwRawX, HwRawY, hw_to_slot, slot_to_hw);
+
+    // A4. Allocate new slots for unmatched HW fingers.
+    for (i = 0; i < HwCount; i++) {
+        if (hw_to_slot[i] != SLOT_NONE) continue; // already matched
+
+        s = AmtPtpAllocateSlot(&pCtx->Contacts);
+        if (s == SLOT_NONE) {
+            TraceEvents(TRACE_LEVEL_WARNING, TRACE_HID_INPUT,
+                "%!FUNC! Table full, dropping finger %d", i);
+            continue;
         }
-    }
+        pCtx->Contacts.Slots[s].State   = SlotLive;
+        pCtx->Contacts.Slots[s].IsPalm  =
+            (pPkt->Fingers[i].TouchMajor >= PALM_MAJOR_THRESHOLD &&
+             pPkt->Fingers[i].TouchMinor >= PALM_MINOR_THRESHOLD);
+        pCtx->Contacts.Slots[s].LastRawX  = HwRawX[i];
+        pCtx->Contacts.Slots[s].LastRawY  = HwRawY[i];
+        pCtx->Contacts.Slots[s].LastNormX = NormalizeX(pCtx, HwRawX[i]);
+        pCtx->Contacts.Slots[s].LastNormY = NormalizeY(pCtx, HwRawY[i]);
 
-    // Update LiveCount: count how many live slots were matched this frame
-    // AND whose hardware finger has Pressure>=1.
-    // Also transition unmatched Live slots to Lifting.
-    pCtx->Contacts.LiveCount = 0;
-    for (i = 0; i < PTP_MAX_CONTACT_POINTS; i++) {
-        if (pCtx->Contacts.Slots[i].State != SlotLive) continue;
-
-        if (touched[i]) {
-            // Find the hardware finger that was matched to this slot.
-            BOOLEAN HasPressure = FALSE;
-            for (j = 0; j < HwCount; j++) {
-                if (matched[j] == i) {
-                    HasPressure = (pPkt->Fingers[j].Pressure >= 1);
-                    // Update last known position while finger is still live.
-                    if (HasPressure && !pCtx->Contacts.Slots[i].IsPalm) {
-                        pCtx->Contacts.Slots[i].LastX =
-                            NormalizeX(pCtx, pPkt->Fingers[j].X);
-                        pCtx->Contacts.Slots[i].LastY =
-                            NormalizeY(pCtx, pPkt->Fingers[j].Y);
-                    }
-                    break;
-                }
-            }
-            if (!HasPressure) {
-                // Hardware says Pressure=0: finger lifting, transition now.
-                pCtx->Contacts.Slots[i].State = SlotLifting;
-            } else {
-                pCtx->Contacts.LiveCount++;
-            }
-        } else {
-            // Slot was live but has no matching hardware finger: finger gone.
-            pCtx->Contacts.Slots[i].State = SlotLifting;
-        }
-    }
-
-    // ── Step 6: build PTP_REPORT ──────────────────────────────────────────
-    RtlZeroMemory(&Report, sizeof(Report));
-    ReportSlots = 0;
-
-    // 6a. Live non-palm slots → TipSwitch=1, Confidence=1.
-    for (i = 0; i < PTP_MAX_CONTACT_POINTS && ReportSlots < PTP_MAX_CONTACT_POINTS; i++) {
-        if (pCtx->Contacts.Slots[i].State != SlotLive)  continue;
-        if (pCtx->Contacts.Slots[i].IsPalm)             continue;
-
-        Report.Contacts[ReportSlots].ContactID  = i;
-        Report.Contacts[ReportSlots].TipSwitch  = 1;
-        Report.Contacts[ReportSlots].Confidence = 1;
-        Report.Contacts[ReportSlots].X          = pCtx->Contacts.Slots[i].LastX;
-        Report.Contacts[ReportSlots].Y          = pCtx->Contacts.Slots[i].LastY;
+        hw_to_slot[i]  = s;
+        slot_to_hw[s]  = i;
 
         TraceEvents(TRACE_LEVEL_VERBOSE, TRACE_HID_INPUT,
-            "%!FUNC! ID=%d LIVE X=%d Y=%d",
-            i, pCtx->Contacts.Slots[i].LastX, pCtx->Contacts.Slots[i].LastY);
-
-        ReportSlots++;
+            "%!FUNC! New slot %d %s", s,
+            pCtx->Contacts.Slots[s].IsPalm ? "(palm)" : "");
     }
 
-    // 6b. Lifting non-palm slots → TipSwitch=0 at LAST LIVE X/Y.
-    //
-    // *** CRITICAL: use LastX/LastY, NOT (0,0). ***
-    //
-    // Windows PTP updates its internal "last position" for a ContactID from
-    // every report it receives, including TipSwitch=0 frames.  Sending (0,0)
-    // moves the contact's termination point to the trackpad origin.  On the
-    // next gesture start the gesture engine interpolates from (0,0), causing
-    // the cursor to snap toward the top-left corner.  This was the primary
-    // cause of the cursor jump observed after repeated tap sequences.
-    for (i = 0; i < PTP_MAX_CONTACT_POINTS && ReportSlots < PTP_MAX_CONTACT_POINTS; i++) {
-        if (pCtx->Contacts.Slots[i].State != SlotLifting) continue;
-        if (pCtx->Contacts.Slots[i].IsPalm) {
-            // Palm never sent a TipSwitch=1 → no lift needed.
-            // Transition directly to Empty (done next frame in step 5 above,
-            // but accelerate it here to free the slot sooner).
-            pCtx->Contacts.Slots[i].State  = SlotEmpty;
-            pCtx->Contacts.Slots[i].IsPalm = FALSE;
+    // A5. Single pass over all slots: update Live, transition to Lifting/Empty.
+    pCtx->Contacts.LiveCount = 0;
+    for (s = 0; s < PTP_MAX_CONTACT_POINTS; s++) {
+        CONTACT_SLOT* sl = &pCtx->Contacts.Slots[s];
+
+        if (sl->State == SlotLifting) {
+            // Already emitted TipSwitch=0 last frame — free the slot.
+            sl->State  = SlotEmpty;
+            sl->IsPalm = FALSE;
             continue;
         }
 
-        Report.Contacts[ReportSlots].ContactID  = i;
-        Report.Contacts[ReportSlots].TipSwitch  = 0;
-        Report.Contacts[ReportSlots].Confidence = 0;
-        Report.Contacts[ReportSlots].X          = pCtx->Contacts.Slots[i].LastX;
-        Report.Contacts[ReportSlots].Y          = pCtx->Contacts.Slots[i].LastY;
+        if (sl->State != SlotLive) continue; // SlotEmpty: nothing to do
 
-        TraceEvents(TRACE_LEVEL_VERBOSE, TRACE_HID_INPUT,
-            "%!FUNC! ID=%d LIFT at X=%d Y=%d",
-            i, pCtx->Contacts.Slots[i].LastX, pCtx->Contacts.Slots[i].LastY);
-
-        ReportSlots++;
+        if (slot_to_hw[s] == SLOT_NONE) {
+            // No HW finger matched this slot → finger disappeared.
+            sl->State = SlotLifting;
+        } else {
+            // Matched. Check pressure.
+            UINT8 hw = slot_to_hw[s];
+            if (pPkt->Fingers[hw].Pressure < 1) {
+                // Pressure=0 transitional frame (finger releasing).
+                sl->State = SlotLifting;
+            } else {
+                // Still live: update position.
+                sl->LastRawX  = HwRawX[hw];
+                sl->LastRawY  = HwRawY[hw];
+                if (!sl->IsPalm) {
+                    sl->LastNormX = NormalizeX(pCtx, HwRawX[hw]);
+                    sl->LastNormY = NormalizeY(pCtx, HwRawY[hw]);
+                }
+                pCtx->Contacts.LiveCount++;
+            }
+        }
     }
 
-    Report.ReportID        = REPORTID_MULTITOUCH;
-    Report.ContactCount    = ReportSlots;
-    Report.IsButtonClicked = pPkt->ClickOccurred;
-    Report.ScanTime        = (USHORT)Delta100us;
-
-    // ── Step 7: send PTP report ───────────────────────────────────────────
-    Status = WdfRequestRetrieveOutputMemory(PtpRequest, &PtpMemory);
+    // ── PASS B: build PTP_REPORT ──────────────────────────────────────────
+    //
+    // Single pass. Live non-palm → TipSwitch=1. Lifting non-palm → TipSwitch=0
+    // at LastNormX/Y. Palm lifting → silent Empty (no HID entry).
+    //
+    // Direct output-buffer pointer avoids WdfMemoryCopyFromBuffer DDI overhead
+    // (~100 cycles) for this 30-byte copy.
+    Status = WdfRequestRetrieveOutputBuffer(
+                 PtpRequest, sizeof(PTP_REPORT), (PVOID*)&pReport, &OutLen);
     if (!NT_SUCCESS(Status)) {
         TraceEvents(TRACE_LEVEL_ERROR, TRACE_DRIVER,
-            "%!FUNC! WdfRequestRetrieveOutputMemory %!STATUS!", Status);
+            "%!FUNC! WdfRequestRetrieveOutputBuffer %!STATUS!", Status);
         goto exit;
     }
 
-    Status = WdfMemoryCopyFromBuffer(PtpMemory, 0, &Report, sizeof(Report));
-    if (!NT_SUCCESS(Status)) {
-        TraceEvents(TRACE_LEVEL_ERROR, TRACE_DRIVER,
-            "%!FUNC! WdfMemoryCopyFromBuffer %!STATUS!", Status);
-        goto exit;
+    RtlZeroMemory(pReport, sizeof(PTP_REPORT));
+    ReportSlots = 0;
+
+    for (s = 0; s < PTP_MAX_CONTACT_POINTS && ReportSlots < PTP_MAX_CONTACT_POINTS; s++) {
+        CONTACT_SLOT* sl = &pCtx->Contacts.Slots[s];
+
+        if (sl->State == SlotLive && !sl->IsPalm) {
+            pReport->Contacts[ReportSlots].ContactID  = s;
+            pReport->Contacts[ReportSlots].TipSwitch  = 1;
+            pReport->Contacts[ReportSlots].Confidence = 1;
+            pReport->Contacts[ReportSlots].X          = sl->LastNormX;
+            pReport->Contacts[ReportSlots].Y          = sl->LastNormY;
+            TraceEvents(TRACE_LEVEL_VERBOSE, TRACE_HID_INPUT,
+                "%!FUNC! ID=%d LIVE X=%u Y=%u", s, sl->LastNormX, sl->LastNormY);
+            ReportSlots++;
+
+        } else if (sl->State == SlotLifting) {
+            if (sl->IsPalm) {
+                // Palm: no TipSwitch=1 was ever sent, no lift needed.
+                sl->State  = SlotEmpty;
+                sl->IsPalm = FALSE;
+            } else {
+                // CRITICAL: use LastNormX/Y — NOT (0,0).
+                // Windows updates its internal "last position" for this
+                // ContactID even from TipSwitch=0 frames.  Sending (0,0)
+                // anchors gesture termination at trackpad origin, causing
+                // cursor snap-back on the next touch sequence.
+                pReport->Contacts[ReportSlots].ContactID  = s;
+                pReport->Contacts[ReportSlots].TipSwitch  = 0;
+                pReport->Contacts[ReportSlots].Confidence = 0;
+                pReport->Contacts[ReportSlots].X          = sl->LastNormX;
+                pReport->Contacts[ReportSlots].Y          = sl->LastNormY;
+                TraceEvents(TRACE_LEVEL_VERBOSE, TRACE_HID_INPUT,
+                    "%!FUNC! ID=%d LIFT X=%u Y=%u", s, sl->LastNormX, sl->LastNormY);
+                ReportSlots++;
+            }
+        }
     }
 
-    WdfRequestSetInformation(PtpRequest, sizeof(Report));
+    pReport->ReportID        = REPORTID_MULTITOUCH;
+    pReport->ContactCount    = ReportSlots;
+    pReport->IsButtonClicked = pPkt->ClickOccurred;
+    pReport->ScanTime        = (USHORT)Delta100us;
+
+    WdfRequestSetInformation(PtpRequest, sizeof(PTP_REPORT));
 
 exit:
     WdfRequestComplete(PtpRequest, Status);
 
 cleanup:
-    // ── Step 8: re-issue SPI read ─────────────────────────────────────────
-    // InterlockedCompareExchange gives acquire semantics; guaranteed to see
-    // the D3 write from D0Exit if it has happened.
     if (DEVICE_STATUS_READ(pCtx) == D0ActiveAndConfigured) {
         AmtPtpSpiInputIssueRequest(pCtx->SpiDevice);
     }
