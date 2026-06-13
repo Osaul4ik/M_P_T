@@ -61,19 +61,9 @@ AmtPtpGetHidDescriptor(
 		case USB_DEVICE_ID_APPLE_T2_7D:
 		{
 			szCopy = AmtPtpT2DefaultHidDescriptor.bLength;
-			// Validate output buffer size
-			size_t outputBufferSize = 0;
-			WdfMemoryGetLength(requestMemory, &outputBufferSize);
-			if (outputBufferSize < szCopy) {
-				TraceEvents(
-					TRACE_LEVEL_ERROR, TRACE_DRIVER,
-					"%!FUNC! Output buffer too small. Required: %zu, Available: %zu",
-					szCopy,
-					outputBufferSize
-				);
-				status = STATUS_BUFFER_TOO_SMALL;
-				goto exit;
-			}
+			// WdfMemoryGetLength not available in KMDF 1.15.
+			// WdfMemoryCopyFromBuffer validates the size internally and returns
+			// STATUS_BUFFER_TOO_SMALL if the output buffer is insufficient.
 			status = WdfMemoryCopyFromBuffer(
 				requestMemory,
 				0,
@@ -101,19 +91,6 @@ AmtPtpGetHidDescriptor(
 			);
 
 			szCopy = AmtPtpT2DefaultHidDescriptor.bLength;
-			// Validate output buffer size
-			size_t outputBufferSize = 0;
-			WdfMemoryGetLength(requestMemory, &outputBufferSize);
-			if (outputBufferSize < szCopy) {
-				TraceEvents(
-					TRACE_LEVEL_ERROR, TRACE_DRIVER,
-					"%!FUNC! Output buffer too small. Required: %zu, Available: %zu",
-					szCopy,
-					outputBufferSize
-				);
-				status = STATUS_BUFFER_TOO_SMALL;
-				goto exit;
-			}
 			status = WdfMemoryCopyFromBuffer(
 				requestMemory,
 				0,
@@ -230,9 +207,8 @@ AmtPtpGetReportDescriptor(
 		case USB_DEVICE_ID_APPLE_T2_7D:
 		{
 
-			szCopy = AmtPtpT2DefaultHidDescriptor.DescriptorList[0].wReportLength;
+				szCopy = AmtPtpT2DefaultHidDescriptor.DescriptorList[0].wReportLength;
 			if (szCopy == 0) {
-
 				status = STATUS_INVALID_DEVICE_STATE;
 				TraceEvents(
 					TRACE_LEVEL_ERROR, TRACE_DRIVER,
@@ -241,20 +217,16 @@ AmtPtpGetReportDescriptor(
 				goto exit;
 			}
 
-		// Validate output buffer size before copying
-		size_t outputBufferSize = 0;
-		WdfMemoryGetLength(requestMemory, &outputBufferSize);
-		if (outputBufferSize < szCopy) {
-			TraceEvents(
-				TRACE_LEVEL_ERROR, TRACE_DRIVER,
-				"%!FUNC! Output buffer too small for report descriptor. Required: %zu, Available: %zu",
-				szCopy,
-				outputBufferSize
+			status = WdfMemoryCopyFromBuffer(
+				requestMemory,
+				0,
+				(PVOID)&AmtPtpT2ReportDescriptor,
+				szCopy
 			);
-			status = STATUS_BUFFER_TOO_SMALL;
-			goto exit;
-		}
 
+			if (!NT_SUCCESS(status)) {
+				TraceEvents(
+					TRACE_LEVEL_ERROR, TRACE_DRIVER,
 					"%!FUNC! WdfMemoryCopyFromBuffer failed with %!STATUS!",
 					status
 				);
