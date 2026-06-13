@@ -24,7 +24,12 @@ typedef struct _DEVICE_CONTEXT
 	BOOL                        IsSurfaceReportOn;
 	BOOL                        IsButtonReportOn;
 
-	LARGE_INTEGER				PerfCounter;
+	LARGE_INTEGER			PerfCounter;
+
+	// Per-contact last known normalized coordinates and reported flags
+	USHORT			LastNormX[PTP_MAX_CONTACT_POINTS];
+	USHORT			LastNormY[PTP_MAX_CONTACT_POINTS];
+	BOOLEAN			WasReported[PTP_MAX_CONTACT_POINTS];
 
 } DEVICE_CONTEXT, *PDEVICE_CONTEXT;
 
@@ -120,12 +125,7 @@ AmtPtpServiceTouchInputInterruptType5(
 	_In_ PDEVICE_CONTEXT DeviceContext,
 	_In_ UCHAR* Buffer,
 	_In_ size_t NumBytesTransferred
-
-	// Per-contact last known normalized coordinates and reported flags
-	USHORT			LastNormX[PTP_MAX_CONTACT_POINTS];
-	USHORT			LastNormY[PTP_MAX_CONTACT_POINTS];
-	BOOLEAN			WasReported[PTP_MAX_CONTACT_POINTS];
-
+	);
 
 _IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS

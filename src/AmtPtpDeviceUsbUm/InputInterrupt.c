@@ -291,7 +291,6 @@ AmtPtpServiceTouchInputInterrupt(
 		Request,
 		&RequestMemory
 	);
-
 	if (!NT_SUCCESS(Status)) {
 		TraceEvents(
 			TRACE_LEVEL_ERROR,
@@ -304,19 +303,9 @@ AmtPtpServiceTouchInputInterrupt(
 
 	// Type 2 touchpad surface report
 	if (DeviceContext->IsSurfaceReportOn) {
-		// Handles trackpad surface report here.
 		raw_n = (NumBytesTransferred - headerSize) / fingerprintSize;
 		if (raw_n >= PTP_MAX_CONTACT_POINTS) raw_n = PTP_MAX_CONTACT_POINTS;
 		PtpReport.ContactCount = (UCHAR) raw_n;
-
-#ifdef INPUT_CONTENT_TRACE
-		TraceEvents(
-			TRACE_LEVEL_INFORMATION,
-			TRACE_DRIVER,
-			"%!FUNC! with %llu points.",
-			raw_n
-		);
-#endif
 
 		// Fingers
 		{
@@ -333,6 +322,49 @@ AmtPtpServiceTouchInputInterrupt(
 					((USHORT)(DeviceContext->DeviceInfo->y.max - AmtRawToInteger(f->abs_y))) : 0;
 
 				UCHAR cid = (UCHAR)i;
+				BOOLEAN tip = (AmtRawToInteger(f->touch_major) << 1) >= 200;
+
+				if (tip) {
+					PtpReport.Contacts[reportSlots].ContactID = cid;
+					PtpReport.Contacts[reportSlots].X = (USHORT)x;
+					PtpReport.Contacts[reportSlots].Y = (USHORT)y;
+					PtpReport.Contacts[reportSlots].TipSwitch = 1;
+					PtpReport.Contacts[reportSlots].Confidence = (AmtRawToInteger(f->touch_minor) << 1) > 0;
+					DeviceContext->LastNormX[cid] = (USHORT)x;
+					DeviceContext->LastNormY[cid] = (USHORT)y;
+					DeviceContext->WasReported[cid] = TRUE;
+					reportSlots++;
+				} else {
+					if (cid < PTP_MAX_CONTACT_POINTS && DeviceContext->WasReported[cid]) {
+						PtpReport.Contacts[reportSlots].ContactID = cid;
+						PtpReport.Contacts[reportSlots].X = DeviceContext->LastNormX[cid];
+						PtpReport.Contacts[reportSlots].Y = DeviceContext->LastNormY[cid];
+						PtpReport.Contacts[reportSlots].TipSwitch = 0;
+						PtpReport.Contacts[reportSlots].Confidence = 1;
+						DeviceContext->WasReported[cid] = FALSE;
+						reportSlots++;
+					}
+				}
+
+		#ifdef INPUT_CONTENT_TRACE
+			TraceEvents(
+				TRACE_LEVEL_INFORMATION,
+				TRACE_INPUT,
+				"%!FUNC!: Point %llu, X = %d, Y = %d, TipSwitch = %d, Confidence = %d, tMajor = %d, tMinor = %d, origin = %d",
+				i,
+				(int) (tip ? x : DeviceContext->LastNormX[cid]),
+				(int) (tip ? y : DeviceContext->LastNormY[cid]),
+				tip ? 1 : 0,
+				(AmtRawToInteger(f->touch_minor) << 1) > 0,
+				AmtRawToInteger(f->touch_major) << 1,
+				AmtRawToInteger(f->touch_minor) << 1,
+				(UCHAR) i
+			);
+		#endif
+			}
+			PtpReport.ContactCount = reportSlots;
+		}
+	}
 				BOOLEAN tip = (AmtRawToInteger(f->touch_major) << 1) >= 200;
 
 				if (tip) {
@@ -517,48 +549,69 @@ AmtPtpServiceTouchInputInterruptType5(
 		);
 #endif
 
-		// Fingers to array
-		for (i = 0; i < raw_n; i++) {
+		// Fingers to array: build sequential report slots and avoid sending (0,0) on lifts
+		{
+			UCHAR reportSlots = 0;
+			for (i = 0; i < raw_n; i++) {
 
-			UCHAR *f_base = Buffer + headerSize + DeviceContext->DeviceInfo->tp_delta;
-			f = (const struct TRACKPAD_FINGER*) (f_base + i * fingerprintSize);
-			f_type5 = (const struct TRACKPAD_FINGER_TYPE5*) f;
+				UCHAR *f_base = Buffer + headerSize + DeviceContext->DeviceInfo->tp_delta;
+				f = (const struct TRACKPAD_FINGER*) (f_base + i * fingerprintSize);
+				f_type5 = (const struct TRACKPAD_FINGER_TYPE5*) f;
 
-			USHORT tmp_x = (*((USHORT*)f_type5)) & 0x1fff;
-			UINT tmp_y = (INT)(*((UINT*)f_type5));
+				USHORT tmp_x = (*((USHORT*)f_type5)) & 0x1fff;
+				UINT tmp_y = (INT)(*((UINT*)f_type5));
 
-			x = (SHORT) (tmp_x << 3) >> 3;
-			y = -(INT) (tmp_y << 6) >> 19;
+				x = (SHORT) (tmp_x << 3) >> 3;
+				y = -(INT) (tmp_y << 6) >> 19;
 
-			x = (x - DeviceContext->DeviceInfo->x.min) > 0 ? (x - DeviceContext->DeviceInfo->x.min) : 0;
-			y = (y - DeviceContext->DeviceInfo->y.min) > 0 ? (y - DeviceContext->DeviceInfo->y.min) : 0;
+				x = (x - DeviceContext->DeviceInfo->x.min) > 0 ? (x - DeviceContext->DeviceInfo->x.min) : 0;
+				y = (y - DeviceContext->DeviceInfo->y.min) > 0 ? (y - DeviceContext->DeviceInfo->y.min) : 0;
 
-			PtpReport.Contacts[i].ContactID = f_type5->ContactIdentifier.Id;
-			PtpReport.Contacts[i].X = (USHORT) x;
-			PtpReport.Contacts[i].Y = (USHORT) y;
-			PtpReport.Contacts[i].TipSwitch = (AmtRawToInteger(f_type5->TouchMajor) << 1) > 0;
+				UCHAR cid = f_type5->ContactIdentifier.Id;
+				BOOLEAN tip = (AmtRawToInteger(f_type5->TouchMajor) << 1) > 0;
 
-			// The Microsoft spec says reject any input larger than 25mm. This is not ideal
-			// for Magic Trackpad 2 - so we raised the threshold a bit higher.
-			// Or maybe I used the wrong unit? IDK
-			PtpReport.Contacts[i].Confidence = (AmtRawToInteger(f_type5->TouchMinor) << 1) < 345 && 
-				(AmtRawToInteger(f_type5->TouchMinor) << 1) < 345;
+				if (tip) {
+					if (cid < PTP_MAX_CONTACT_POINTS) {
+						DeviceContext->LastNormX[cid] = (USHORT)x;
+						DeviceContext->LastNormY[cid] = (USHORT)y;
+						DeviceContext->WasReported[cid] = TRUE;
+					}
+					PtpReport.Contacts[reportSlots].ContactID = cid;
+					PtpReport.Contacts[reportSlots].X = (USHORT) x;
+					PtpReport.Contacts[reportSlots].Y = (USHORT) y;
+					PtpReport.Contacts[reportSlots].TipSwitch = 1;
+					PtpReport.Contacts[reportSlots].Confidence = (AmtRawToInteger(f_type5->TouchMinor) << 1) < 345 && 
+						(AmtRawToInteger(f_type5->TouchMinor) << 1) < 345;
+					reportSlots++;
+				} else {
+					if (cid < PTP_MAX_CONTACT_POINTS && DeviceContext->WasReported[cid]) {
+						PtpReport.Contacts[reportSlots].ContactID = cid;
+						PtpReport.Contacts[reportSlots].X = DeviceContext->LastNormX[cid];
+						PtpReport.Contacts[reportSlots].Y = DeviceContext->LastNormY[cid];
+						PtpReport.Contacts[reportSlots].TipSwitch = 0;
+						PtpReport.Contacts[reportSlots].Confidence = 1;
+						DeviceContext->WasReported[cid] = FALSE;
+						reportSlots++;
+					}
+				}
 
-#ifdef INPUT_CONTENT_TRACE
-			TraceEvents(
-				TRACE_LEVEL_INFORMATION,
-				TRACE_INPUT,
-				"%!FUNC!: Point %llu, X = %d, Y = %d, TipSwitch = %d, Confidence = %d, tMajor = %d, tMinor = %d, origin = %d",
-				i,
-				PtpReport.Contacts[i].X,
-				PtpReport.Contacts[i].Y,
-				PtpReport.Contacts[i].TipSwitch,
-				PtpReport.Contacts[i].Confidence,
-				AmtRawToInteger(f_type5->TouchMajor) << 1,
-				AmtRawToInteger(f_type5->TouchMinor) << 1,
-				f_type5->ContactIdentifier.Id
-			);
-#endif
+			#ifdef INPUT_CONTENT_TRACE
+				TraceEvents(
+					TRACE_LEVEL_INFORMATION,
+					TRACE_INPUT,
+					"%!FUNC!: Point %llu, X = %d, Y = %d, TipSwitch = %d, Confidence = %d, tMajor = %d, tMinor = %d, origin = %d",
+					i,
+					(tip ? (int) x : (int) DeviceContext->LastNormX[cid]),
+					(tip ? (int) y : (int) DeviceContext->LastNormY[cid]),
+					tip ? 1 : 0,
+					(AmtRawToInteger(f_type5->TouchMinor) << 1) > 0,
+					AmtRawToInteger(f_type5->TouchMajor) << 1,
+					AmtRawToInteger(f_type5->TouchMinor) << 1,
+					f_type5->ContactIdentifier.Id
+				);
+			#endif
+			}
+			PtpReport.ContactCount = reportSlots;
 		}
 	}
 
