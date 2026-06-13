@@ -15,6 +15,7 @@ Environment:
 --*/
 
 #include "public.h"
+#include "include/Hid.h"
 
 EXTERN_C_START
 
