@@ -192,25 +192,43 @@ AmtPtpEvtUsbInterruptPipeReadComplete(
 			WdfRequestComplete(Request, STATUS_DATA_ERROR);
 			return;
 		}
+		{
+			UCHAR reportSlots = 0;
+			for (i = 0; i < raw_n; i++) {
+				f = (const struct TRACKPAD_FINGER*) (f_base + i * fingerprintSize);
 
-		PtpReport.ContactCount = (UCHAR) raw_n;
+				// Translate X and Y
+				x = (AmtRawToInteger(f->abs_x) - pDeviceContext->DeviceInfo->x.min) > 0 ? 
+					((USHORT)(AmtRawToInteger(f->abs_x) - pDeviceContext->DeviceInfo->x.min)) : 0;
+				y = (pDeviceContext->DeviceInfo->y.max - AmtRawToInteger(f->abs_y)) > 0 ? 
+					((USHORT)(pDeviceContext->DeviceInfo->y.max - AmtRawToInteger(f->abs_y))) : 0;
 
-		for (i = 0; i < raw_n; i++) {
-			f = (const struct TRACKPAD_FINGER*) (f_base + i * fingerprintSize);
-			
-			// Translate X and Y
-			x = (AmtRawToInteger(f->abs_x) - pDeviceContext->DeviceInfo->x.min) > 0 ? 
-				((USHORT)(AmtRawToInteger(f->abs_x) - pDeviceContext->DeviceInfo->x.min)) : 0;
-			y = (pDeviceContext->DeviceInfo->y.max - AmtRawToInteger(f->abs_y)) > 0 ? 
-				((USHORT)(pDeviceContext->DeviceInfo->y.max - AmtRawToInteger(f->abs_y))) : 0;
+				UCHAR cid = (UCHAR)i;
+				BOOLEAN tip = (AmtRawToInteger(f->touch_major) << 1) >= 200 || (AmtRawToInteger(f->touch_minor) << 1) >= 150;
 
-			// Defuzz functions remain the same
-			// TODO: Implement defuzz later
-			PtpReport.Contacts[i].ContactID = (UCHAR) i;
-			PtpReport.Contacts[i].X = x;
-			PtpReport.Contacts[i].Y = y;
-			PtpReport.Contacts[i].TipSwitch = (AmtRawToInteger(f->touch_major) << 1) >= 200 || (AmtRawToInteger(f->touch_minor) << 1) >= 150;
-			PtpReport.Contacts[i].Confidence = (AmtRawToInteger(f->touch_minor) << 1) > 0;
+				if (tip) {
+					PtpReport.Contacts[reportSlots].ContactID = cid;
+					PtpReport.Contacts[reportSlots].X = (USHORT)x;
+					PtpReport.Contacts[reportSlots].Y = (USHORT)y;
+					PtpReport.Contacts[reportSlots].TipSwitch = 1;
+					PtpReport.Contacts[reportSlots].Confidence = (AmtRawToInteger(f->touch_minor) << 1) > 0;
+					pDeviceContext->LastNormX[cid] = (USHORT)x;
+					pDeviceContext->LastNormY[cid] = (USHORT)y;
+					pDeviceContext->WasReported[cid] = TRUE;
+					reportSlots++;
+				} else {
+					if (cid < PTP_MAX_CONTACT_POINTS && pDeviceContext->WasReported[cid]) {
+						PtpReport.Contacts[reportSlots].ContactID = cid;
+						PtpReport.Contacts[reportSlots].X = pDeviceContext->LastNormX[cid];
+						PtpReport.Contacts[reportSlots].Y = pDeviceContext->LastNormY[cid];
+						PtpReport.Contacts[reportSlots].TipSwitch = 0;
+						PtpReport.Contacts[reportSlots].Confidence = 1;
+						pDeviceContext->WasReported[cid] = FALSE;
+						reportSlots++;
+					}
+				}
+			}
+			PtpReport.ContactCount = reportSlots;
 		}
 	}
 

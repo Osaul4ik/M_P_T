@@ -44,6 +44,11 @@ typedef struct _DEVICE_CONTEXT
 	// Timer
 	LARGE_INTEGER LastReportTime;
 
+	// Per-contact last known normalized coordinates and reported flags
+	USHORT LastNormX[PTP_MAX_CONTACT_POINTS];
+	USHORT LastNormY[PTP_MAX_CONTACT_POINTS];
+	BOOLEAN WasReported[PTP_MAX_CONTACT_POINTS];
+
 } DEVICE_CONTEXT, *PDEVICE_CONTEXT;
 
 //

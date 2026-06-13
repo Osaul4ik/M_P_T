@@ -59,14 +59,19 @@ AmtPtpDeviceSpiKmCreateDevice(
 	pDeviceContext = DeviceGetContext(Device);
 	pDeviceContext->SpiDevice = Device;
 
-	Status = WdfLookasideListCreate(
-		WDF_NO_OBJECT_ATTRIBUTES,
-		REPORT_BUFFER_SIZE,
-		NonPagedPoolNx,
-		WDF_NO_OBJECT_ATTRIBUTES,
-		PTP_LIST_POOL_TAG,
-		&pDeviceContext->HidReadBufferLookaside
-	);
+	{
+		WDF_OBJECT_ATTRIBUTES LookasideAttributes;
+		WDF_OBJECT_ATTRIBUTES_INIT(&LookasideAttributes);
+		LookasideAttributes.ParentObject = Device;
+		Status = WdfLookasideListCreate(
+			&LookasideAttributes,
+			REPORT_BUFFER_SIZE,
+			NonPagedPoolNx,
+			WDF_NO_OBJECT_ATTRIBUTES,
+			PTP_LIST_POOL_TAG,
+			&pDeviceContext->HidReadBufferLookaside
+		);
+	}
 	if (!NT_SUCCESS(Status)) {
 		TraceEvents(TRACE_LEVEL_ERROR, TRACE_DRIVER,
 			"%!FUNC! WdfLookasideListCreate failed with %!STATUS!", Status);

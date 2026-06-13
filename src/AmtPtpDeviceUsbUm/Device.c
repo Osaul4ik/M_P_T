@@ -248,6 +248,11 @@ AmtPtpEvtDevicePrepareHardware(
 	pDeviceContext->IsButtonReportOn = TRUE;
 	pDeviceContext->IsSurfaceReportOn = TRUE;
 
+	// Initialize per-contact state
+	RtlZeroMemory(pDeviceContext->LastNormX, sizeof(pDeviceContext->LastNormX));
+	RtlZeroMemory(pDeviceContext->LastNormY, sizeof(pDeviceContext->LastNormY));
+	RtlZeroMemory(pDeviceContext->WasReported, sizeof(pDeviceContext->WasReported));
+
 	TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DRIVER, "%!FUNC! Exit");
 	return status;
 }

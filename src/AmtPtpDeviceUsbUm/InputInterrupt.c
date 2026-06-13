@@ -319,41 +319,62 @@ AmtPtpServiceTouchInputInterrupt(
 #endif
 
 		// Fingers
-		for (i = 0; i < raw_n; i++) {
+		{
+			UCHAR reportSlots = 0;
+			for (i = 0; i < raw_n; i++) {
 
-			UCHAR *f_base = Buffer + headerSize + DeviceContext->DeviceInfo->tp_delta;
-			f = (const struct TRACKPAD_FINGER*) (f_base + i * fingerprintSize);
+				UCHAR *f_base = Buffer + headerSize + DeviceContext->DeviceInfo->tp_delta;
+				f = (const struct TRACKPAD_FINGER*) (f_base + i * fingerprintSize);
 
-			// Translate X and Y
-			x = (AmtRawToInteger(f->abs_x) - DeviceContext->DeviceInfo->x.min) > 0 ? 
-				((USHORT)(AmtRawToInteger(f->abs_x) - DeviceContext->DeviceInfo->x.min)) : 0;
-			y = (DeviceContext->DeviceInfo->y.max - AmtRawToInteger(f->abs_y)) > 0 ? 
-				((USHORT)(DeviceContext->DeviceInfo->y.max - AmtRawToInteger(f->abs_y))) : 0;
+				// Translate X and Y
+				x = (AmtRawToInteger(f->abs_x) - DeviceContext->DeviceInfo->x.min) > 0 ? 
+					((USHORT)(AmtRawToInteger(f->abs_x) - DeviceContext->DeviceInfo->x.min)) : 0;
+				y = (DeviceContext->DeviceInfo->y.max - AmtRawToInteger(f->abs_y)) > 0 ? 
+					((USHORT)(DeviceContext->DeviceInfo->y.max - AmtRawToInteger(f->abs_y))) : 0;
 
-			// Defuzz functions remain the same
-			// TODO: Implement defuzz later
-			PtpReport.Contacts[i].ContactID = (UCHAR) i;
-			PtpReport.Contacts[i].X = x;
-			PtpReport.Contacts[i].Y = y;
-			PtpReport.Contacts[i].TipSwitch = (AmtRawToInteger(f->touch_major) << 1) >= 200;
-			PtpReport.Contacts[i].Confidence = (AmtRawToInteger(f->touch_minor) << 1) > 0;
+				UCHAR cid = (UCHAR)i;
+				BOOLEAN tip = (AmtRawToInteger(f->touch_major) << 1) >= 200;
+
+				if (tip) {
+					PtpReport.Contacts[reportSlots].ContactID = cid;
+					PtpReport.Contacts[reportSlots].X = (USHORT)x;
+					PtpReport.Contacts[reportSlots].Y = (USHORT)y;
+					PtpReport.Contacts[reportSlots].TipSwitch = 1;
+					PtpReport.Contacts[reportSlots].Confidence = (AmtRawToInteger(f->touch_minor) << 1) > 0;
+					DeviceContext->LastNormX[cid] = (USHORT)x;
+					DeviceContext->LastNormY[cid] = (USHORT)y;
+					DeviceContext->WasReported[cid] = TRUE;
+					reportSlots++;
+				} else {
+					if (cid < PTP_MAX_CONTACT_POINTS && DeviceContext->WasReported[cid]) {
+						PtpReport.Contacts[reportSlots].ContactID = cid;
+						PtpReport.Contacts[reportSlots].X = DeviceContext->LastNormX[cid];
+						PtpReport.Contacts[reportSlots].Y = DeviceContext->LastNormY[cid];
+						PtpReport.Contacts[reportSlots].TipSwitch = 0;
+						PtpReport.Contacts[reportSlots].Confidence = 1;
+						DeviceContext->WasReported[cid] = FALSE;
+						reportSlots++;
+					}
+				}
 
 #ifdef INPUT_CONTENT_TRACE
-			TraceEvents(
-				TRACE_LEVEL_INFORMATION,
-				TRACE_INPUT,
-				"%!FUNC!: Point %llu, X = %d, Y = %d, TipSwitch = %d, Confidence = %d, tMajor = %d, tMinor = %d, origin = %d, PTP Origin = %d",
-				i,
-				PtpReport.Contacts[i].X,
-				PtpReport.Contacts[i].Y,
-				PtpReport.Contacts[i].TipSwitch,
-				PtpReport.Contacts[i].Confidence,
-				AmtRawToInteger(f->touch_major) << 1,
-				AmtRawToInteger(f->touch_minor) << 1,
-				AmtRawToInteger(f->origin),
-				(UCHAR) i
-			);
+				TraceEvents(
+					TRACE_LEVEL_INFORMATION,
+					TRACE_INPUT,
+					"%!FUNC!: Point %llu, X = %d, Y = %d, TipSwitch = %d, Confidence = %d, tMajor = %d, tMinor = %d, origin = %d, PTP Origin = %d",
+					i,
+					(int) (tip ? x : DeviceContext->LastNormX[cid]),
+					(int) (tip ? y : DeviceContext->LastNormY[cid]),
+					tip ? 1 : 0,
+					(AmtRawToInteger(f->touch_minor) << 1) > 0,
+					AmtRawToInteger(f->touch_major) << 1,
+					AmtRawToInteger(f->touch_minor) << 1,
+					AmtRawToInteger(f->origin),
+					(UCHAR) i
+				);
 #endif
+			}
+			PtpReport.ContactCount = reportSlots;
 		}
 	}
 
