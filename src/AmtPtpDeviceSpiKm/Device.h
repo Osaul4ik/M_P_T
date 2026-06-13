@@ -9,11 +9,9 @@ Environment:
 
 #pragma once
 #include "public.h"
+#include "AppleDefinition.h"   // SPI_TRACKPAD_MAX_FINGERS
+#include "Hid.h"               // PTP_MAX_CONTACT_POINTS
 #include "ContactTracking.h"
-
-#ifndef PTP_MAX_CONTACT_POINTS
-#define PTP_MAX_CONTACT_POINTS 5
-#endif
 
 EXTERN_C_START
 
