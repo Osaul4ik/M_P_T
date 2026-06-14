@@ -148,6 +148,11 @@ typedef struct _SLOT_STATE {
 	// seeded on CONFIRMING->ACTIVE, zeroed on ACTIVE exit.
 	USHORT      HystX;
 	USHORT      HystY;
+
+	// EMA smoothed coordinates (for cursor smoothness).
+	// Seeded on CONFIRMING->ACTIVE, updated every ACTIVE frame.
+	USHORT      SmoothedX;
+	USHORT      SmoothedY;
 } SLOT_STATE, *PSLOT_STATE;
 
 #define PTP_BUTTON_TYPE_CLICK_PAD 0
@@ -198,13 +203,27 @@ typedef struct _PTP_CONTACT {
 } PTP_CONTACT, * PPTP_CONTACT;
 #pragma pack(pop)
 
+/*
+ * PTP input report — must match HID descriptor layout:
+ *   ReportID       1 byte
+ *   Contacts[5]   45 bytes (9 bytes each)
+ *   ActualCount    1 byte
+ *   ScanTime       2 bytes
+ *   ContactCount   1 byte
+ *   IsButtonClicked 1 byte
+ *   Total:        51 bytes
+ */
+#pragma pack(push)
+#pragma pack(1)
 typedef struct _PTP_REPORT {
 	UCHAR       ReportID;
-	PTP_CONTACT Contacts[5];
+	PTP_CONTACT Contacts[5];    // 5 × 9 = 45 bytes
+	UCHAR       ActualCount;    // how many contacts are valid
 	USHORT      ScanTime;
 	UCHAR       ContactCount;
 	UCHAR       IsButtonClicked;
 } PTP_REPORT, *PPTP_REPORT;
+#pragma pack(pop)
 
 typedef struct _PTP_USERMODEAPP_CONF_REPORT {
 	UCHAR		ReportID;

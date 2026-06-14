@@ -49,7 +49,20 @@
 // (slot, finger) pair among those still unmatched. This guarantees a slot
 // never steals a finger that is actually closer to a different,
 // still-unmatched slot.
-#define REBIND_MAX_DELTA     30
+//
+// REBIND_MAX_DELTA is scaled per device by using the x resolution range.
+#define REBIND_MAX_DELTA_DENOM  300  // fraction of x-range for adaptive delta
+#define REBIND_MIN_DELTA        30   // minimum absolute delta
+
+// Palm rejection: finger aspect ratio threshold (major/minor > this = palm)
+#define PALM_ASPECT_RATIO_THRESHOLD  3
+// Palm rejection: absolute major threshold (in raw units)
+#define PALM_MAJOR_THRESHOLD         (UCHAR)0x60
+
+// Coordinate smoothing (exponential moving average) alpha factor.
+// Higher = more responsive, lower = smoother.
+#define SMOOTHING_ALPHA_NUM  3   // numerator   (3/8 = 0.375)
+#define SMOOTHING_ALPHA_DEN  8   // denominator
 
 #define SLOT_NONE  ((UCHAR)PTP_MAX_CONTACT_POINTS)
 
@@ -80,6 +93,66 @@ AmtApplyDeadzone(_In_ USHORT newVal, _Inout_ USHORT* pBaseline)
 #endif
     *pBaseline = newVal;
     return newVal;
+}
+
+//
+// Exponential moving average smoothing (non-linear, low-latency).
+// blended = (raw * alpha_num + prev * (alpha_den - alpha_num)) / alpha_den
+//
+static inline USHORT
+AmtSmoothCoord(
+    _In_ USHORT rawVal,
+    _In_ USHORT prevVal)
+{
+    INT blended = ((INT)rawVal * SMOOTHING_ALPHA_NUM +
+                   (INT)prevVal * (SMOOTHING_ALPHA_DEN - SMOOTHING_ALPHA_NUM))
+                  / SMOOTHING_ALPHA_DEN;
+    return (USHORT)(blended < 0 ? 0 : blended);
+}
+
+//
+// Palm rejection heuristics.
+// Returns TRUE if the finger is likely a palm and should be suppressed.
+//
+static inline BOOLEAN
+AmtIsPalm(
+    _In_ const struct TRACKPAD_FINGER* f,
+    _In_ const struct BCM5974_CONFIG* devInfo,
+    _In_ USHORT normX,
+    _In_ USHORT normY)
+{
+    // 1. Absolute size check: if touch_major is huge, it's a palm.
+    if (f->touch_major > PALM_MAJOR_THRESHOLD) {
+        return TRUE;
+    }
+
+    // 2. Aspect ratio: palm is elongated (oval), finger is round.
+    //    If minor > 0, ratio = major / minor.
+    if (f->touch_minor > 0) {
+        INT ratio = (INT)f->touch_major / (INT)f->touch_minor;
+        if (ratio >= PALM_ASPECT_RATIO_THRESHOLD) {
+            return TRUE;
+        }
+    }
+
+    // 3. Edge zones: if the finger is very close to the edge of the
+    //    trackpad, it's likely part of a palm resting on the edge.
+    {
+        INT xRange = devInfo->x.max - devInfo->x.min;
+        INT yRange = devInfo->y.max - devInfo->y.min;
+        INT edgePctX = xRange / 8;  // ~12.5% from each edge
+        INT edgePctY = yRange / 8;
+
+        if (normX < (USHORT)edgePctX ||
+            normX > (USHORT)(xRange - edgePctX) ||
+            normY < (USHORT)edgePctY ||
+            normY > (USHORT)(yRange - edgePctY))
+        {
+            return TRUE;
+        }
+    }
+
+    return FALSE;
 }
 
 static inline INT
@@ -183,6 +256,21 @@ AmtAssertSlotInvariants(
 #endif
 }
 
+//
+// Compute a per-device REBIND_MAX_DELTA based on x-resolution range.
+// This makes the 2a-bis position threshold consistent across different
+// trackpad sizes (13" vs 15" etc.) and avoids false matches on
+// high-resolution devices where fixed 30 units is too large.
+//
+static inline INT
+AmtGetRebindMaxDelta(
+    _In_ PDEVICE_CONTEXT pCtx)
+{
+    INT xRange = pCtx->DeviceInfo->x.max - pCtx->DeviceInfo->x.min;
+    INT adaptive = xRange / REBIND_MAX_DELTA_DENOM;
+    return (adaptive < REBIND_MIN_DELTA) ? REBIND_MIN_DELTA : adaptive;
+}
+
 VOID
 AmtPtpProcessTouchFrame(
     _In_    PDEVICE_CONTEXT pCtx,
@@ -197,6 +285,7 @@ AmtPtpProcessTouchFrame(
     const struct TRACKPAD_FINGER* f;
     size_t i, s;
     UCHAR reportSlots = *pReportSlots;
+    INT rebindMaxDelta = AmtGetRebindMaxDelta(pCtx);
 
     // Phase 0: cooldown countdown.
     for (s = 0; s < PTP_MAX_CONTACT_POINTS; s++) {
@@ -230,10 +319,22 @@ AmtPtpProcessTouchFrame(
             (AmtRawToInteger(f->touch_major) << 1) >= TIP_MAJOR_THRESHOLD ||
             (AmtRawToInteger(f->touch_minor) << 1) >= TIP_MINOR_THRESHOLD;
 
-        fingerTipDown[i] = tip;
-        if (!tip) continue;
+        if (!tip) {
+            fingerTipDown[i] = FALSE;
+            continue;
+        }
 
         AmtNormalizeFinger(pCtx, f, &fingerNormX[i], &fingerNormY[i]);
+
+        // Palm rejection: if this finger looks like a palm, ignore it.
+        if (AmtIsPalm(f, pCtx->DeviceInfo, fingerNormX[i], fingerNormY[i])) {
+            fingerTipDown[i] = FALSE;
+            TraceEvents(TRACE_LEVEL_VERBOSE, TRACE_INPUT,
+                "%!FUNC! finger=%d rejected as palm", (INT)i);
+            continue;
+        }
+
+        fingerTipDown[i] = TRUE;
         fingerKey[i] = (UCHAR)i;
     }
 
@@ -265,7 +366,7 @@ AmtPtpProcessTouchFrame(
     // 2a-bis. Position rebind for slots/fingers left unmatched.
     //
     // Greedy global mutual-best-match: repeatedly find the closest
-    // remaining (slot, finger) pair within REBIND_MAX_DELTA and bind it.
+    // remaining (slot, finger) pair within rebindMaxDelta and bind it.
     // Because each iteration picks the single globally-closest pair, a
     // slot can never grab a finger that some other still-unmatched slot
     // is closer to (that other pair would have been picked first), and
@@ -275,7 +376,7 @@ AmtPtpProcessTouchFrame(
     for (;;) {
         UCHAR bestSlot   = SLOT_NONE;
         UCHAR bestFinger = SLOT_NONE;
-        INT   bestDist   = REBIND_MAX_DELTA + 1;
+        INT   bestDist   = rebindMaxDelta + 1;
 
         for (s = 0; s < PTP_MAX_CONTACT_POINTS; s++) {
             PSLOT_STATE st = &pCtx->Slots[s];
@@ -300,7 +401,7 @@ AmtPtpProcessTouchFrame(
         }
 
         if (bestSlot == SLOT_NONE) {
-            break;  // no remaining candidate pair within REBIND_MAX_DELTA
+            break;  // no remaining candidate pair within rebindMaxDelta
         }
 
         slotForFinger[bestFinger] = bestSlot;
@@ -308,8 +409,8 @@ AmtPtpProcessTouchFrame(
         pCtx->Slots[bestSlot].FingerKey = fingerKey[bestFinger];
 
         TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_INPUT,
-            "%!FUNC! slot=%d rebound to finger=%d by position (dist=%d)",
-            (INT)bestSlot, (INT)bestFinger, bestDist);
+            "%!FUNC! slot=%d rebound to finger=%d by position (dist=%d, max=%d)",
+            (INT)bestSlot, (INT)bestFinger, bestDist, rebindMaxDelta);
     }
 
     // 2b. Assign new slots for unmatched fingers.
@@ -392,7 +493,7 @@ AmtPtpProcessTouchFrame(
         }
     }
 
-    // Phase 4/5: emit contacts for matched fingers.
+    // Phase 4/5: emit contacts for matched fingers (with smoothing).
     for (i = 0; i < raw_n; i++) {
         if (!fingerTipDown[i]) continue;
 
@@ -420,10 +521,22 @@ AmtPtpProcessTouchFrame(
             st->Phase = SLOT_ACTIVE;
             st->HystX = fingerNormX[i];
             st->HystY = fingerNormY[i];
+            // Seed the smoother with the first active position.
+            st->SmoothedX = fingerNormX[i];
+            st->SmoothedY = fingerNormY[i];
         }
 
-        USHORT reportX = AmtApplyDeadzone(fingerNormX[i], &st->HystX);
-        USHORT reportY = AmtApplyDeadzone(fingerNormY[i], &st->HystY);
+        USHORT reportX, reportY;
+
+        // Apply deadzone, then EMA smoothing.
+        USHORT afterDeadzoneX = AmtApplyDeadzone(fingerNormX[i], &st->HystX);
+        USHORT afterDeadzoneY = AmtApplyDeadzone(fingerNormY[i], &st->HystY);
+
+        reportX = AmtSmoothCoord(afterDeadzoneX, st->SmoothedX);
+        reportY = AmtSmoothCoord(afterDeadzoneY, st->SmoothedY);
+
+        st->SmoothedX = reportX;
+        st->SmoothedY = reportY;
 
         if (reportSlots < PTP_MAX_CONTACT_POINTS) {
             f = (const struct TRACKPAD_FINGER*)(f_base + i * pCtx->DeviceInfo->tp_fsize);

@@ -395,7 +395,12 @@ AmtPtpReportFeatures(
 			}
 
 			PPTP_DEVICE_HQA_CERTIFICATION_REPORT certReport = (PPTP_DEVICE_HQA_CERTIFICATION_REPORT)pHidPacket->reportBuffer;
-			*certReport->CertificationBlob = DEFAULT_PTP_HQA_BLOB;
+			// BUG FIX: Use RtlCopyMemory to copy the entire HQA blob.
+			// The prior code used pointer-assignment which only set the first byte.
+			RtlCopyMemory(
+				certReport->CertificationBlob,
+				DEFAULT_PTP_HQA_BLOB,
+				sizeof(certReport->CertificationBlob));
 			certReport->ReportID = REPORTID_PTPHQA;
 
 			TraceEvents(
