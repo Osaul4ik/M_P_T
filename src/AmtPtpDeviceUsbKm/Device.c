@@ -66,15 +66,17 @@ VOID
 AmtPtpResetSlotState(
     _In_ PDEVICE_CONTEXT pCtx)
 {
-    RtlZeroMemory(pCtx->SlotInUse,          sizeof(pCtx->SlotInUse));
-    RtlZeroMemory(pCtx->SlotPendingRelease, sizeof(pCtx->SlotPendingRelease));
-    RtlZeroMemory(pCtx->SlotCooldown,       sizeof(pCtx->SlotCooldown));
-    RtlZeroMemory(pCtx->SlotTipConfirmed,   sizeof(pCtx->SlotTipConfirmed));
-    RtlZeroMemory(pCtx->SlotFingerKey,      sizeof(pCtx->SlotFingerKey));
-    RtlZeroMemory(pCtx->LastNormX,          sizeof(pCtx->LastNormX));
-    RtlZeroMemory(pCtx->LastNormY,          sizeof(pCtx->LastNormY));
-    RtlZeroMemory(pCtx->HystX,              sizeof(pCtx->HystX));
-    RtlZeroMemory(pCtx->HystY,              sizeof(pCtx->HystY));
+    size_t s;
+
+    // Zeroing SLOT_STATE sets Phase=SLOT_FREE (0), TipConfirmed=0,
+    // Cooldown=0, LastNormX/Y=0, HystX/Y=0 — all correct for FREE.
+    // FingerKey=0 is NOT "no key" though (0 is a valid USB array index),
+    // so it must be explicitly set to SLOT_KEY_NONE below.
+    RtlZeroMemory(pCtx->Slots, sizeof(pCtx->Slots));
+
+    for (s = 0; s < PTP_MAX_CONTACT_POINTS; s++) {
+        pCtx->Slots[s].FingerKey = SLOT_KEY_NONE;
+    }
 }
 
 // ---- CreateDevice ----------------------------------------------------------

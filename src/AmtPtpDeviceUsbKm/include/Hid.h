@@ -88,6 +88,68 @@ typedef UCHAR HID_REPORT_DESCRIPTOR, *PHID_REPORT_DESCRIPTOR;
 	0x24, 0x8b, 0xc4, 0x43, 0xa5, 0xe5, 0x24, 0xc2
 
 #define PTP_MAX_CONTACT_POINTS 5
+
+// ---------------------------------------------------------------------------
+// Per-finger slot state machine (InterruptTouch.c / ProcessingThread.c)
+//
+// Lifecycle: FREE -> CONFIRMING -> ACTIVE -> PENDING_RELEASE -> COOLDOWN -> FREE
+//
+// Consolidates what used to be 8 parallel arrays (SlotInUse,
+// SlotPendingRelease, SlotCooldown, SlotTipConfirmed, SlotFingerKey,
+// LastNormX/Y, HystX/Y) into one struct per slot. The explicit Phase field
+// makes the FSM state unambiguous and keeps per-slot data co-located,
+// eliminating a whole class of "forgot to reset array N" bugs.
+//
+// Field validity by phase (checked by AmtAssertSlotInvariants in
+// InterruptTouch.c, debug builds only):
+//
+//   FREE            : TipConfirmed==0, Cooldown==0, FingerKey==SLOT_KEY_NONE,
+//                      LastNormX/Y==0, HystX/Y==0
+//   CONFIRMING      : 1 <= TipConfirmed < TIP_CONFIRM_FRAMES, Cooldown==0,
+//                      HystX/Y==0
+//   ACTIVE          : TipConfirmed==TIP_CONFIRM_FRAMES, Cooldown==0,
+//                      FingerKey != SLOT_KEY_NONE
+//   PENDING_RELEASE : TipConfirmed==0, Cooldown==0, HystX/Y==0,
+//                      FingerKey==SLOT_KEY_NONE
+//   COOLDOWN        : Cooldown>0, TipConfirmed==0, HystX/Y==0,
+//                      LastNormX/Y==0
+// ---------------------------------------------------------------------------
+typedef enum _SLOT_PHASE {
+	SLOT_FREE            = 0,
+	SLOT_CONFIRMING      = 1,
+	SLOT_ACTIVE          = 2,
+	SLOT_PENDING_RELEASE = 3,
+	SLOT_COOLDOWN        = 4,
+} SLOT_PHASE;
+
+#define SLOT_KEY_NONE  ((UCHAR)0xFF)
+
+typedef struct _SLOT_STATE {
+	SLOT_PHASE  Phase;
+
+	// Debounce counter while CONFIRMING (0..TIP_CONFIRM_FRAMES).
+	UCHAR       TipConfirmed;
+
+	// Frames remaining in COOLDOWN.
+	UCHAR       Cooldown;
+
+	// Identity key used for Phase 2a key-match. This is the USB-array
+	// index at the time of (re)bind, NOT a hardware finger ID -- the T2
+	// controller does not expose one. SLOT_KEY_NONE when not tracking.
+	UCHAR       FingerKey;
+
+	// Last reported normalised coordinate. Valid only while ACTIVE or
+	// PENDING_RELEASE; used for the lift report and as the reference
+	// point for Phase 2a-bis position-based rebind.
+	USHORT      LastNormX;
+	USHORT      LastNormY;
+
+	// Hysteresis/deadzone baseline. Scoped to a single ACTIVE gesture:
+	// seeded on CONFIRMING->ACTIVE, zeroed on ACTIVE exit.
+	USHORT      HystX;
+	USHORT      HystY;
+} SLOT_STATE, *PSLOT_STATE;
+
 #define PTP_BUTTON_TYPE_CLICK_PAD 0
 #define PTP_BUTTON_TYPE_PRESSURE_PAD 1
 

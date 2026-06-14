@@ -12,6 +12,12 @@
 //     report on PENDING_RELEASE->COOLDOWN, then zeroed.
 // By the time a slot reaches FREE both pairs are guaranteed zero, so no
 // gesture can inherit a previous gesture's position.
+//
+// State is consolidated into SLOT_STATE (include/Hid.h): one struct per
+// slot with an explicit Phase field, instead of 8 parallel arrays whose
+// combinations previously had to encode the FSM state implicitly.
+// AmtAssertSlotInvariants() validates FSM consistency after every frame
+// in debug builds.
 
 #include "Driver.h"
 #include "InterruptTouch.tmh"
@@ -30,10 +36,22 @@
 // USB-array index swap between two fingers in the same frame, which Phase 2a's
 // pure key match cannot — the swap looks like two simultaneous key mismatches
 // but the true fingers barely moved.
+//
+// NOTE: FingerKey is the USB-array index recorded at the slot's last
+// (re)bind, NOT a hardware finger ID — the T2 controller does not expose
+// one. Phase 2a key-match only succeeds when the controller happens to
+// keep a tracked finger at the same array index across frames; Phase 2a-bis
+// position rebind is the primary mechanism for re-establishing identity
+// after a reorder.
+//
+// To reduce false matches when two fingers are close together, 2a-bis uses
+// a greedy MUTUAL-best-match: repeatedly bind the globally closest
+// (slot, finger) pair among those still unmatched. This guarantees a slot
+// never steals a finger that is actually closer to a different,
+// still-unmatched slot.
 #define REBIND_MAX_DELTA     30
 
 #define SLOT_NONE  ((UCHAR)PTP_MAX_CONTACT_POINTS)
-#define KEY_NONE   ((UCHAR)0xFF)
 
 static inline INT
 AmtRawToInteger(_In_ USHORT x)
@@ -71,6 +89,100 @@ AmtAbsDelta(_In_ INT a, _In_ INT b)
     return (d < 0) ? -d : d;
 }
 
+//
+// Normalise one finger's raw coordinates into device-space (0..range).
+// Pure function of the device config + raw finger sample; touches no
+// slot state. Unifies the clamp logic that was previously inlined in
+// Phase 1.
+//
+static inline VOID
+AmtNormalizeFinger(
+    _In_  PDEVICE_CONTEXT pCtx,
+    _In_  const struct TRACKPAD_FINGER* f,
+    _Out_ USHORT* pNormX,
+    _Out_ USHORT* pNormY)
+{
+    INT xRange = pCtx->DeviceInfo->x.max - pCtx->DeviceInfo->x.min;
+    INT yRange = pCtx->DeviceInfo->y.max - pCtx->DeviceInfo->y.min;
+    INT normY;
+
+    *pNormX = AmtClampCoord(
+        AmtRawToInteger(f->abs_x), pCtx->DeviceInfo->x.min, xRange);
+
+    normY = pCtx->DeviceInfo->y.max - AmtRawToInteger(f->abs_y);
+    *pNormY = AmtClampCoord(normY, 0, yRange);
+}
+
+//
+// Debug-only FSM invariant check, run once per frame after all slot
+// transitions are applied. Traces and asserts on the first violation
+// found per slot. See include/Hid.h (SLOT_STATE) for the documented
+// per-phase invariants this enforces.
+//
+static inline VOID
+AmtAssertSlotInvariants(
+    _In_ PDEVICE_CONTEXT pCtx)
+{
+#if DBG
+    size_t s;
+
+    for (s = 0; s < PTP_MAX_CONTACT_POINTS; s++) {
+        PSLOT_STATE st = &pCtx->Slots[s];
+        BOOLEAN ok = TRUE;
+
+        switch (st->Phase) {
+        case SLOT_FREE:
+            ok = (st->TipConfirmed == 0) && (st->Cooldown == 0) &&
+                 (st->FingerKey == SLOT_KEY_NONE) &&
+                 (st->LastNormX == 0) && (st->LastNormY == 0) &&
+                 (st->HystX == 0) && (st->HystY == 0);
+            break;
+
+        case SLOT_CONFIRMING:
+            ok = (st->TipConfirmed >= 1) &&
+                 (st->TipConfirmed < TIP_CONFIRM_FRAMES) &&
+                 (st->Cooldown == 0) &&
+                 (st->HystX == 0) && (st->HystY == 0);
+            break;
+
+        case SLOT_ACTIVE:
+            ok = (st->TipConfirmed == TIP_CONFIRM_FRAMES) &&
+                 (st->Cooldown == 0) &&
+                 (st->FingerKey != SLOT_KEY_NONE);
+            break;
+
+        case SLOT_PENDING_RELEASE:
+            ok = (st->TipConfirmed == 0) && (st->Cooldown == 0) &&
+                 (st->HystX == 0) && (st->HystY == 0) &&
+                 (st->FingerKey == SLOT_KEY_NONE);
+            break;
+
+        case SLOT_COOLDOWN:
+            ok = (st->Cooldown > 0) && (st->TipConfirmed == 0) &&
+                 (st->HystX == 0) && (st->HystY == 0) &&
+                 (st->LastNormX == 0) && (st->LastNormY == 0);
+            break;
+
+        default:
+            ok = FALSE;
+            break;
+        }
+
+        if (!ok) {
+            TraceEvents(TRACE_LEVEL_ERROR, TRACE_INPUT,
+                "%!FUNC! INVARIANT VIOLATION slot=%llu phase=%d "
+                "tip=%d cooldown=%d key=0x%02x last=(%u,%u) hyst=(%u,%u)",
+                (ULONG64)s, (INT)st->Phase, st->TipConfirmed, st->Cooldown,
+                st->FingerKey, st->LastNormX, st->LastNormY,
+                st->HystX, st->HystY);
+            NT_ASSERTMSG("Slot FSM invariant violated", FALSE);
+        }
+    }
+#else
+    UNREFERENCED_PARAMETER(pCtx);
+#endif
+}
+
 VOID
 AmtPtpProcessTouchFrame(
     _In_    PDEVICE_CONTEXT pCtx,
@@ -88,10 +200,16 @@ AmtPtpProcessTouchFrame(
 
     // Phase 0: cooldown countdown.
     for (s = 0; s < PTP_MAX_CONTACT_POINTS; s++) {
-        if (pCtx->SlotCooldown[s] > 0) {
-            pCtx->SlotCooldown[s]--;
-            if (pCtx->SlotCooldown[s] == 0) {
-                pCtx->SlotFingerKey[s] = KEY_NONE;
+        PSLOT_STATE st = &pCtx->Slots[s];
+
+        if (st->Phase == SLOT_COOLDOWN) {
+            st->Cooldown--;
+            if (st->Cooldown == 0) {
+                st->FingerKey = SLOT_KEY_NONE;
+                st->Phase     = SLOT_FREE;
+
+                TraceEvents(TRACE_LEVEL_VERBOSE, TRACE_INPUT,
+                    "%!FUNC! slot=%llu COOLDOWN -> FREE", (ULONG64)s);
             }
         }
     }
@@ -103,7 +221,7 @@ AmtPtpProcessTouchFrame(
     UCHAR   fingerKey     [PTP_MAX_CONTACT_POINTS];
 
     for (i = 0; i < PTP_MAX_CONTACT_POINTS; i++)
-        fingerKey[i] = KEY_NONE;
+        fingerKey[i] = SLOT_KEY_NONE;
 
     for (i = 0; i < raw_n; i++) {
         f = (const struct TRACKPAD_FINGER*)(f_base + i * pCtx->DeviceInfo->tp_fsize);
@@ -115,15 +233,7 @@ AmtPtpProcessTouchFrame(
         fingerTipDown[i] = tip;
         if (!tip) continue;
 
-        INT xRange = pCtx->DeviceInfo->x.max - pCtx->DeviceInfo->x.min;
-        INT yRange = pCtx->DeviceInfo->y.max - pCtx->DeviceInfo->y.min;
-
-        fingerNormX[i] = AmtClampCoord(
-            AmtRawToInteger(f->abs_x), pCtx->DeviceInfo->x.min, xRange);
-
-        INT normY = pCtx->DeviceInfo->y.max - AmtRawToInteger(f->abs_y);
-        fingerNormY[i] = AmtClampCoord(normY, 0, yRange);
-
+        AmtNormalizeFinger(pCtx, f, &fingerNormX[i], &fingerNormY[i]);
         fingerKey[i] = (UCHAR)i;
     }
 
@@ -134,13 +244,15 @@ AmtPtpProcessTouchFrame(
     for (i = 0; i < PTP_MAX_CONTACT_POINTS; i++) slotForFinger[i] = SLOT_NONE;
     for (s = 0; s < PTP_MAX_CONTACT_POINTS; s++) fingerForSlot[s] = SLOT_NONE;
 
-    // 2a. Match by key.
+    // 2a. Match by key (works only when the controller happens to keep a
+    // tracked finger at the same array index across frames).
     for (i = 0; i < raw_n; i++) {
         if (!fingerTipDown[i]) continue;
         UCHAR key = fingerKey[i];
         for (s = 0; s < PTP_MAX_CONTACT_POINTS; s++) {
-            if ((pCtx->SlotInUse[s] || pCtx->SlotTipConfirmed[s] > 0) &&
-                pCtx->SlotFingerKey[s] == key &&
+            PSLOT_STATE st = &pCtx->Slots[s];
+            if ((st->Phase == SLOT_ACTIVE || st->Phase == SLOT_CONFIRMING) &&
+                st->FingerKey == key &&
                 fingerForSlot[s] == SLOT_NONE)
             {
                 slotForFinger[i] = (UCHAR)s;
@@ -151,36 +263,53 @@ AmtPtpProcessTouchFrame(
     }
 
     // 2a-bis. Position rebind for slots/fingers left unmatched.
-    for (s = 0; s < PTP_MAX_CONTACT_POINTS; s++) {
-        if (fingerForSlot[s] != SLOT_NONE) continue;
-        if (!(pCtx->SlotInUse[s] || pCtx->SlotTipConfirmed[s] > 0)) continue;
-
+    //
+    // Greedy global mutual-best-match: repeatedly find the closest
+    // remaining (slot, finger) pair within REBIND_MAX_DELTA and bind it.
+    // Because each iteration picks the single globally-closest pair, a
+    // slot can never grab a finger that some other still-unmatched slot
+    // is closer to (that other pair would have been picked first), and
+    // vice versa for fingers. This is equivalent to enforcing mutual
+    // best-match without an O(n^2) stable-matching pass, which is
+    // unnecessary at n <= PTP_MAX_CONTACT_POINTS (5).
+    for (;;) {
+        UCHAR bestSlot   = SLOT_NONE;
         UCHAR bestFinger = SLOT_NONE;
         INT   bestDist   = REBIND_MAX_DELTA + 1;
 
-        for (i = 0; i < raw_n; i++) {
-            if (!fingerTipDown[i]) continue;
-            if (slotForFinger[i] != SLOT_NONE) continue;
+        for (s = 0; s < PTP_MAX_CONTACT_POINTS; s++) {
+            PSLOT_STATE st = &pCtx->Slots[s];
 
-            INT dx   = AmtAbsDelta((INT)fingerNormX[i], (INT)pCtx->LastNormX[s]);
-            INT dy   = AmtAbsDelta((INT)fingerNormY[i], (INT)pCtx->LastNormY[s]);
-            INT dist = dx + dy;
+            if (fingerForSlot[s] != SLOT_NONE) continue;
+            if (!(st->Phase == SLOT_ACTIVE || st->Phase == SLOT_CONFIRMING)) continue;
 
-            if (dist < bestDist) {
-                bestDist   = dist;
-                bestFinger = (UCHAR)i;
+            for (i = 0; i < raw_n; i++) {
+                if (!fingerTipDown[i]) continue;
+                if (slotForFinger[i] != SLOT_NONE) continue;
+
+                INT dx   = AmtAbsDelta((INT)fingerNormX[i], (INT)st->LastNormX);
+                INT dy   = AmtAbsDelta((INT)fingerNormY[i], (INT)st->LastNormY);
+                INT dist = dx + dy;
+
+                if (dist < bestDist) {
+                    bestDist   = dist;
+                    bestSlot   = (UCHAR)s;
+                    bestFinger = (UCHAR)i;
+                }
             }
         }
 
-        if (bestFinger != SLOT_NONE) {
-            slotForFinger[bestFinger] = (UCHAR)s;
-            fingerForSlot[s]          = bestFinger;
-            pCtx->SlotFingerKey[s]    = fingerKey[bestFinger];
-
-            TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_INPUT,
-                "%!FUNC! Slot %llu rebound to finger %d by position (dist=%d)",
-                (ULONG64)s, (INT)bestFinger, bestDist);
+        if (bestSlot == SLOT_NONE) {
+            break;  // no remaining candidate pair within REBIND_MAX_DELTA
         }
+
+        slotForFinger[bestFinger] = bestSlot;
+        fingerForSlot[bestSlot]   = bestFinger;
+        pCtx->Slots[bestSlot].FingerKey = fingerKey[bestFinger];
+
+        TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_INPUT,
+            "%!FUNC! slot=%d rebound to finger=%d by position (dist=%d)",
+            (INT)bestSlot, (INT)bestFinger, bestDist);
     }
 
     // 2b. Assign new slots for unmatched fingers.
@@ -189,15 +318,18 @@ AmtPtpProcessTouchFrame(
         if (slotForFinger[i] != SLOT_NONE) continue;
 
         for (s = 0; s < PTP_MAX_CONTACT_POINTS; s++) {
-            if (!pCtx->SlotInUse[s] &&
-                !pCtx->SlotPendingRelease[s] &&
-                !pCtx->SlotCooldown[s] &&
-                pCtx->SlotTipConfirmed[s] == 0 &&
-                fingerForSlot[s] == SLOT_NONE)
-            {
+            PSLOT_STATE st = &pCtx->Slots[s];
+
+            if (st->Phase == SLOT_FREE && fingerForSlot[s] == SLOT_NONE) {
                 slotForFinger[i] = (UCHAR)s;
                 fingerForSlot[s] = (UCHAR)i;
-                pCtx->SlotFingerKey[s] = fingerKey[i];
+                st->FingerKey    = fingerKey[i];
+
+                TraceEvents(TRACE_LEVEL_VERBOSE, TRACE_INPUT,
+                    "%!FUNC! slot=%llu FREE -> CONFIRMING (finger=%d)",
+                    (ULONG64)s, (INT)i);
+
+                st->Phase = SLOT_CONFIRMING;
                 break;
             }
         }
@@ -207,39 +339,56 @@ AmtPtpProcessTouchFrame(
     for (s = 0; s < PTP_MAX_CONTACT_POINTS; s++) {
         if (fingerForSlot[s] != SLOT_NONE) continue;
 
-        // PENDING_RELEASE -> emit lift, enter COOLDOWN.
-        if (pCtx->SlotPendingRelease[s]) {
+        PSLOT_STATE st = &pCtx->Slots[s];
+
+        switch (st->Phase) {
+        case SLOT_PENDING_RELEASE:
+            // PENDING_RELEASE -> emit lift, enter COOLDOWN.
             if (reportSlots < PTP_MAX_CONTACT_POINTS) {
                 PtpReport->Contacts[reportSlots].ContactID  = (UCHAR)s;
-                PtpReport->Contacts[reportSlots].X          = pCtx->LastNormX[s];
-                PtpReport->Contacts[reportSlots].Y          = pCtx->LastNormY[s];
+                PtpReport->Contacts[reportSlots].X          = st->LastNormX;
+                PtpReport->Contacts[reportSlots].Y          = st->LastNormY;
                 PtpReport->Contacts[reportSlots].TipSwitch  = 0;
                 PtpReport->Contacts[reportSlots].Confidence = 1;
                 reportSlots++;
             }
-            pCtx->SlotPendingRelease[s] = FALSE;
-            pCtx->SlotCooldown[s]       = 2;
-            pCtx->LastNormX[s]          = 0;
-            pCtx->LastNormY[s]          = 0;
-            continue;
-        }
 
-        // ACTIVE -> PENDING_RELEASE.
-        if (pCtx->SlotInUse[s]) {
-            pCtx->SlotInUse[s]          = FALSE;
-            pCtx->SlotPendingRelease[s] = TRUE;
-            pCtx->SlotFingerKey[s]      = KEY_NONE;
-            pCtx->SlotTipConfirmed[s]   = 0;
-            pCtx->HystX[s]              = 0;
-            pCtx->HystY[s]              = 0;
-            continue;
-        }
+            TraceEvents(TRACE_LEVEL_VERBOSE, TRACE_INPUT,
+                "%!FUNC! slot=%llu PENDING_RELEASE -> COOLDOWN", (ULONG64)s);
 
-        // CONFIRMING (no match) -> FREE.
-        if (pCtx->SlotTipConfirmed[s] > 0) {
-            pCtx->SlotTipConfirmed[s] = 0;
-            pCtx->SlotFingerKey[s]    = KEY_NONE;
-            continue;
+            st->Phase     = SLOT_COOLDOWN;
+            st->Cooldown  = 2;
+            st->LastNormX = 0;
+            st->LastNormY = 0;
+            break;
+
+        case SLOT_ACTIVE:
+            // ACTIVE -> PENDING_RELEASE.
+            TraceEvents(TRACE_LEVEL_VERBOSE, TRACE_INPUT,
+                "%!FUNC! slot=%llu ACTIVE -> PENDING_RELEASE", (ULONG64)s);
+
+            st->Phase        = SLOT_PENDING_RELEASE;
+            st->FingerKey    = SLOT_KEY_NONE;
+            st->TipConfirmed = 0;
+            st->HystX        = 0;
+            st->HystY        = 0;
+            break;
+
+        case SLOT_CONFIRMING:
+            // CONFIRMING (no match) -> FREE.
+            TraceEvents(TRACE_LEVEL_VERBOSE, TRACE_INPUT,
+                "%!FUNC! slot=%llu CONFIRMING -> FREE (lost match)", (ULONG64)s);
+
+            st->Phase        = SLOT_FREE;
+            st->TipConfirmed = 0;
+            st->FingerKey    = SLOT_KEY_NONE;
+            break;
+
+        case SLOT_FREE:
+        case SLOT_COOLDOWN:
+        default:
+            // Nothing to do — handled in Phase 0 or already idle.
+            break;
         }
     }
 
@@ -250,26 +399,31 @@ AmtPtpProcessTouchFrame(
         UCHAR slot = slotForFinger[i];
         if (slot >= PTP_MAX_CONTACT_POINTS) continue;
 
-        if (pCtx->SlotTipConfirmed[slot] < TIP_CONFIRM_FRAMES) {
-            pCtx->SlotTipConfirmed[slot]++;
+        PSLOT_STATE st = &pCtx->Slots[slot];
+
+        if (st->TipConfirmed < TIP_CONFIRM_FRAMES) {
+            st->TipConfirmed++;
         }
 
-        BOOLEAN alreadyActive = pCtx->SlotInUse[slot];
+        BOOLEAN alreadyActive = (st->Phase == SLOT_ACTIVE);
         BOOLEAN justConfirmed = (!alreadyActive &&
-            pCtx->SlotTipConfirmed[slot] >= TIP_CONFIRM_FRAMES);
+            st->TipConfirmed >= TIP_CONFIRM_FRAMES);
 
         if (!alreadyActive && !justConfirmed) {
             continue;   // still CONFIRMING
         }
 
         if (justConfirmed) {
-            pCtx->SlotInUse[slot] = TRUE;
-            pCtx->HystX[slot]     = fingerNormX[i];
-            pCtx->HystY[slot]     = fingerNormY[i];
+            TraceEvents(TRACE_LEVEL_VERBOSE, TRACE_INPUT,
+                "%!FUNC! slot=%d CONFIRMING -> ACTIVE", (INT)slot);
+
+            st->Phase = SLOT_ACTIVE;
+            st->HystX = fingerNormX[i];
+            st->HystY = fingerNormY[i];
         }
 
-        USHORT reportX = AmtApplyDeadzone(fingerNormX[i], &pCtx->HystX[slot]);
-        USHORT reportY = AmtApplyDeadzone(fingerNormY[i], &pCtx->HystY[slot]);
+        USHORT reportX = AmtApplyDeadzone(fingerNormX[i], &st->HystX);
+        USHORT reportY = AmtApplyDeadzone(fingerNormY[i], &st->HystY);
 
         if (reportSlots < PTP_MAX_CONTACT_POINTS) {
             f = (const struct TRACKPAD_FINGER*)(f_base + i * pCtx->DeviceInfo->tp_fsize);
@@ -283,9 +437,11 @@ AmtPtpProcessTouchFrame(
             reportSlots++;
         }
 
-        pCtx->LastNormX[slot] = reportX;
-        pCtx->LastNormY[slot] = reportY;
+        st->LastNormX = reportX;
+        st->LastNormY = reportY;
     }
 
     *pReportSlots = reportSlots;
+
+    AmtAssertSlotInvariants(pCtx);
 }

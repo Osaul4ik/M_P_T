@@ -101,25 +101,14 @@ typedef struct _DEVICE_CONTEXT
     // processing thread (PASSIVE_LEVEL).  No locking required.
     //
     // Lifecycle:
-    //   FREE → CONFIRMING → ACTIVE → PENDING_RELEASE → COOLDOWN → FREE
+    //   FREE -> CONFIRMING -> ACTIVE -> PENDING_RELEASE -> COOLDOWN -> FREE
     //
-    // SlotInUse         - slot is ACTIVE (finger confirmed, being reported)
-    // SlotPendingRelease- finger disappeared; hold 1 frame before freeing
-    // SlotCooldown      - just released; block reassignment for 1 frame
-    // SlotTipConfirmed  - consecutive tip-down frames (debounce counter)
-    // SlotFingerKey     - stable identity key (USB array index at first touch)
-    // LastNormX/Y       - last reported normalised coordinate (for lift event)
-    // HystX/Y           - hysteresis baseline (per-slot, ACTIVE gesture only)
+    // Consolidated into one SLOT_STATE struct per contact point (see
+    // include/Hid.h for the field layout and per-phase invariants).
+    // AmtAssertSlotInvariants() in InterruptTouch.c validates these
+    // invariants after every processed frame in debug builds.
     // ---------------------------------------------------------------
-    BOOLEAN             SlotInUse[PTP_MAX_CONTACT_POINTS];
-    BOOLEAN             SlotPendingRelease[PTP_MAX_CONTACT_POINTS];
-    UCHAR               SlotCooldown[PTP_MAX_CONTACT_POINTS];
-    UCHAR               SlotTipConfirmed[PTP_MAX_CONTACT_POINTS];
-    UCHAR               SlotFingerKey[PTP_MAX_CONTACT_POINTS];
-    USHORT              LastNormX[PTP_MAX_CONTACT_POINTS];
-    USHORT              LastNormY[PTP_MAX_CONTACT_POINTS];
-    USHORT              HystX[PTP_MAX_CONTACT_POINTS];
-    USHORT              HystY[PTP_MAX_CONTACT_POINTS];
+    SLOT_STATE          Slots[PTP_MAX_CONTACT_POINTS];
 
     // ---------------------------------------------------------------
     // Diagnostics (interlocked — safe from any level)
