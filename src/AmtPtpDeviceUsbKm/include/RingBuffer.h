@@ -62,6 +62,10 @@ static inline ULONG
 RingBufferCount(
     _In_ const USB_PACKET_RING* Ring)
 {
+    // Consumer reading WriteIndex — needs load-load barrier to ensure
+    // we see the producer's latest write (the producer uses KeMemoryBarrier
+    // before incrementing WriteIndex).
+    KeMemoryBarrier();
     return Ring->WriteIndex - Ring->ReadIndex;
 }
 
@@ -72,6 +76,11 @@ static inline BOOLEAN
 RingBufferIsEmpty(
     _In_ const USB_PACKET_RING* Ring)
 {
+    // Consumer: ensure we read the latest WriteIndex before checking.
+    // Without this barrier the producer's WriteIndex bump may not be
+    // visible, causing the consumer to falsely conclude the ring is empty
+    // and sleep forever (lost-wakeup hangs input devices).
+    KeMemoryBarrier();
     return Ring->WriteIndex == Ring->ReadIndex;
 }
 
@@ -82,6 +91,9 @@ static inline BOOLEAN
 RingBufferIsFull(
     _In_ const USB_PACKET_RING* Ring)
 {
+    // Producer: ensure we read the latest ReadIndex before checking.
+    // The consumer uses KeMemoryBarrier before incrementing ReadIndex.
+    KeMemoryBarrier();
     return (Ring->WriteIndex - Ring->ReadIndex) >= RING_CAPACITY;
 }
 

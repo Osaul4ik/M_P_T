@@ -133,7 +133,10 @@ Return Value:
 	);
 
 	WdfFdoInitSetFilter(DeviceInit);
-	WdfPdoInitAllowForwardingRequestToParent(DeviceInit);
+	// CRITICAL BUG FIX: WdfPdoInitAllowForwardingRequestToParent() is PDO-only
+	// and MUST NOT be called on an FDO DeviceInit. Doing so corrupts WDF
+	// device initialization, causing driver install hangs and unresponsive
+	// input devices. This FDO (filter driver) does not need it.
 
     status = AmtPtpDeviceUsbKmCreateDevice(DeviceInit);
 

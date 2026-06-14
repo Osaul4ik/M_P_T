@@ -280,29 +280,45 @@ ProcThreadBody(
         {
             // Drain ring before exiting so no packet is silently lost
             // when the ring still has data right at shutdown.
+            // If no HID request is pending, just discard the slot rather than
+            // busy-wait — otherwise ProcThreadStop would deadlock waiting for
+            // this thread.
             RING_SLOT* slot;
             while ((slot = RingBufferPeek(&pCtx->RingBuffer)) != NULL) {
-                ProcThreadBuildAndDeliver(pCtx, slot->Data, slot->Length);
+                if (!ProcThreadBuildAndDeliver(pCtx, slot->Data, slot->Length)) {
+                    // No HID request — discard the remaining bits so we can exit.
+                    while ((slot = RingBufferPeek(&pCtx->RingBuffer)) != NULL) {
+                        InterlockedIncrement(&pCtx->DroppedPackets);
+                        RingBufferConsumed(&pCtx->RingBuffer);
+                    }
+                    break;
+                }
                 RingBufferConsumed(&pCtx->RingBuffer);
             }
             break;
         }
 
-        // STATUS_WAIT_0 — ProcEvent fired.  Drain all pending slots.
-        RING_SLOT* slot;
-        while ((slot = RingBufferPeek(&pCtx->RingBuffer)) != NULL) {
-            BOOLEAN delivered = ProcThreadBuildAndDeliver(
-                pCtx, slot->Data, slot->Length);
-            if (!delivered) {
-                // No HID request available.
-                // Leave this slot in the ring — we'll retry when the next
-                // packet arrives (which re-signals ProcEvent) or when the
-                // HID stack posts a new read request and the driver calls
-                // ProcThreadSignal from AmtPtpDispatchReadReportRequests.
-                break;
-            }
-            RingBufferConsumed(&pCtx->RingBuffer);
+    // STATUS_WAIT_0 — ProcEvent fired.  Drain all pending slots.
+    // Also check StopEvent inside the loop: if both events were set,
+    // KeWaitForMultipleObjects returns STATUS_WAIT_0 (ProcEvent has
+    // lower index), so we MUST poll StopEvent here to avoid a
+    // busy-spin on the ring when shutdown is requested.
+    RING_SLOT* slot;
+    while ((slot = RingBufferPeek(&pCtx->RingBuffer)) != NULL &&
+           !KeReadStateEvent(&pCtx->StopEvent))
+    {
+        BOOLEAN delivered = ProcThreadBuildAndDeliver(
+            pCtx, slot->Data, slot->Length);
+        if (!delivered) {
+            // No HID request available.
+            // Leave this slot in the ring — we'll retry when the next
+            // packet arrives (which re-signals ProcEvent) or when the
+            // HID stack posts a new read request and the driver calls
+            // ProcThreadSignal from AmtPtpDispatchReadReportRequests.
+            break;
         }
+        RingBufferConsumed(&pCtx->RingBuffer);
+    }
     }
 
     TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DRIVER,
