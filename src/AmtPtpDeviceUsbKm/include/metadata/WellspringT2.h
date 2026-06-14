@@ -17,23 +17,24 @@
 		/* End of a byte */ \
 		/* Begin of 4 bytes */ \
 		REPORT_COUNT, 0x01, /* Report Count: 1 */ \
-		REPORT_SIZE, 0x20, /* Report Size: 0x20 (4 bytes) -- Windows PTP spec: ContactID is 32-bit */ \
-		LOGICAL_MAXIMUM_3, 0xff, 0xff, 0xff, 0x7f, /* Logical Maximum: 0x7FFFFFFF */ \
-		USAGE, 0x51, /* Usage: Contact Identifier */ \
+		REPORT_SIZE, 0x20, /* Report Size: 0x10 (2 bytes) */ \
+		LOGICAL_MAXIMUM_3, 0xff, 0xff, 0xff, 0xff, /* Logical Maximum: 0xffffffff */ \
+		USAGE, 0x51, /* Usage: Contract Identifier */ \
 		INPUT, 0x02, /* Input: (Data, Var, Abs) */ \
 		/* End of 4 bytes */ \
-		/* Begin of 4 bytes (X+Y) */ \
+		/* Begin of 4 bytes */ \
+		/* Size is hard-coded at this moment */ \
 		USAGE_PAGE, 0x01, /* Usage Page: Generic Desktop */ \
+		LOGICAL_MAXIMUM_2, 0x20, 0x4e, /* Logical Maximum: 20000 (See defintion) */ \
 		REPORT_SIZE, 0x10, /* Report Size: 0x10 (2 bytes) */ \
-		REPORT_COUNT, 0x01, /* Report Count: 1 */ \
-		LOGICAL_MAXIMUM_2, 0x20, 0x4e, /* Logical Maximum: 20000 */ \
 		UNIT_EXPONENT, 0x0e, /* Unit exponent: -2 */ \
 		UNIT, 0x11, /* Unit: SI Length (cm) */ \
 		USAGE, 0x30, /* Usage: X */ \
-		PHYSICAL_MAXIMUM_2, 0x14, 0x05, /* Physical Maximum: 1300 */ \
+		PHYSICAL_MAXIMUM_2, 0x14, 0x05, /* Physical Maximum: 1300 (See Apple Spec) */ \
+		REPORT_COUNT, 0x01, /* Report count: 1 */ \
 		INPUT, 0x02, /* Input: (Data, Var, Abs) */ \
-		PHYSICAL_MAXIMUM_2, 0x52, 0x03, /* Physical Maximum: 850 */ \
-		LOGICAL_MAXIMUM_2, 0xe0, 0x2e, /* Logical Maximum: 12000 */ \
+		PHYSICAL_MAXIMUM_2, 0x52, 0x03, /* Physical Maximum: 850 (See Apple Spec) */ \
+		LOGICAL_MAXIMUM_2, 0xe0, 0x2e, /* Logical Maximum: 12000 (See definition) */ \
 		USAGE, 0x31, /* Usage: Y */ \
 		INPUT, 0x02, /* Input: (Data, Var, Abs) */ \
 		PHYSICAL_MAXIMUM, 0x00, /* Physical Maximum: 0 */ \
@@ -57,104 +58,74 @@
 		/* End of a byte */ \
 		/* Begin of 4 bytes */ \
 		REPORT_COUNT, 0x01, /* Report Count: 1 */ \
-		REPORT_SIZE, 0x20, /* Report Size: 0x20 (4 bytes) -- Windows PTP spec: ContactID is 32-bit */ \
-		LOGICAL_MAXIMUM_3, 0xff, 0xff, 0xff, 0x7f, /* Logical Maximum: 0x7FFFFFFF */ \
-		USAGE, 0x51, /* Usage: Contact Identifier */ \
+		REPORT_SIZE, 0x20, /* Report Size: 0x10 (2 bytes) */ \
+		LOGICAL_MAXIMUM_3, 0xff, 0xff, 0xff, 0xff, /* Logical Maximum: 0xffffffff */ \
+		USAGE, 0x51, /* Usage: Contract Identifier */ \
 		INPUT, 0x02, /* Input: (Data, Var, Abs) */ \
 		/* End of 4 bytes */ \
-		/* Begin of 4 bytes (X+Y) */ \
+		/* Begin of 4 bytes */ \
+		/* Size is hard-coded at this moment */ \
 		USAGE_PAGE, 0x01, /* Usage Page: Generic Desktop */ \
+		LOGICAL_MAXIMUM_2, 0x20, 0x4e, /* Logical Maximum: 20000 (See defintion) */ \
 		REPORT_SIZE, 0x10, /* Report Size: 0x10 (2 bytes) */ \
-		REPORT_COUNT, 0x01, /* Report Count: 1 */ \
-		LOGICAL_MAXIMUM_2, 0x20, 0x4e, /* Logical Maximum: 20000 */ \
 		UNIT_EXPONENT, 0x0e, /* Unit exponent: -2 */ \
 		UNIT, 0x11, /* Unit: SI Length (cm) */ \
 		USAGE, 0x30, /* Usage: X */ \
-		PHYSICAL_MAXIMUM_2, 0x14, 0x05, /* Physical Maximum: 1045 */ \
+		PHYSICAL_MAXIMUM_2, 0x14, 0x05, /* Physical Maximum: 1045 (See Apple Spec) */ \
+		REPORT_COUNT, 0x01, /* Report count: 1 */ \
 		INPUT, 0x02, /* Input: (Data, Var, Abs) */ \
-		PHYSICAL_MAXIMUM_2, 0x52, 0x03, /* Physical Maximum: 750 */ \
-		LOGICAL_MAXIMUM_2, 0xe0, 0x2e, /* Logical Maximum: 12000 */ \
+		PHYSICAL_MAXIMUM_2, 0x52, 0x03, /* Physical Maximum: 750 (See Apple Spec) */ \
+		LOGICAL_MAXIMUM_2, 0xe0, 0x2e, /* Logical Maximum: 12000 (See definition) */ \
 		USAGE, 0x31, /* Usage: Y */ \
 		INPUT, 0x02, /* Input: (Data, Var, Abs) */ \
 		/* End of 4 bytes */ \
 	END_COLLECTION /* End Collection */ \
 
-/*
- * Windows Precision Touchpad HID descriptor — T2 controller.
- *
- * Layout per the Windows PTP HID protocol specification:
- *   ReportID (1 byte)
- *   5 × Finger (9 bytes each = 45 bytes)
- *   ActualCount (1 byte)       — how many slots have meaningful data
- *   ScanTime   (2 bytes)
- *   ContactCount (1 byte)
- *   Button     (1 byte)
- *   Total: 51 bytes
- *
- * NOTE: The descriptor exposes 5 finger collections statically (required
- * by PTP spec), but the TotalContacts field is derived from
- * PTP_MAX_CONTACT_POINTS (5).  ActualCount tells the host that only
- * reportSlots of them carry valid data in any given report.
- */
+/* ORIGINAL WORKING HID DESCRIPTOR
+   Do NOT modify! This descriptor matches what Windows HID parser
+   and the existing PTP_REPORT struct expect.
+   Layout (50 bytes): ReportID(1) + Contacts[5](45) + ScanTime(2) + ContactCount(1) + Button(1) */
 #define AAPL_WELLSPRING_T2_PTP_TLC \
 	USAGE_PAGE, 0x0d, /* Usage Page: Digitizer */ \
 	USAGE, 0x05, /* Usage: Touch Pad */ \
 	BEGIN_COLLECTION, 0x01, /* Begin Collection: Application */ \
 		REPORT_ID, REPORTID_MULTITOUCH, /* Report ID: Multi-touch */ \
-		/* --- 5 finger slots --- */ \
 		USAGE, 0x22, /* Usage: Finger */ \
-		AAPL_WELLSPRING_T2_PTP_FINGER_COLLECTION_1, /* Slot 0 */ \
+		AAPL_WELLSPRING_T2_PTP_FINGER_COLLECTION_1, /* 1 */ \
 		USAGE_PAGE, 0x0d, /* Usage Page: Digitizer */ \
 		USAGE, 0x22, /* Usage: Finger */ \
-		AAPL_WELLSPRING_T2_PTP_FINGER_COLLECTION_1, /* Slot 1 */ \
+		AAPL_WELLSPRING_T2_PTP_FINGER_COLLECTION_1, /* 2 */ \
 		USAGE_PAGE, 0x0d, /* Usage Page: Digitizer */ \
 		USAGE, 0x22, /* Usage: Finger */ \
-		AAPL_WELLSPRING_T2_PTP_FINGER_COLLECTION_2, /* Slot 2 */ \
+		AAPL_WELLSPRING_T2_PTP_FINGER_COLLECTION_2, /* 3 */ \
 		USAGE_PAGE, 0x0d, /* Usage Page: Digitizer */ \
 		USAGE, 0x22, /* Usage: Finger */ \
-		AAPL_WELLSPRING_T2_PTP_FINGER_COLLECTION_1, /* Slot 3 */ \
+		AAPL_WELLSPRING_T2_PTP_FINGER_COLLECTION_1, /* 4 */ \
 		USAGE_PAGE, 0x0d, /* Usage Page: Digitizer */ \
 		USAGE, 0x22, /* Usage: Finger */ \
-		AAPL_WELLSPRING_T2_PTP_FINGER_COLLECTION_2, /* Slot 4 */ \
-		/* --- ActualCount --- */ \
+		AAPL_WELLSPRING_T2_PTP_FINGER_COLLECTION_2, /* 5 */ \
 		USAGE_PAGE, 0x0d, /* Usage Page: Digitizer */ \
-		REPORT_SIZE, 0x08, /* Report Size: 8 bits */ \
-		REPORT_COUNT, 0x01, /* Report Count: 1 */ \
-		LOGICAL_MINIMUM, 0x00, \
-		LOGICAL_MAXIMUM, PTP_MAX_CONTACT_POINTS, \
-		USAGE, 0x57, /* Usage: Actual Count */ \
-		INPUT, 0x02, /* Input: (Data, Var, Abs) */ \
-		/* --- ScanTime --- */ \
-		REPORT_SIZE, 0x10, /* Report Size: 16 bits */ \
-		REPORT_COUNT, 0x01, \
 		UNIT_EXPONENT, 0x0c, /* Unit exponent: -4 */ \
 		UNIT_2, 0x01, 0x10, /* Time: Second */ \
-		PHYSICAL_MAXIMUM_2, 0xFF, 0x7F, \
-		LOGICAL_MAXIMUM_2, 0xFF, 0x7F, \
+		PHYSICAL_MAXIMUM_3, 0xff, 0xff, 0x00, 0x00, \
+		LOGICAL_MAXIMUM_3, 0xff, 0xff, 0x00, 0x00, \
 		USAGE, 0x56, /* Usage: Scan Time */ \
 		INPUT, 0x02, /* Input: (Data, Var, Abs) */ \
-		/* --- ContactCount (total contacts in frame) --- */ \
-		REPORT_SIZE, 0x08, \
-		REPORT_COUNT, 0x01, \
 		USAGE, 0x54, /* Usage: Contact Count */ \
-		LOGICAL_MINIMUM, 0x00, \
-		LOGICAL_MAXIMUM, PTP_MAX_CONTACT_POINTS, \
+		LOGICAL_MAXIMUM, 0x7f, \
+		REPORT_SIZE, 0x08, \
 		INPUT, 0x02, /* Input: (Data, Var, Abs) */ \
-		/* --- Button --- */ \
 		USAGE_PAGE, 0x09, /* Usage Page: Button */ \
 		USAGE, 0x01, /* Button 1 */ \
-		LOGICAL_MINIMUM, 0x00, \
 		LOGICAL_MAXIMUM, 0x01, \
 		REPORT_SIZE, 0x01, \
-		REPORT_COUNT, 0x01, \
 		INPUT, 0x02, /* Input: (Data, Var, Abs) */ \
 		REPORT_COUNT, 0x07, \
 		INPUT, 0x03, /* Input: (Const, Var, Abs) */ \
-		/* --- Feature reports --- */ \
-		USAGE_PAGE, 0x0d, \
+		USAGE_PAGE, 0x0d, /* Usage Page: Digitizer */ \
 		REPORT_ID, REPORTID_DEVICE_CAPS, \
-		USAGE, 0x55, /* Usage: Maximum Contact Points */ \
-		USAGE, 0x59, /* Usage: Touchpad Button Type */ \
+		USAGE, 0x55, /* Usage: Maximum Contacts */ \
+		USAGE, 0x59, /* Usage: Touchpad Button Type*/ \
 		LOGICAL_MINIMUM, 0x00, \
 		LOGICAL_MAXIMUM_2, 0xff, 0x00, \
 		REPORT_SIZE, 0x08, \

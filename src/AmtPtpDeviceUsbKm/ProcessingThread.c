@@ -213,10 +213,8 @@ ProcThreadBuildAndDeliver(
         raw_n = ((size_t)NumBytes - headerSize) / fingerSize;
         if (raw_n > PTP_MAX_CONTACT_POINTS) raw_n = PTP_MAX_CONTACT_POINTS;
         AmtPtpProcessTouchFrame(pCtx, TouchBuffer, raw_n, &ptpReport, &reportSlots);
-        ptpReport.ActualCount   = reportSlots;   // how many slots carry valid data
         ptpReport.ContactCount  = reportSlots;
     } else {
-        ptpReport.ActualCount   = 0;
         ptpReport.ContactCount  = 0;
     }
 

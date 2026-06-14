@@ -207,18 +207,19 @@ typedef struct _PTP_CONTACT {
  * PTP input report — must match HID descriptor layout:
  *   ReportID       1 byte
  *   Contacts[5]   45 bytes (9 bytes each)
- *   ActualCount    1 byte
  *   ScanTime       2 bytes
  *   ContactCount   1 byte
  *   IsButtonClicked 1 byte
- *   Total:        51 bytes
+ *   Total:        50 bytes
+ *
+ * NOTE: No ActualCount field — the HID descriptor does not expose one.
+ * Windows uses ContactCount to determine how many contacts are valid.
  */
 #pragma pack(push)
 #pragma pack(1)
 typedef struct _PTP_REPORT {
 	UCHAR       ReportID;
 	PTP_CONTACT Contacts[5];    // 5 × 9 = 45 bytes
-	UCHAR       ActualCount;    // how many contacts are valid
 	USHORT      ScanTime;
 	UCHAR       ContactCount;
 	UCHAR       IsButtonClicked;
