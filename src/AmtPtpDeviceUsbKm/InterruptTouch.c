@@ -133,48 +133,48 @@ AmtSmoothCoord(
 // Returns TRUE if the finger is likely a palm and should be suppressed.
 //
 static inline BOOLEAN
-AmtIsPalm(
+static inline BOOLEAN AmtIsPalm(
     _In_ const struct TRACKPAD_FINGER* f,
     _In_ const struct BCM5974_CONFIG* devInfo,
     _In_ USHORT normX,
     _In_ USHORT normY)
 {
-    // 1. Absolute size check: if touch_major is huge (≥250), it's a palm
-    //    or the edge of the thumb.  Typical fingertip values are 100–200.
+    INT score = 0;
+
+    // 1. size (soft, NOT hard reject)
     if (f->touch_major >= PALM_MAJOR_THRESHOLD) {
-        return TRUE;
+        score += 40;
+    } else if (f->touch_major > 180) {
+        score += 20;
     }
 
-    // 2. Aspect ratio: palm is elongated (oval), finger is round.
-    //    If minor > 0, ratio = major / minor.  Only reject when both
-    //    the aspect ratio is extreme AND the finger is fairly large
-    //    (touch_major > 80) to avoid rejecting small elongated noise.
+    // 2. aspect ratio (soft penalty only)
     if (f->touch_minor > 0 && f->touch_major > 80) {
-        INT ratio = (INT)f->touch_major / (INT)f->touch_minor;
-        if (ratio >= PALM_ASPECT_RATIO_THRESHOLD) {
-            return TRUE;
-        }
+        INT ratio = (INT)f->touch_major * 100 / (INT)f->touch_minor;
+
+        if (ratio > 900) score += 15;
+        else if (ratio > 600) score += 8;
     }
 
-    // 3. Edge zones: only reject fingers very close to the absolute edge
-    //    (3% margin) AND that are also somewhat large — a small fingertip
-    //    near the edge (e.g., reaching for a scrollbar) should still work.
-    if (f->touch_major > 120) {
+    // 3. edge (soft penalty, not reject)
+    if (f->touch_major > 140) {
         INT xRange = devInfo->x.max - devInfo->x.min;
         INT yRange = devInfo->y.max - devInfo->y.min;
-        INT edgePctX = xRange / 32;  // ~3% from each edge
+
+        INT edgePctX = xRange / 32;
         INT edgePctY = yRange / 32;
 
-        if (normX < (USHORT)edgePctX ||
-            normX > (USHORT)(xRange - edgePctX) ||
-            normY < (USHORT)edgePctY ||
-            normY > (USHORT)(yRange - edgePctY))
+        if (normX < edgePctX ||
+            normX > (xRange - edgePctX) ||
+            normY < edgePctY ||
+            normY > (yRange - edgePctY))
         {
-            return TRUE;
+            score += 10;
         }
     }
 
-    return FALSE;
+    // FINAL DECISION
+    return (score >= 60);
 }
 
 static inline INT
