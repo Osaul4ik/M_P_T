@@ -32,7 +32,12 @@
     <ClCompile Include="Driver.c" />
     <ClCompile Include="Hid.c" />
     <ClCompile Include="Interrupt.c" />
-    <ClCompile Include="InterruptTouch.c" />
+    <ClCompile Include="InterruptTouch.c">
+      <WppEnabled>true</WppEnabled>
+      <WppRecorderEnabled>true</WppRecorderEnabled>
+      <WppScanConfigurationData>trace.h</WppScanConfigurationData>
+      <WppKernelMode>true</WppKernelMode>
+    </ClCompile>
     <ClCompile Include="Queue.c" />
   </ItemGroup>
   <ItemGroup>
