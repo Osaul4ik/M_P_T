@@ -1,20 +1,27 @@
-// Interrupt.c: USB interrupt pipe setup and the top-level read-complete
-// callback. Per-finger slot tracking lives in InterruptTouch.c
-// (AmtPtpProcessTouchFrame).
+// Interrupt.c - USB interrupt pipe setup and the minimal read-complete callback.
+//
+// The callback does exactly three things at DISPATCH_LEVEL:
+//   1. Validate packet geometry.
+//   2. Copy raw bytes into the ring buffer (RingBufferWrite).
+//   3. Signal the processing thread (ProcThreadSignal / KeSetEvent).
+//
+// All state-machine work, coordinate normalisation, hysteresis, and HID
+// request completion happen in ProcessingThread.c at PASSIVE_LEVEL.
 
 #include "Driver.h"
 #include "Interrupt.tmh"
+#include "include/ProcessingThread.h"
 
-// ---- continuous-reader configuration ----------------------------------------
+// ---- continuous-reader configuration ---------------------------------------
 
 _IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
 AmtPtpConfigContReaderForInterruptEndPoint(
     _In_ PDEVICE_CONTEXT DeviceContext)
 {
-    WDF_USB_CONTINUOUS_READER_CONFIG contReaderConfig;
+    WDF_USB_CONTINUOUS_READER_CONFIG cfg;
+    size_t   transferLength = 0;
     NTSTATUS status;
-    size_t transferLength = 0;
 
     TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DRIVER, "%!FUNC! Entry");
 
@@ -27,21 +34,32 @@ AmtPtpConfigContReaderForInterruptEndPoint(
     }
 
     if (transferLength == 0) {
+        TraceEvents(TRACE_LEVEL_ERROR, TRACE_DRIVER,
+            "%!FUNC! Unknown tp_type %d", DeviceContext->DeviceInfo->tp_type);
         status = STATUS_UNKNOWN_REVISION;
         goto exit;
     }
 
+    // Guard: the ring slot must be large enough for one full USB frame.
+    if (transferLength > RING_PACKET_MAX_SIZE) {
+        TraceEvents(TRACE_LEVEL_ERROR, TRACE_DRIVER,
+            "%!FUNC! transferLength=%llu exceeds RING_PACKET_MAX_SIZE=%d",
+            (ULONG64)transferLength, RING_PACKET_MAX_SIZE);
+        NT_ASSERTMSG("Increase RING_PACKET_MAX_SIZE", FALSE);
+        status = STATUS_BUFFER_OVERFLOW;
+        goto exit;
+    }
+
     WDF_USB_CONTINUOUS_READER_CONFIG_INIT(
-        &contReaderConfig,
+        &cfg,
         AmtPtpEvtUsbInterruptPipeReadComplete,
         DeviceContext,
         transferLength);
 
-    contReaderConfig.EvtUsbTargetPipeReadersFailed = AmtPtpEvtUsbInterruptReadersFailed;
+    cfg.EvtUsbTargetPipeReadersFailed = AmtPtpEvtUsbInterruptReadersFailed;
 
     status = WdfUsbTargetPipeConfigContinuousReader(
-        DeviceContext->InterruptPipe,
-        &contReaderConfig);
+        DeviceContext->InterruptPipe, &cfg);
 
     if (!NT_SUCCESS(status)) {
         TraceEvents(TRACE_LEVEL_ERROR, TRACE_DRIVER,
@@ -49,13 +67,16 @@ AmtPtpConfigContReaderForInterruptEndPoint(
     }
 
 exit:
-    TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DRIVER, "%!FUNC! Exit");
-    // Always return SUCCESS: the framework drops all frames if this returns
-    // failure, which is worse than running with a bad transfer length.
-    return STATUS_SUCCESS;
+    TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DRIVER, "%!FUNC! Exit %!STATUS!", status);
+    // Return SUCCESS: framework drops all future frames if this fails, which
+    // is worse than a bad transfer-length guess.
+    return NT_SUCCESS(status) ? STATUS_SUCCESS : status;
 }
 
-// ---- interrupt completion routine -------------------------------------------
+// ---- interrupt completion routine ------------------------------------------
+//
+// Called at DISPATCH_LEVEL by the framework continuous reader.
+// MUST return as fast as possible.
 
 VOID
 AmtPtpEvtUsbInterruptPipeReadComplete(
@@ -66,100 +87,43 @@ AmtPtpEvtUsbInterruptPipeReadComplete(
 {
     UNREFERENCED_PARAMETER(Pipe);
 
-    PDEVICE_CONTEXT         pCtx       = Context;
-    const size_t            headerSize = (size_t)pCtx->DeviceInfo->tp_header;
-    const size_t            fingerSize = (size_t)pCtx->DeviceInfo->tp_fsize;
-    size_t                  raw_n;
+    PDEVICE_CONTEXT pCtx = (PDEVICE_CONTEXT)Context;
+    UCHAR*          raw;
+    BOOLEAN         written;
 
-    UCHAR*                  TouchBuffer;
-    LARGE_INTEGER           CurrentPerfCounter;
-    LONGLONG                PerfCounterDelta;
-    NTSTATUS                Status;
-    PTP_REPORT              PtpReport;
-    UCHAR                   reportSlots = 0;
-
-    WDFREQUEST              Request;
-    WDFMEMORY               RequestMemory;
-
-    // ---- basic packet validation ----------------------------------------
-    if (NumBytesTransferred < headerSize ||
-        (NumBytesTransferred - headerSize) % fingerSize != 0) {
-        TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DRIVER,
-            "%!FUNC! Malformed packet, length=%llu — dropped", NumBytesTransferred);
+    // Empty frame — nothing to do.
+    if (NumBytesTransferred == 0) {
         return;
     }
 
-    TouchBuffer = WdfMemoryGetBuffer(Buffer, NULL);
-    if (TouchBuffer == NULL) {
-        TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DRIVER,
-            "%!FUNC! NULL TouchBuffer — dropped");
+    // Quick geometry check: must be at least a header.
+    if (NumBytesTransferred < (size_t)pCtx->DeviceInfo->tp_header) {
+        TraceEvents(TRACE_LEVEL_WARNING, TRACE_DRIVER,
+            "%!FUNC! Short packet len=%llu < header=%d — dropped",
+            (ULONG64)NumBytesTransferred, pCtx->DeviceInfo->tp_header);
         return;
     }
 
-    // ---- dequeue pending HID read request -------------------------------
-    Status = WdfIoQueueRetrieveNextRequest(pCtx->InputQueue, &Request);
-    if (!NT_SUCCESS(Status)) {
-        TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DRIVER,
-            "%!FUNC! No pending PTP request — dropped");
+    raw = (UCHAR*)WdfMemoryGetBuffer(Buffer, NULL);
+    if (raw == NULL) {
         return;
     }
 
-    Status = WdfRequestRetrieveOutputMemory(Request, &RequestMemory);
-    if (!NT_SUCCESS(Status)) {
-        TraceEvents(TRACE_LEVEL_ERROR, TRACE_DRIVER,
-            "%!FUNC! WdfRequestRetrieveOutputMemory failed %!STATUS!", Status);
-        WdfRequestComplete(Request, Status);
+    // Attempt to enqueue.  If the ring is full the packet is dropped.
+    written = RingBufferWrite(&pCtx->RingBuffer, raw, (ULONG)NumBytesTransferred);
+    if (!written) {
+        InterlockedIncrement(&pCtx->DroppedPackets);
+        TraceEvents(TRACE_LEVEL_WARNING, TRACE_INPUT,
+            "%!FUNC! Ring full — packet dropped (total dropped=%d)",
+            pCtx->DroppedPackets);
         return;
     }
 
-    // ---- prepare report skeleton ----------------------------------------
-    RtlZeroMemory(&PtpReport, sizeof(PTP_REPORT));
-    PtpReport.ReportID        = REPORTID_MULTITOUCH;
-    PtpReport.IsButtonClicked = 0;
-
-    // Scan time in 100 µs units, clamped to USHORT.
-    KeQueryPerformanceCounter(&CurrentPerfCounter);
-    PerfCounterDelta = (CurrentPerfCounter.QuadPart -
-                        pCtx->LastReportTime.QuadPart) / 100;
-    if (PerfCounterDelta > 0xFF) PerfCounterDelta = 0xFF;
-    PtpReport.ScanTime = (USHORT)PerfCounterDelta;
-
-    // ---- touch contacts (slot state machine in InterruptTouch.c) --------
-    if (pCtx->PtpReportTouch) {
-        raw_n = (NumBytesTransferred - headerSize) / fingerSize;
-        if (raw_n > PTP_MAX_CONTACT_POINTS) raw_n = PTP_MAX_CONTACT_POINTS;
-
-        AmtPtpProcessTouchFrame(pCtx, TouchBuffer, raw_n, &PtpReport, &reportSlots);
-        PtpReport.ContactCount = reportSlots;
-    }
-
-    // ---- button ---------------------------------------------------------
-    if (pCtx->PtpReportButton) {
-        if (TouchBuffer[pCtx->DeviceInfo->tp_button]) {
-            PtpReport.IsButtonClicked = TRUE;
-            TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_INPUT,
-                "%!FUNC! Trackpad button clicked");
-        }
-    }
-
-    // ---- write report back to HID stack ---------------------------------
-    pCtx->LastReportTime = CurrentPerfCounter;
-
-    Status = WdfMemoryCopyFromBuffer(
-        RequestMemory, 0, (PVOID)&PtpReport, sizeof(PTP_REPORT));
-
-    if (!NT_SUCCESS(Status)) {
-        TraceEvents(TRACE_LEVEL_ERROR, TRACE_DRIVER,
-            "%!FUNC! WdfMemoryCopyFromBuffer failed %!STATUS!", Status);
-        WdfRequestComplete(Request, Status);
-        return;
-    }
-
-    WdfRequestSetInformation(Request, sizeof(PTP_REPORT));
-    WdfRequestComplete(Request, Status);
+    // Wake the processing thread.
+    ProcThreadSignal(pCtx);
 }
 
-// ---- reader failure callback ------------------------------------------------
+// ---- reader failure callback -----------------------------------------------
 
 BOOLEAN
 AmtPtpEvtUsbInterruptReadersFailed(
@@ -168,8 +132,10 @@ AmtPtpEvtUsbInterruptReadersFailed(
     _In_ USBD_STATUS UsbdStatus)
 {
     UNREFERENCED_PARAMETER(Pipe);
-    UNREFERENCED_PARAMETER(Status);
-    UNREFERENCED_PARAMETER(UsbdStatus);
 
-    return TRUE;  // restart the reader
+    TraceEvents(TRACE_LEVEL_ERROR, TRACE_DRIVER,
+        "%!FUNC! USB reader failed NTSTATUS=%!STATUS! USBD=0x%08x",
+        Status, UsbdStatus);
+
+    return TRUE;  // ask the framework to restart the reader
 }
