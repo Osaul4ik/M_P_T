@@ -75,7 +75,8 @@ typedef struct _DEVICE_CONTEXT
     UCHAR               SlotFingerKey[PTP_MAX_CONTACT_POINTS];    // finger identity (USB array index at first touch)
 
     // Last reported normalised coordinates — used for lift-event report so
-    // the final position is stable.
+    // the final position is stable. Scoped to a single ACTIVE gesture: see
+    // InterruptTouch.c header comment for the write/read/zero lifecycle.
     USHORT              LastNormX[PTP_MAX_CONTACT_POINTS];
     USHORT              LastNormY[PTP_MAX_CONTACT_POINTS];
 
@@ -137,6 +138,18 @@ AmtPtpConfigContReaderForInterruptEndPoint(
 //
 EVT_WDF_USB_READER_COMPLETION_ROUTINE AmtPtpEvtUsbInterruptPipeReadComplete;
 EVT_WDF_USB_READERS_FAILED            AmtPtpEvtUsbInterruptReadersFailed;
+
+//
+// Touch frame processing (slot state machine, InterruptTouch.c)
+//
+VOID
+AmtPtpProcessTouchFrame(
+    _In_ PDEVICE_CONTEXT pCtx,
+    _In_ UCHAR* TouchBuffer,
+    _In_ size_t raw_n,
+    _Inout_ PTP_REPORT* PtpReport,
+    _Inout_ UCHAR* pReportSlots
+);
 
 //
 // Debug utilities
