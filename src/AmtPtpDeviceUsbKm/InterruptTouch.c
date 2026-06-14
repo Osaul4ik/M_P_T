@@ -55,9 +55,11 @@
 #define REBIND_MIN_DELTA        30   // minimum absolute delta
 
 // Palm rejection: finger aspect ratio threshold (major/minor > this = palm)
-#define PALM_ASPECT_RATIO_THRESHOLD  3
-// Palm rejection: absolute major threshold (in raw units)
-#define PALM_MAJOR_THRESHOLD         (UCHAR)0x60
+// A typical fingertip has aspect ratio ~1.0–2.0; a palm is >3.0.
+#define PALM_ASPECT_RATIO_THRESHOLD  6
+// Palm rejection: absolute major threshold (in raw units).
+// Typical finger touch_major values are 100–200; palm/thumb values are 250+.
+#define PALM_MAJOR_THRESHOLD         250
 
 // Coordinate smoothing (exponential moving average) alpha factor.
 // Higher = more responsive, lower = smoother.
@@ -121,27 +123,31 @@ AmtIsPalm(
     _In_ USHORT normX,
     _In_ USHORT normY)
 {
-    // 1. Absolute size check: if touch_major is huge, it's a palm.
-    if (f->touch_major > PALM_MAJOR_THRESHOLD) {
+    // 1. Absolute size check: if touch_major is huge (≥250), it's a palm
+    //    or the edge of the thumb.  Typical fingertip values are 100–200.
+    if (f->touch_major >= PALM_MAJOR_THRESHOLD) {
         return TRUE;
     }
 
     // 2. Aspect ratio: palm is elongated (oval), finger is round.
-    //    If minor > 0, ratio = major / minor.
-    if (f->touch_minor > 0) {
+    //    If minor > 0, ratio = major / minor.  Only reject when both
+    //    the aspect ratio is extreme AND the finger is fairly large
+    //    (touch_major > 80) to avoid rejecting small elongated noise.
+    if (f->touch_minor > 0 && f->touch_major > 80) {
         INT ratio = (INT)f->touch_major / (INT)f->touch_minor;
         if (ratio >= PALM_ASPECT_RATIO_THRESHOLD) {
             return TRUE;
         }
     }
 
-    // 3. Edge zones: if the finger is very close to the edge of the
-    //    trackpad, it's likely part of a palm resting on the edge.
-    {
+    // 3. Edge zones: only reject fingers very close to the absolute edge
+    //    (3% margin) AND that are also somewhat large — a small fingertip
+    //    near the edge (e.g., reaching for a scrollbar) should still work.
+    if (f->touch_major > 120) {
         INT xRange = devInfo->x.max - devInfo->x.min;
         INT yRange = devInfo->y.max - devInfo->y.min;
-        INT edgePctX = xRange / 8;  // ~12.5% from each edge
-        INT edgePctY = yRange / 8;
+        INT edgePctX = xRange / 32;  // ~3% from each edge
+        INT edgePctY = yRange / 32;
 
         if (normX < (USHORT)edgePctX ||
             normX > (USHORT)(xRange - edgePctX) ||
