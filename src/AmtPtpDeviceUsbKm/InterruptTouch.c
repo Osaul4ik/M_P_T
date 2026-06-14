@@ -75,7 +75,7 @@
 #define PALM_ASPECT_RATIO_THRESHOLD  6
 // Palm rejection: absolute major threshold (in raw units).
 // Typical finger touch_major values are 100–200; palm/thumb values are 250+.
-#define PALM_MAJOR_THRESHOLD         250
+#define PALM_MAJOR_THRESHOLD         350
 
 // Coordinate smoothing (exponential moving average) alpha factor.
 // Higher = more responsive, lower = smoother.
@@ -133,7 +133,7 @@ AmtSmoothCoord(
 // Returns TRUE if the finger is likely a palm and should be suppressed.
 //
 static inline BOOLEAN
-static inline BOOLEAN AmtIsPalm(
+ AmtIsPalm(
     _In_ const struct TRACKPAD_FINGER* f,
     _In_ const struct BCM5974_CONFIG* devInfo,
     _In_ USHORT normX,
@@ -152,8 +152,8 @@ static inline BOOLEAN AmtIsPalm(
     if (f->touch_minor > 0 && f->touch_major > 80) {
         INT ratio = (INT)f->touch_major * 100 / (INT)f->touch_minor;
 
-        if (ratio > 900) score += 15;
-        else if (ratio > 600) score += 8;
+        if (ratio > 1100) score += 15;
+        else if (ratio > 800) score += 8;
     }
 
     // 3. edge (soft penalty, not reject)
@@ -169,12 +169,12 @@ static inline BOOLEAN AmtIsPalm(
             normY < edgePctY ||
             normY > (yRange - edgePctY))
         {
-            score += 10;
+            score += 3;
         }
     }
 
     // FINAL DECISION
-    return (score >= 60);
+    return (score >= 75);
 }
 
 static inline INT
