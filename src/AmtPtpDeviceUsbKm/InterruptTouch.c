@@ -522,7 +522,7 @@ AmtPtpProcessTouchFrame(
 
         if (justConfirmed) {
             TraceEvents(TRACE_LEVEL_VERBOSE, TRACE_INPUT,
-                "%!FUNC! slot=%d CONFIRMING -> ACTIVE", (INT)slot);
+                "%!FUNC! slot=%d CONFIRMING -> ACTIVE (ContactID=%lu)", (INT)slot, pCtx->NextContactID);
 
             st->Phase = SLOT_ACTIVE;
             st->HystX = fingerNormX[i];
@@ -530,6 +530,9 @@ AmtPtpProcessTouchFrame(
             // Seed the smoother with the first active position.
             st->SmoothedX = fingerNormX[i];
             st->SmoothedY = fingerNormY[i];
+            // Assign a globally unique ContactID so that Windows PTP
+            // can track this physical finger across frames.
+            st->ContactID = pCtx->NextContactID++;
         }
 
         USHORT reportX, reportY;
@@ -548,7 +551,12 @@ AmtPtpProcessTouchFrame(
             f = (const struct TRACKPAD_FINGER*)(f_base + i * pCtx->DeviceInfo->tp_fsize);
             BOOLEAN confidence = (AmtRawToInteger(f->touch_minor) << 1) > 0;
 
-            PtpReport->Contacts[reportSlots].ContactID  = slot;
+            // Use the stable ContactID assigned at CONFIRMING->ACTIVE.
+            // Using slot index as ContactID causes cursor jumps when
+            // a fast 2-finger tap is followed by a 1-finger tap, because
+            // the new finger reuses a slot whose old ContactID Windows
+            // still associates with the previous gesture's position.
+            PtpReport->Contacts[reportSlots].ContactID  = st->ContactID;
             PtpReport->Contacts[reportSlots].X          = reportX;
             PtpReport->Contacts[reportSlots].Y          = reportY;
             PtpReport->Contacts[reportSlots].TipSwitch  = 1;

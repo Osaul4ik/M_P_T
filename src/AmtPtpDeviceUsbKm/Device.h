@@ -111,6 +111,13 @@ typedef struct _DEVICE_CONTEXT
     SLOT_STATE          Slots[PTP_MAX_CONTACT_POINTS];
 
     // ---------------------------------------------------------------
+    // Stable ContactID allocator
+    // Monotonically incrementing counter for unique finger IDs.
+    // Written at PASSIVE_LEVEL (processing thread only).
+    // ---------------------------------------------------------------
+    ULONG               NextContactID;
+
+    // ---------------------------------------------------------------
     // Diagnostics (interlocked — safe from any level)
     // ---------------------------------------------------------------
     volatile LONG       DroppedPackets;   // incremented when ring is full

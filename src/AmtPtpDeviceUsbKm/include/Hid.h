@@ -138,6 +138,13 @@ typedef struct _SLOT_STATE {
 	// controller does not expose one. SLOT_KEY_NONE when not tracking.
 	UCHAR       FingerKey;
 
+	// Stable ContactID assigned at CONFIRMING->ACTIVE transition.
+	// Uses a monotonically increasing global counter so that every new
+	// contact gets a unique ID.  Windows PTP uses this to track physical
+	// fingers — if a new finger gets the same ContactID as an old one
+	// that just lifted, Windows may interpret it as a cursor jump.
+	ULONG       ContactID;
+
 	// Last reported normalised coordinate. Valid only while ACTIVE or
 	// PENDING_RELEASE; used for the lift report and as the reference
 	// point for Phase 2a-bis position-based rebind.
@@ -212,8 +219,8 @@ typedef struct _PTP_CONTACT {
  *   IsButtonClicked 1 byte
  *   Total:        50 bytes
  *
- * NOTE: No ActualCount field — the HID descriptor does not expose one.
- * Windows uses ContactCount to determine how many contacts are valid.
+ * ContactID is now a global counter, not slot index.
+ * See SLOT_STATE::ContactID and DEVICE_CONTEXT::NextContactID.
  */
 #pragma pack(push)
 #pragma pack(1)

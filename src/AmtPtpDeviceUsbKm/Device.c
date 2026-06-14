@@ -75,8 +75,13 @@ AmtPtpResetSlotState(
     RtlZeroMemory(pCtx->Slots, sizeof(pCtx->Slots));
 
     for (s = 0; s < PTP_MAX_CONTACT_POINTS; s++) {
-        pCtx->Slots[s].FingerKey = SLOT_KEY_NONE;
+        pCtx->Slots[s].FingerKey  = SLOT_KEY_NONE;
+        pCtx->Slots[s].ContactID  = 0;
     }
+
+    // Reset the global ContactID allocator so that IDs are unique
+    // within each D0 power cycle. 1-based so that 0 means "no contact".
+    pCtx->NextContactID = 1;
 }
 
 // ---- CreateDevice ----------------------------------------------------------
