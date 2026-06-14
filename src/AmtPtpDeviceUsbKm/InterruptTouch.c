@@ -46,7 +46,7 @@
 #define TIP_CONFIRM_FRAMES   2
 
 // Deadzone: hold last value if movement is below this many raw units.
-#define XY_DEADZONE_UNITS    2
+#define XY_DEADZONE_UNITS    1
 
 // Max position delta (raw units) allowed for a 2a-bis rebind. This catches a
 // USB-array index swap between two fingers in the same frame, which Phase 2a's
@@ -79,7 +79,7 @@
 
 // Coordinate smoothing (exponential moving average) alpha factor.
 // Higher = more responsive, lower = smoother.
-#define SMOOTHING_ALPHA_NUM  3   // numerator   (3/8 = 0.375)
+#define SMOOTHING_ALPHA_NUM  5   // numerator   (3/8 = 0.375)
 #define SMOOTHING_ALPHA_DEN  8   // denominator
 
 #define SLOT_NONE  ((UCHAR)PTP_MAX_CONTACT_POINTS)
