@@ -4,6 +4,16 @@
 #ifndef _AAPL_HID_DESCRIPTOR_H_
 #define _AAPL_HID_DESCRIPTOR_H_
 
+//
+// Static HQA certification blob — DEFAULT_PTP_HQA_BLOB is a macro that
+// expands to raw byte constants, not a pointer, so we need a named array
+// to pass to RtlCopyMemory.
+//
+static const UCHAR AmtPtpDefaultHqaBlob[256] = {
+    DEFAULT_PTP_HQA_BLOB
+};
+
+
 HID_REPORT_DESCRIPTOR AmtPtpT2ReportDescriptor[] = {
 	AAPL_WELLSPRING_T2_PTP_TLC,
 	AAPL_PTP_WINDOWS_CONFIGURATION_TLC,
@@ -397,9 +407,11 @@ AmtPtpReportFeatures(
 			PPTP_DEVICE_HQA_CERTIFICATION_REPORT certReport = (PPTP_DEVICE_HQA_CERTIFICATION_REPORT)pHidPacket->reportBuffer;
 			// BUG FIX: Use RtlCopyMemory to copy the entire HQA blob.
 			// The prior code used pointer-assignment which only set the first byte.
+			// DEFAULT_PTP_HQA_BLOB is a byte-initializer macro, not a pointer;
+			// AmtPtpDefaultHqaBlob is the proper static array.
 			RtlCopyMemory(
 				certReport->CertificationBlob,
-				DEFAULT_PTP_HQA_BLOB,
+				AmtPtpDefaultHqaBlob,
 				sizeof(certReport->CertificationBlob));
 			certReport->ReportID = REPORTID_PTPHQA;
 
