@@ -105,12 +105,25 @@ typedef UCHAR HID_REPORT_DESCRIPTOR, *PHID_REPORT_DESCRIPTOR;
 //
 //   FREE            : TipConfirmed==0, Cooldown==0, FingerKey==SLOT_KEY_NONE,
 //                      LastNormX/Y==0, HystX/Y==0
+//
 //   CONFIRMING      : 1 <= TipConfirmed < TIP_CONFIRM_FRAMES, Cooldown==0,
-//                      HystX/Y==0
+//                      HystX/Y==0.
+//                      NOTE: LastNormX/Y ARE non-zero in CONFIRMING — they
+//                      are seeded in Phase 2b (FREE->CONFIRMING) and updated
+//                      in Phase 4/5 on every subsequent confirm frame.  They
+//                      serve as the position reference for 2a-bis rebind and
+//                      for the soft-tap emission on CONFIRMING->FREE.
+//                      AmtAssertSlotInvariants does NOT require them to be 0
+//                      in CONFIRMING (unlike the earlier design).
+//
 //   ACTIVE          : TipConfirmed==TIP_CONFIRM_FRAMES, Cooldown==0,
 //                      FingerKey != SLOT_KEY_NONE
+//
 //   PENDING_RELEASE : TipConfirmed==0, Cooldown==0, HystX/Y==0,
-//                      FingerKey==SLOT_KEY_NONE
+//                      FingerKey==SLOT_KEY_NONE.
+//                      LastNormX/Y hold the last reported position and are
+//                      used for the lift report; zeroed on ->COOLDOWN.
+//
 //   COOLDOWN        : Cooldown>0, TipConfirmed==0, HystX/Y==0,
 //                      LastNormX/Y==0
 // ---------------------------------------------------------------------------
@@ -138,16 +151,21 @@ typedef struct _SLOT_STATE {
 	// controller does not expose one. SLOT_KEY_NONE when not tracking.
 	UCHAR       FingerKey;
 
-	// Stable ContactID assigned at CONFIRMING->ACTIVE transition.
+	// Stable ContactID assigned at CONFIRMING->ACTIVE transition (or
+	// synthesised by AmtEmitSoftTap for soft taps that never reach ACTIVE).
 	// Uses a monotonically increasing global counter so that every new
 	// contact gets a unique ID.  Windows PTP uses this to track physical
 	// fingers — if a new finger gets the same ContactID as an old one
 	// that just lifted, Windows may interpret it as a cursor jump.
 	ULONG       ContactID;
 
-	// Last reported normalised coordinate. Valid only while ACTIVE or
-	// PENDING_RELEASE; used for the lift report and as the reference
-	// point for Phase 2a-bis position-based rebind.
+	// Last reported normalised coordinate.
+	//   CONFIRMING    : seeded on FREE->CONFIRMING (Phase 2b), updated
+	//                   each confirm frame (Phase 4/5).  Used for 2a-bis
+	//                   rebind and soft-tap position.
+	//   ACTIVE        : updated every frame; used as rebind reference.
+	//   PENDING_RELEASE: holds last ACTIVE position for the lift report.
+	//   FREE/COOLDOWN : must be 0.
 	USHORT      LastNormX;
 	USHORT      LastNormY;
 

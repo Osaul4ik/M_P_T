@@ -18,6 +18,20 @@
 // combinations previously had to encode the FSM state implicitly.
 // AmtAssertSlotInvariants() validates FSM consistency after every frame
 // in debug builds.
+//
+// --- Soft Tap Fix ---
+// When TIP_CONFIRM_FRAMES > 1 a very brief touch (fewer frames than
+// TIP_CONFIRM_FRAMES) would be silently discarded: Phase 4/5 only emits
+// a contact once the slot is ACTIVE, but if the finger lifts before
+// enough confirm-frames accumulate, Phase 3 transitions CONFIRMING->FREE
+// without ever emitting anything.  Windows never sees a tap.
+//
+// Fix: on CONFIRMING->FREE, if TipConfirmed >= 1, synthesise a
+// compressed tap: emit one frame with TipSwitch=1 (tip-down) followed
+// immediately by a tip-up entry in the same report via PENDING_RELEASE.
+// Because both are in the same PTP_REPORT the HID stack sees them in
+// order and Windows registers a tap.  A ContactID is still allocated from
+// pCtx->NextContactID so Windows can track the contact correctly.
 
 #include "Driver.h"
 #include "InterruptTouch.tmh"
@@ -27,6 +41,8 @@
 #define TIP_MINOR_THRESHOLD  150
 
 // Consecutive tip-down frames required before a slot goes ACTIVE.
+// NOTE: soft tap emission on CONFIRMING->FREE handles the case where
+// the finger lifts before this count is reached (see above).
 #define TIP_CONFIRM_FRAMES   2
 
 // Deadzone: hold last value if movement is below this many raw units.
@@ -277,6 +293,78 @@ AmtGetRebindMaxDelta(
     return (adaptive < REBIND_MIN_DELTA) ? REBIND_MIN_DELTA : adaptive;
 }
 
+//
+// Emit a synthetic tap (tip-down + tip-up) for a slot that was in
+// CONFIRMING but lifted before reaching TIP_CONFIRM_FRAMES.
+//
+// Two contacts are appended to ptpReport:
+//   [reportSlots+0]: TipSwitch=1 (tip-down) at the slot's last known position
+//   [reportSlots+1]: TipSwitch=0 (tip-up)   at the same position
+//
+// Both share the same ContactID so Windows sees a clean tap gesture.
+//
+// The slot is immediately transitioned to COOLDOWN so no further processing
+// occurs for it this frame. LastNormX/Y are zeroed after use (COOLDOWN
+// invariant requires them to be 0).
+//
+// Returns the new reportSlots count (incremented by 0, 1, or 2 depending
+// on remaining capacity).
+//
+static UCHAR
+AmtEmitSoftTap(
+    _In_    PDEVICE_CONTEXT pCtx,
+    _In_    size_t          slot,
+    _In_    USHORT          normX,
+    _In_    USHORT          normY,
+    _Inout_ PTP_REPORT*     PtpReport,
+    _In_    UCHAR           reportSlots)
+{
+    PSLOT_STATE st = &pCtx->Slots[slot];
+    ULONG contactID;
+
+    // Assign a unique ContactID for this synthetic tap.
+    contactID = pCtx->NextContactID++;
+    st->ContactID = contactID;
+
+    TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_INPUT,
+        "%!FUNC! soft tap: slot=%llu normX=%u normY=%u ContactID=%lu",
+        (ULONG64)slot, normX, normY, contactID);
+
+    // Tip-down entry.
+    if (reportSlots < PTP_MAX_CONTACT_POINTS) {
+        PtpReport->Contacts[reportSlots].ContactID  = contactID;
+        PtpReport->Contacts[reportSlots].X          = normX;
+        PtpReport->Contacts[reportSlots].Y          = normY;
+        PtpReport->Contacts[reportSlots].TipSwitch  = 1;
+        PtpReport->Contacts[reportSlots].Confidence = 1;
+        reportSlots++;
+    }
+
+    // Tip-up entry immediately following — same report, next slot.
+    // Windows PTP processes contacts in array order within one report,
+    // so tip-down then tip-up in the same report constitutes a valid tap.
+    if (reportSlots < PTP_MAX_CONTACT_POINTS) {
+        PtpReport->Contacts[reportSlots].ContactID  = contactID;
+        PtpReport->Contacts[reportSlots].X          = normX;
+        PtpReport->Contacts[reportSlots].Y          = normY;
+        PtpReport->Contacts[reportSlots].TipSwitch  = 0;
+        PtpReport->Contacts[reportSlots].Confidence = 1;
+        reportSlots++;
+    }
+
+    // Transition to COOLDOWN — all fields must satisfy COOLDOWN invariant.
+    st->Phase        = SLOT_COOLDOWN;
+    st->Cooldown     = 2;
+    st->TipConfirmed = 0;
+    st->FingerKey    = SLOT_KEY_NONE;
+    st->HystX        = 0;
+    st->HystY        = 0;
+    st->LastNormX    = 0;    // COOLDOWN requires LastNormX == 0
+    st->LastNormY    = 0;    // COOLDOWN requires LastNormY == 0
+
+    return reportSlots;
+}
+
 VOID
 AmtPtpProcessTouchFrame(
     _In_    PDEVICE_CONTEXT pCtx,
@@ -437,6 +525,13 @@ AmtPtpProcessTouchFrame(
                     (ULONG64)s, (INT)i);
 
                 st->Phase = SLOT_CONFIRMING;
+                // Seed LastNormX/Y so 2a-bis can rebind on the next frame
+                // even if TipConfirmed hasn't reached ACTIVE yet.
+                // (Invariant checker allows LastNormX/Y to be non-zero in
+                //  CONFIRMING only when noted here — CONFIRMING invariant
+                //  in AmtAssertSlotInvariants does NOT require them to be 0.)
+                st->LastNormX = fingerNormX[i];
+                st->LastNormY = fingerNormY[i];
                 break;
             }
         }
@@ -452,12 +547,19 @@ AmtPtpProcessTouchFrame(
         case SLOT_PENDING_RELEASE:
             // PENDING_RELEASE -> emit lift, enter COOLDOWN.
             if (reportSlots < PTP_MAX_CONTACT_POINTS) {
-                PtpReport->Contacts[reportSlots].ContactID  = (UCHAR)s;
+                PtpReport->Contacts[reportSlots].ContactID  = st->ContactID;
                 PtpReport->Contacts[reportSlots].X          = st->LastNormX;
                 PtpReport->Contacts[reportSlots].Y          = st->LastNormY;
                 PtpReport->Contacts[reportSlots].TipSwitch  = 0;
                 PtpReport->Contacts[reportSlots].Confidence = 1;
                 reportSlots++;
+            } else {
+                // No room in this report — the lift will be emitted next frame
+                // because the slot remains PENDING_RELEASE.
+                TraceEvents(TRACE_LEVEL_WARNING, TRACE_INPUT,
+                    "%!FUNC! slot=%llu PENDING_RELEASE: report full, lift deferred",
+                    (ULONG64)s);
+                break;
             }
 
             TraceEvents(TRACE_LEVEL_VERBOSE, TRACE_INPUT,
@@ -482,13 +584,41 @@ AmtPtpProcessTouchFrame(
             break;
 
         case SLOT_CONFIRMING:
-            // CONFIRMING (no match) -> FREE.
-            TraceEvents(TRACE_LEVEL_VERBOSE, TRACE_INPUT,
-                "%!FUNC! slot=%llu CONFIRMING -> FREE (lost match)", (ULONG64)s);
+            // CONFIRMING (no match) -> the finger lifted before we could
+            // confirm it as ACTIVE.
+            //
+            // FIX: If TipConfirmed >= 1 the hardware saw at least one
+            // real tip-down frame — this was a genuine (soft) tap.
+            // Synthesise a compressed tip-down + tip-up in this report so
+            // Windows registers the tap gesture.
+            //
+            // If TipConfirmed == 0 the slot was brand-new this frame and
+            // the finger is already gone — almost certainly electrical
+            // noise.  Discard silently.
+            if (st->TipConfirmed >= 1) {
+                TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_INPUT,
+                    "%!FUNC! slot=%llu CONFIRMING -> synthetic soft tap "
+                    "(TipConfirmed=%d)", (ULONG64)s, st->TipConfirmed);
 
-            st->Phase        = SLOT_FREE;
-            st->TipConfirmed = 0;
-            st->FingerKey    = SLOT_KEY_NONE;
+                // Use the last known position seeded in Phase 2b.
+                reportSlots = AmtEmitSoftTap(
+                    pCtx, s,
+                    st->LastNormX, st->LastNormY,
+                    PtpReport, reportSlots);
+                // AmtEmitSoftTap transitions the slot to COOLDOWN and
+                // clears all fields — nothing more to do here.
+            } else {
+                TraceEvents(TRACE_LEVEL_VERBOSE, TRACE_INPUT,
+                    "%!FUNC! slot=%llu CONFIRMING -> FREE (noise, tip=0)",
+                    (ULONG64)s);
+
+                // Clean transition to FREE — clear all fields.
+                st->Phase        = SLOT_FREE;
+                st->TipConfirmed = 0;
+                st->FingerKey    = SLOT_KEY_NONE;
+                st->LastNormX    = 0;   // was seeded in Phase 2b; clear now
+                st->LastNormY    = 0;
+            }
             break;
 
         case SLOT_FREE:
@@ -517,12 +647,17 @@ AmtPtpProcessTouchFrame(
             st->TipConfirmed >= TIP_CONFIRM_FRAMES);
 
         if (!alreadyActive && !justConfirmed) {
-            continue;   // still CONFIRMING
+            // Still CONFIRMING — update LastNormX/Y so 2a-bis stays
+            // accurate on the next frame even though we don't emit yet.
+            st->LastNormX = fingerNormX[i];
+            st->LastNormY = fingerNormY[i];
+            continue;
         }
 
         if (justConfirmed) {
             TraceEvents(TRACE_LEVEL_VERBOSE, TRACE_INPUT,
-                "%!FUNC! slot=%d CONFIRMING -> ACTIVE (ContactID=%lu)", (INT)slot, pCtx->NextContactID);
+                "%!FUNC! slot=%d CONFIRMING -> ACTIVE (ContactID=%lu)",
+                (INT)slot, pCtx->NextContactID);
 
             st->Phase = SLOT_ACTIVE;
             st->HystX = fingerNormX[i];
