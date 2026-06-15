@@ -50,7 +50,15 @@
 #define REBIND_MAX_DELTA_DENOM 300
 #define REBIND_MIN_DELTA 30
 
-// Palm rejection thresholds.
+// Palm rejection — cooldown hysteresis counter (frames).
+// Once a palm is detected, input stays blocked for this many frames
+// after the last frame where a palm was observed.  This prevents
+// rapid on/off toggling when the palm is partially lifted but still
+// has contact with the surface.
+#define PALM_COOLDOWN_FRAMES       5
+
+// Palm rejection thresholds (kept for reference, but the scoring
+// function uses only step-based thresholds defined in AmtIsPalm).
 #define PALM_ASPECT_RATIO_THRESHOLD 6
 #define PALM_MAJOR_THRESHOLD 300
 
@@ -155,7 +163,7 @@ AmtIsPalm(
         }
     }
 
-    return (score >= 70);
+    return (score >= 60);
 }
 
 static inline INT
@@ -446,31 +454,49 @@ VOID AmtPtpProcessTouchFrame(
     }
 
     // Palm-lock gate: if a palm was detected this frame, or if the palm
-    // lock is still active from the previous frame (drain frame), suppress
-    // ALL touch input so no non-palm finger can generate events.
+    // lock is still active from a previous frame (hysteresis cooldown),
+    // suppress ALL touch input so no non-palm finger can generate events.
+    //
+    // Hysteresis: once PalmDetected is set, it stays set for
+    // PALM_COOLDOWN_FRAMES after the last palm observation.  This prevents
+    // rapid on/off toggling when the palm is partially lifted but still
+    // has contact — the partially-lifted palm often fails the per-frame
+    // classifier, but should still block input until the user fully
+    // removes the palm from the surface.
     if (anyPalmThisFrame)
     {
         pCtx->PalmDetected = TRUE;
+        pCtx->PalmCooldown = PALM_COOLDOWN_FRAMES;
         for (i = 0; i < PTP_MAX_CONTACT_POINTS; i++)
         {
             fingerTipDown[i] = FALSE;
         }
         TraceEvents(TRACE_LEVEL_VERBOSE, TRACE_INPUT,
-                    "%!FUNC! Palm detected — all input suppressed");
+                    "%!FUNC! Palm detected — all input suppressed (cooldown=%d)",
+                    pCtx->PalmCooldown);
     }
     else if (pCtx->PalmDetected)
     {
-        // Drain frame: no palms this frame, but the lock was active.
-        // Block all input for one more frame so slot state machines
-        // can drain (ACTIVE->PENDING_RELEASE->COOLDOWN->FREE).
-        // After this frame we release the lock.
-        pCtx->PalmDetected = FALSE;
-        for (i = 0; i < PTP_MAX_CONTACT_POINTS; i++)
+        // No palm in this frame, but hysteresis cooldown is still active.
+        if (pCtx->PalmCooldown > 0)
         {
-            fingerTipDown[i] = FALSE;
+            pCtx->PalmCooldown--;
+            for (i = 0; i < PTP_MAX_CONTACT_POINTS; i++)
+            {
+                fingerTipDown[i] = FALSE;
+            }
+            TraceEvents(TRACE_LEVEL_VERBOSE, TRACE_INPUT,
+                        "%!FUNC! Palm cooldown frame — input suppressed (%d remaining)",
+                        pCtx->PalmCooldown);
         }
-        TraceEvents(TRACE_LEVEL_VERBOSE, TRACE_INPUT,
-                    "%!FUNC! Palm lifted — drain frame, input suppressed");
+        else
+        {
+            // Cooldown expired: release the lock and let input flow.
+            pCtx->PalmDetected = FALSE;
+            TraceEvents(TRACE_LEVEL_VERBOSE, TRACE_INPUT,
+                        "%!FUNC! Palm cooldown expired — lock released");
+            // fingerTipDown values from the per-finger pass are used as-is.
+        }
     }
     // else: normal operation — PalmDetected is FALSE and no palm this frame.
     // fingerTipDown values from the per-finger pass are used as-is.

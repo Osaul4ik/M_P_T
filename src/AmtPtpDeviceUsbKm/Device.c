@@ -79,8 +79,9 @@ AmtPtpResetSlotState(
         pCtx->Slots[s].ContactID  = 0;
     }
 
-    // Clear palm detection state.
+    // Clear palm detection state and cooldown.
     pCtx->PalmDetected = FALSE;
+    pCtx->PalmCooldown = 0;
 
     // Reset the global ContactID allocator so that IDs are unique
     // within each D0 power cycle. 1-based so that 0 means "no contact".

@@ -119,10 +119,12 @@ typedef struct _DEVICE_CONTEXT
 
     // ---------------------------------------------------------------
     // Palm lock: when TRUE, ALL touch inputs are rejected
-    // until no palm is detected for one full frame.
+    // until no palm is detected for PALM_COOLDOWN_FRAMES consecutive
+    // frames (hysteresis).  PalmCooldown is the remaining countdown.
     // Owned by processing thread (PASSIVE_LEVEL) only.
     // ---------------------------------------------------------------
     BOOLEAN             PalmDetected;
+    UCHAR               PalmCooldown;
 
     // ---------------------------------------------------------------
     // Diagnostics (interlocked — safe from any level)
