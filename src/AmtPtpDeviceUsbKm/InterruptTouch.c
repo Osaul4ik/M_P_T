@@ -407,6 +407,14 @@ VOID AmtPtpProcessTouchFrame(
                 st->FingerKey = SLOT_KEY_NONE;
                 st->Phase = SLOT_FREE;
 
+                // CRITICAL: zero the EMA-smoothed coordinates so a new
+                // finger on this slot does NOT inherit the previous
+                // gesture's smoothed position, which would cause a
+                // cursor jump to the old gesture location on the first
+                // frame (reportX = (rawX*5 + oldSmoothedX*3)/8).
+                st->SmoothedX = 0;
+                st->SmoothedY = 0;
+
                 TraceEvents(TRACE_LEVEL_VERBOSE, TRACE_INPUT,
                             "%!FUNC! slot=%llu COOLDOWN -> FREE", (ULONG64)s);
             }
@@ -777,6 +785,8 @@ VOID AmtPtpProcessTouchFrame(
                 st->FingerKey = SLOT_KEY_NONE;
                 st->LastNormX = 0;
                 st->LastNormY = 0;
+                st->SmoothedX = 0;
+                st->SmoothedY = 0;
             }
             break;
         }
