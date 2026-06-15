@@ -346,7 +346,14 @@ AmtEmitSoftTap(
     st->LastNormX = normX; // preserved for frame N+1 tip-up
     st->LastNormY = normY;
 
+    // A soft tap never ran the ACTIVE EMA path, but defensively clear the
+    // smoothed coordinates here so this slot cannot carry any stale position
+    // forward into the next gesture (cursor-jump guard).
+    st->SmoothedX = 0;
+    st->SmoothedY = 0;
+
     return reportSlots;
+
 }
 
 // ---------------------------------------------------------------------------
@@ -606,12 +613,35 @@ VOID AmtPtpProcessTouchFrame(
 
         slotForFinger[bestFinger] = bestSlot;
         fingerForSlot[bestSlot] = bestFinger;
-        pCtx->Slots[bestSlot].FingerKey = fingerKey[bestFinger];
+
+        PSLOT_STATE rb = &pCtx->Slots[bestSlot];
+        BOOLEAN keyChanged = (rb->FingerKey != fingerKey[bestFinger]);
+        rb->FingerKey = fingerKey[bestFinger];
+
+        // A position rebind means this slot's physical finger identity is
+        // no longer guaranteed to be the same contact it tracked before.
+        // If the underlying USB-array key changed, the slot is now following
+        // a DIFFERENT physical finger.  We must NOT let the EMA smoother or
+        // deadzone baseline carry the previous finger's coordinates forward:
+        // doing so blends the new finger's first frame with the old gesture's
+        // (potentially distant) position, snapping the cursor back to where
+        // the previous gesture started.  Re-seed the smoothing/deadzone state
+        // to the new finger's current position so tracking starts clean.
+        if (keyChanged && rb->Phase == SLOT_ACTIVE)
+        {
+            rb->SmoothedX = fingerNormX[bestFinger];
+            rb->SmoothedY = fingerNormY[bestFinger];
+            rb->HystX = fingerNormX[bestFinger];
+            rb->HystY = fingerNormY[bestFinger];
+        }
 
         TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_INPUT,
-                    "%!FUNC! slot=%d rebound to finger=%d by position (dist=%d, max=%d)",
-                    (INT)bestSlot, (INT)bestFinger, bestDist, rebindMaxDelta);
+                    "%!FUNC! slot=%d rebound to finger=%d by position "
+                    "(dist=%d, max=%d, keyChanged=%d)",
+                    (INT)bestSlot, (INT)bestFinger, bestDist, rebindMaxDelta,
+                    (INT)keyChanged);
     }
+
 
     // 2b. Assign new slots for unmatched fingers.
     for (i = 0; i < raw_n; i++)
