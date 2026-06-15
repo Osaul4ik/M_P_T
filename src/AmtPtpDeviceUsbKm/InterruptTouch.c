@@ -55,8 +55,11 @@
 #define PALM_ASPECT_RATIO_THRESHOLD 6
 #define PALM_MAJOR_THRESHOLD 300
 
-// Coordinate smoothing (EMA) alpha.
-#define SMOOTHING_ALPHA_NUM 3
+// Coordinate smoothing (EMA) alpha = ALPHA_NUM / ALPHA_DEN.
+// Higher numerator = more responsive (less smoothing).
+// At 5/8 = 0.625 the finger position tracks 62.5% new value per frame —
+// responsive enough for fast scrolls while still filtering sensor noise.
+#define SMOOTHING_ALPHA_NUM 5
 #define SMOOTHING_ALPHA_DEN 8
 
 #define SLOT_NONE ((UCHAR)PTP_MAX_CONTACT_POINTS)
