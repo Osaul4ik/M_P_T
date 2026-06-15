@@ -698,8 +698,8 @@ AmtPtpProcessTouchFrame(
             reportSlots++;
         }
 
-        st->LastNormX = fingerNormX[i];
-        st->LastNormY = fingerNormY[i];
+        st->LastNormX = reportX;
+        st->LastNormY = reportY;
     }
 
     // Phase 3b: append staged lift entries (TipSwitch=0) after active contacts.
