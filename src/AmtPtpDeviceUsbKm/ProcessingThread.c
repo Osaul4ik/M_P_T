@@ -208,20 +208,19 @@ ProcThreadBuildAndDeliver(
     ptpReport.IsButtonClicked = 0;
 
     // Scan time in 100 µs units (0.1 ms per unit, per PTP spec).
-    // Correctly convert from PerformanceCounter ticks to 100 µs:
-    //   time_100us = (now - last) * 10,000,000 / freq / 100
-    //   = (now - last) * 100,000 / freq
-    // Derived: 1 second = freq ticks. 1 scan time unit = 100 µs = 0.0001 s.
-    //   delta_ticks / freq = delta_seconds
-    //   delta_seconds / 0.0001 = delta_seconds * 10000 = scan time units
-    //   So: delta_ticks * 10000 / freq = scan time units.
+    //
+    // The PerformanceCounter frequency is cached once at D0Entry
+    // in pCtx->PerfCounterFreq.  Convert ticks to 100 µs:
+    //   scan_time = (now - last) * 10000 / freq
+    //
+    // Derivation: 1 s = freq ticks, 1 scan unit = 100 µs = 1e-4 s.
+    //   delta_ticks / freq = delta_s
+    //   delta_s / 1e-4    = delta_s * 10000 = scan_time_units
+    //   So: delta_ticks * 10000 / freq = scan_time_units.
     KeQueryPerformanceCounter(&now);
-    LARGE_INTEGER perfFreq;
-    KeQueryPerformanceFrequency(&perfFreq);
     LONGLONG delta = (now.QuadPart - pCtx->LastReportTime.QuadPart);
     if (delta < 0) delta = 0;
-    // delta * 10000 / freq  (with 64-bit precision)
-    delta = (delta * 10000) / perfFreq.QuadPart;
+    delta = (delta * 10000) / pCtx->PerfCounterFreq.QuadPart;
     if (delta > 0xFFFF) delta = 0xFFFF;
     ptpReport.ScanTime = (USHORT)delta;
 

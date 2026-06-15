@@ -254,6 +254,10 @@ AmtPtpEvtDeviceD0Entry(
         }
     }
 
+    // Cache the performance counter frequency for ScanTime conversion.
+    // KeQueryPerformanceCounter fills the optional output parameter with
+    // the counter frequency on systems that support it.
+    KeQueryPerformanceCounter(&pCtx->PerfCounterFreq);
     KeQueryPerformanceCounter(&pCtx->LastReportTime);
 
     // Start the processing thread BEFORE the USB reader so that no packet

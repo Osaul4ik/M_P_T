@@ -76,6 +76,9 @@ typedef struct _DEVICE_CONTEXT
     // ---------------------------------------------------------------
     LARGE_INTEGER       LastReportTime;
 
+    // Cached performance counter frequency (initialised once at D0Entry).
+    LARGE_INTEGER       PerfCounterFreq;
+
     // ---------------------------------------------------------------
     // Ring buffer — single-producer (USB callback, DISPATCH_LEVEL),
     // single-consumer (processing thread, PASSIVE_LEVEL).
