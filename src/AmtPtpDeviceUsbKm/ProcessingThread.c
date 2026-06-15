@@ -20,6 +20,12 @@
  *   This means at most one report worth of backpressure before the HID
  *   stack is considered starved; further packets are not discarded but the
  *   ring WILL fill if the HID stack stops reading.
+ *
+ * ContactCount
+ *   ContactCount in the PTP_REPORT is set exclusively by
+ *   AmtPtpProcessTouchFrame (InterruptTouch.c). It reflects only contacts
+ *   with TipSwitch=1 in the snapshot (PTP spec §5.3). This file must NOT
+ *   overwrite ContactCount after the call returns.
  */
 
 #include "driver.h"
@@ -86,8 +92,6 @@ ProcThreadStart(
     if (!NT_SUCCESS(status)) {
         TraceEvents(TRACE_LEVEL_ERROR, TRACE_DRIVER,
             "%!FUNC! ObReferenceObjectByHandle failed %!STATUS!", status);
-        // Thread will still run; we just can't wait for it.
-        // Signal stop immediately so it exits cleanly.
         KeSetEvent(&pCtx->StopEvent, IO_NO_INCREMENT, FALSE);
         pCtx->ThreadObject  = NULL;
         pCtx->ThreadRunning = FALSE;
@@ -113,7 +117,6 @@ ProcThreadStop(
     TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DRIVER,
         "%!FUNC! Signalling thread to stop");
 
-    // Signal stop.  Also kick ProcEvent so the thread wakes from its wait.
     KeSetEvent(&pCtx->StopEvent, IO_NO_INCREMENT, FALSE);
     KeSetEvent(&pCtx->ProcEvent, IO_NO_INCREMENT, FALSE);
 
@@ -123,7 +126,7 @@ ProcThreadStop(
             Executive,
             KernelMode,
             FALSE,
-            NULL);              // wait indefinitely
+            NULL);
 
         ObDereferenceObject(pCtx->ThreadObject);
         pCtx->ThreadObject = NULL;
@@ -138,9 +141,6 @@ VOID
 ProcThreadSignal(
     _In_ PDEVICE_CONTEXT pCtx)
 {
-    // IO_NETWORK_INCREMENT (2) gives a small boost; avoids the
-    // full THREAD_PRIORITY_NORMAL boost from IO_NO_INCREMENT while still
-    // waking the thread promptly.
     KeSetEvent(&pCtx->ProcEvent, IO_DISK_INCREMENT, FALSE);
 }
 
@@ -151,6 +151,10 @@ ProcThreadSignal(
  *
  * Returns TRUE  if the report was delivered to a waiting HID request.
  * Returns FALSE if no HID request was pending (caller should retry later).
+ *
+ * ContactCount is set by AmtPtpProcessTouchFrame and must NOT be
+ * overwritten here — it already reflects the PTP snapshot rule
+ * (TipSwitch=1 contacts only).
  */
 static BOOLEAN
 ProcThreadBuildAndDeliver(
@@ -163,7 +167,9 @@ ProcThreadBuildAndDeliver(
     size_t       raw_n;
 
     PTP_REPORT   ptpReport;
-    UCHAR        reportSlots = 0;
+    UCHAR        reportSlots = 0;   // total Contacts[] entries written
+                                    // (used only for the copy; ContactCount
+                                    //  is managed inside ProcessTouchFrame)
 
     WDFREQUEST   request;
     WDFMEMORY    requestMemory;
@@ -183,7 +189,6 @@ ProcThreadBuildAndDeliver(
     // Dequeue a pending HID read request.
     status = WdfIoQueueRetrieveNextRequest(pCtx->InputQueue, &request);
     if (!NT_SUCCESS(status)) {
-        // No request available — caller will retry on next wake.
         TraceEvents(TRACE_LEVEL_VERBOSE, TRACE_DRIVER,
             "%!FUNC! No pending HID request");
         return FALSE;
@@ -212,10 +217,17 @@ ProcThreadBuildAndDeliver(
     if (pCtx->PtpReportTouch) {
         raw_n = ((size_t)NumBytes - headerSize) / fingerSize;
         if (raw_n > PTP_MAX_CONTACT_POINTS) raw_n = PTP_MAX_CONTACT_POINTS;
+
+        // AmtPtpProcessTouchFrame:
+        //   - writes contact entries to ptpReport.Contacts[]
+        //   - sets ptpReport.ContactCount = number of TipSwitch=1 entries
+        //   - updates *reportSlots with the total entries written
         AmtPtpProcessTouchFrame(pCtx, TouchBuffer, raw_n, &ptpReport, &reportSlots);
-        ptpReport.ContactCount  = reportSlots;
+
+        // DO NOT overwrite ptpReport.ContactCount here.
+        // It is already set correctly inside AmtPtpProcessTouchFrame.
     } else {
-        ptpReport.ContactCount  = 0;
+        ptpReport.ContactCount = 0;
     }
 
     // Button.
@@ -229,7 +241,10 @@ ProcThreadBuildAndDeliver(
 
     pCtx->LastReportTime = now;
 
-    // Copy report to the HID request buffer.
+    // Copy the full fixed-size report to the HID request buffer.
+    // We always send sizeof(PTP_REPORT) regardless of how many contacts
+    // are active — the HID descriptor declares a fixed-length report and
+    // unused Contacts[] slots are zero-filled by RtlZeroMemory above.
     status = WdfMemoryCopyFromBuffer(
         requestMemory, 0,
         (PVOID)&ptpReport, sizeof(PTP_REPORT));
@@ -258,14 +273,10 @@ ProcThreadBody(
     TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DRIVER,
         "%!FUNC! Processing thread started");
 
-    // We wait on two objects simultaneously:
-    //   [0] ProcEvent — new USB packet available
-    //   [1] StopEvent — time to exit
     waitObjects[0] = &pCtx->ProcEvent;
     waitObjects[1] = &pCtx->StopEvent;
 
     for (;;) {
-        // Wait for either a new packet or a stop request.
         waitStatus = KeWaitForMultipleObjects(
             2,
             waitObjects,
@@ -273,22 +284,16 @@ ProcThreadBody(
             Executive,
             KernelMode,
             FALSE,
-            NULL,   // no timeout
+            NULL,
             NULL);
 
         // Exit signal.
         if (waitStatus == STATUS_WAIT_1 ||
             KeReadStateEvent(&pCtx->StopEvent))
         {
-            // Drain ring before exiting so no packet is silently lost
-            // when the ring still has data right at shutdown.
-            // If no HID request is pending, just discard the slot rather than
-            // busy-wait — otherwise ProcThreadStop would deadlock waiting for
-            // this thread.
             RING_SLOT* slot;
             while ((slot = RingBufferPeek(&pCtx->RingBuffer)) != NULL) {
                 if (!ProcThreadBuildAndDeliver(pCtx, slot->Data, slot->Length)) {
-                    // No HID request — discard the remaining bits so we can exit.
                     while ((slot = RingBufferPeek(&pCtx->RingBuffer)) != NULL) {
                         InterlockedIncrement(&pCtx->DroppedPackets);
                         RingBufferConsumed(&pCtx->RingBuffer);
@@ -300,27 +305,18 @@ ProcThreadBody(
             break;
         }
 
-    // STATUS_WAIT_0 — ProcEvent fired.  Drain all pending slots.
-    // Also check StopEvent inside the loop: if both events were set,
-    // KeWaitForMultipleObjects returns STATUS_WAIT_0 (ProcEvent has
-    // lower index), so we MUST poll StopEvent here to avoid a
-    // busy-spin on the ring when shutdown is requested.
-    RING_SLOT* slot;
-    while ((slot = RingBufferPeek(&pCtx->RingBuffer)) != NULL &&
-           !KeReadStateEvent(&pCtx->StopEvent))
-    {
-        BOOLEAN delivered = ProcThreadBuildAndDeliver(
-            pCtx, slot->Data, slot->Length);
-        if (!delivered) {
-            // No HID request available.
-            // Leave this slot in the ring — we'll retry when the next
-            // packet arrives (which re-signals ProcEvent) or when the
-            // HID stack posts a new read request and the driver calls
-            // ProcThreadSignal from AmtPtpDispatchReadReportRequests.
-            break;
+        // STATUS_WAIT_0 — drain all pending slots.
+        RING_SLOT* slot;
+        while ((slot = RingBufferPeek(&pCtx->RingBuffer)) != NULL &&
+               !KeReadStateEvent(&pCtx->StopEvent))
+        {
+            BOOLEAN delivered = ProcThreadBuildAndDeliver(
+                pCtx, slot->Data, slot->Length);
+            if (!delivered) {
+                break;
+            }
+            RingBufferConsumed(&pCtx->RingBuffer);
         }
-        RingBufferConsumed(&pCtx->RingBuffer);
-    }
     }
 
     TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DRIVER,

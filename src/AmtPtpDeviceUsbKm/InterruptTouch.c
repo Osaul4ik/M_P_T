@@ -4,7 +4,27 @@
 // No shared state is touched by the USB interrupt callback, so no locking
 // is required for any field in this file.
 //
-// Lifecycle: FREE -> CONFIRMING -> ACTIVE -> PENDING_RELEASE -> COOLDOWN -> FREE
+// Lifecycle:
+//   FREE -> CONFIRMING -> ACTIVE -> PENDING_RELEASE -> COOLDOWN -> FREE
+//
+//   CONFIRMING (lift before ACTIVE):
+//     -> SOFT_PENDING_UP (frame N  : emits TipSwitch=1)
+//     -> COOLDOWN        (frame N+1: emits TipSwitch=0)
+//     -> FREE
+//
+// PTP snapshot semantics
+// ----------------------
+// Each PTP_REPORT is a SNAPSHOT of contacts active in that instant.
+// TipSwitch transitions MUST span two separate frames — never in one report.
+// ContactCount = number of contacts with TipSwitch=1 in the snapshot.
+//
+// Soft-tap fix
+// ------------
+// When a finger lifts before TIP_CONFIRM_FRAMES are accumulated, Phase 3
+// transitions CONFIRMING -> SOFT_PENDING_UP with TipSwitch=1 emitted in
+// frame N.  Frame N+1 (Phase 3 again) sees SOFT_PENDING_UP, emits
+// TipSwitch=0, and moves to COOLDOWN.  Windows sees two distinct frames:
+// contact-down then contact-up — a clean tap gesture with no ghost contacts.
 //
 // LastNormX/Y and HystX/Y are scoped to a single ACTIVE gesture:
 //   - HystX/Y is seeded on CONFIRMING->ACTIVE and zeroed on ACTIVE exit.
@@ -12,26 +32,6 @@
 //     report on PENDING_RELEASE->COOLDOWN, then zeroed.
 // By the time a slot reaches FREE both pairs are guaranteed zero, so no
 // gesture can inherit a previous gesture's position.
-//
-// State is consolidated into SLOT_STATE (include/Hid.h): one struct per
-// slot with an explicit Phase field, instead of 8 parallel arrays whose
-// combinations previously had to encode the FSM state implicitly.
-// AmtAssertSlotInvariants() validates FSM consistency after every frame
-// in debug builds.
-//
-// --- Soft Tap Fix ---
-// When TIP_CONFIRM_FRAMES > 1 a very brief touch (fewer frames than
-// TIP_CONFIRM_FRAMES) would be silently discarded: Phase 4/5 only emits
-// a contact once the slot is ACTIVE, but if the finger lifts before
-// enough confirm-frames accumulate, Phase 3 transitions CONFIRMING->FREE
-// without ever emitting anything.  Windows never sees a tap.
-//
-// Fix: on CONFIRMING->FREE, if TipConfirmed >= 1, synthesise a
-// compressed tap: emit one frame with TipSwitch=1 (tip-down) followed
-// immediately by a tip-up entry in the same report via PENDING_RELEASE.
-// Because both are in the same PTP_REPORT the HID stack sees them in
-// order and Windows registers a tap.  A ContactID is still allocated from
-// pCtx->NextContactID so Windows can track the contact correctly.
 
 #include "Driver.h"
 #include "InterruptTouch.tmh"
@@ -41,46 +41,22 @@
 #define TIP_MINOR_THRESHOLD  150
 
 // Consecutive tip-down frames required before a slot goes ACTIVE.
-// NOTE: soft tap emission on CONFIRMING->FREE handles the case where
-// the finger lifts before this count is reached (see above).
 #define TIP_CONFIRM_FRAMES   2
 
 // Deadzone: hold last value if movement is below this many raw units.
 #define XY_DEADZONE_UNITS    1
 
-// Max position delta (raw units) allowed for a 2a-bis rebind. This catches a
-// USB-array index swap between two fingers in the same frame, which Phase 2a's
-// pure key match cannot — the swap looks like two simultaneous key mismatches
-// but the true fingers barely moved.
-//
-// NOTE: FingerKey is the USB-array index recorded at the slot's last
-// (re)bind, NOT a hardware finger ID — the T2 controller does not expose
-// one. Phase 2a key-match only succeeds when the controller happens to
-// keep a tracked finger at the same array index across frames; Phase 2a-bis
-// position rebind is the primary mechanism for re-establishing identity
-// after a reorder.
-//
-// To reduce false matches when two fingers are close together, 2a-bis uses
-// a greedy MUTUAL-best-match: repeatedly bind the globally closest
-// (slot, finger) pair among those still unmatched. This guarantees a slot
-// never steals a finger that is actually closer to a different,
-// still-unmatched slot.
-//
-// REBIND_MAX_DELTA is scaled per device by using the x resolution range.
-#define REBIND_MAX_DELTA_DENOM  300  // fraction of x-range for adaptive delta
-#define REBIND_MIN_DELTA        30   // minimum absolute delta
+// Max position delta (raw units) for 2a-bis rebind; adaptive, see below.
+#define REBIND_MAX_DELTA_DENOM  300
+#define REBIND_MIN_DELTA        30
 
-// Palm rejection: finger aspect ratio threshold (major/minor > this = palm)
-// A typical fingertip has aspect ratio ~1.0–2.0; a palm is >3.0.
+// Palm rejection thresholds.
 #define PALM_ASPECT_RATIO_THRESHOLD  6
-// Palm rejection: absolute major threshold (in raw units).
-// Typical finger touch_major values are 100–200; palm/thumb values are 250+.
 #define PALM_MAJOR_THRESHOLD         350
 
-// Coordinate smoothing (exponential moving average) alpha factor.
-// Higher = more responsive, lower = smoother.
-#define SMOOTHING_ALPHA_NUM  5   // numerator   (3/8 = 0.375)
-#define SMOOTHING_ALPHA_DEN  8   // denominator
+// Coordinate smoothing (EMA) alpha.
+#define SMOOTHING_ALPHA_NUM  3
+#define SMOOTHING_ALPHA_DEN  8
 
 #define SLOT_NONE  ((UCHAR)PTP_MAX_CONTACT_POINTS)
 
@@ -113,10 +89,6 @@ AmtApplyDeadzone(_In_ USHORT newVal, _Inout_ USHORT* pBaseline)
     return newVal;
 }
 
-//
-// Exponential moving average smoothing (non-linear, low-latency).
-// blended = (raw * alpha_num + prev * (alpha_den - alpha_num)) / alpha_den
-//
 static inline USHORT
 AmtSmoothCoord(
     _In_ USHORT rawVal,
@@ -128,12 +100,8 @@ AmtSmoothCoord(
     return (USHORT)(blended < 0 ? 0 : blended);
 }
 
-//
-// Palm rejection heuristics.
-// Returns TRUE if the finger is likely a palm and should be suppressed.
-//
 static inline BOOLEAN
- AmtIsPalm(
+AmtIsPalm(
     _In_ const struct TRACKPAD_FINGER* f,
     _In_ const struct BCM5974_CONFIG* devInfo,
     _In_ USHORT normX,
@@ -141,26 +109,21 @@ static inline BOOLEAN
 {
     INT score = 0;
 
-    // 1. size (soft, NOT hard reject)
     if (f->touch_major >= PALM_MAJOR_THRESHOLD) {
         score += 40;
     } else if (f->touch_major > 180) {
         score += 20;
     }
 
-    // 2. aspect ratio (soft penalty only)
     if (f->touch_minor > 0 && f->touch_major > 80) {
         INT ratio = (INT)f->touch_major * 100 / (INT)f->touch_minor;
-
         if (ratio > 1100) score += 15;
         else if (ratio > 800) score += 8;
     }
 
-    // 3. edge (soft penalty, not reject)
     if (f->touch_major > 140) {
         INT xRange = devInfo->x.max - devInfo->x.min;
         INT yRange = devInfo->y.max - devInfo->y.min;
-
         INT edgePctX = xRange / 32;
         INT edgePctY = yRange / 32;
 
@@ -173,7 +136,6 @@ static inline BOOLEAN
         }
     }
 
-    // FINAL DECISION
     return (score >= 75);
 }
 
@@ -184,12 +146,6 @@ AmtAbsDelta(_In_ INT a, _In_ INT b)
     return (d < 0) ? -d : d;
 }
 
-//
-// Normalise one finger's raw coordinates into device-space (0..range).
-// Pure function of the device config + raw finger sample; touches no
-// slot state. Unifies the clamp logic that was previously inlined in
-// Phase 1.
-//
 static inline VOID
 AmtNormalizeFinger(
     _In_  PDEVICE_CONTEXT pCtx,
@@ -208,12 +164,10 @@ AmtNormalizeFinger(
     *pNormY = AmtClampCoord(normY, 0, yRange);
 }
 
-//
-// Debug-only FSM invariant check, run once per frame after all slot
-// transitions are applied. Traces and asserts on the first violation
-// found per slot. See include/Hid.h (SLOT_STATE) for the documented
-// per-phase invariants this enforces.
-//
+// ---------------------------------------------------------------------------
+// Debug-only FSM invariant check.
+// Extended to cover SLOT_SOFT_PENDING_UP.
+// ---------------------------------------------------------------------------
 static inline VOID
 AmtAssertSlotInvariants(
     _In_ PDEVICE_CONTEXT pCtx)
@@ -234,6 +188,7 @@ AmtAssertSlotInvariants(
             break;
 
         case SLOT_CONFIRMING:
+            // LastNormX/Y may be non-zero (seeded in Phase 2b).
             ok = (st->TipConfirmed >= 1) &&
                  (st->TipConfirmed < TIP_CONFIRM_FRAMES) &&
                  (st->Cooldown == 0) &&
@@ -247,6 +202,14 @@ AmtAssertSlotInvariants(
             break;
 
         case SLOT_PENDING_RELEASE:
+            ok = (st->TipConfirmed == 0) && (st->Cooldown == 0) &&
+                 (st->HystX == 0) && (st->HystY == 0) &&
+                 (st->FingerKey == SLOT_KEY_NONE);
+            break;
+
+        case SLOT_SOFT_PENDING_UP:
+            // Waiting to emit TipSwitch=0 next frame.
+            // LastNormX/Y hold the tap position (non-zero is expected).
             ok = (st->TipConfirmed == 0) && (st->Cooldown == 0) &&
                  (st->HystX == 0) && (st->HystY == 0) &&
                  (st->FingerKey == SLOT_KEY_NONE);
@@ -278,12 +241,6 @@ AmtAssertSlotInvariants(
 #endif
 }
 
-//
-// Compute a per-device REBIND_MAX_DELTA based on x-resolution range.
-// This makes the 2a-bis position threshold consistent across different
-// trackpad sizes (13" vs 15" etc.) and avoids false matches on
-// high-resolution devices where fixed 30 units is too large.
-//
 static inline INT
 AmtGetRebindMaxDelta(
     _In_ PDEVICE_CONTEXT pCtx)
@@ -293,23 +250,23 @@ AmtGetRebindMaxDelta(
     return (adaptive < REBIND_MIN_DELTA) ? REBIND_MIN_DELTA : adaptive;
 }
 
+// ---------------------------------------------------------------------------
+// AmtEmitSoftTap
 //
-// Emit a synthetic tap (tip-down + tip-up) for a slot that was in
-// CONFIRMING but lifted before reaching TIP_CONFIRM_FRAMES.
+// Called from Phase 3 when a CONFIRMING slot lifts before reaching
+// TIP_CONFIRM_FRAMES (TipConfirmed >= 1 means at least one real frame).
 //
-// Two contacts are appended to ptpReport:
-//   [reportSlots+0]: TipSwitch=1 (tip-down) at the slot's last known position
-//   [reportSlots+1]: TipSwitch=0 (tip-up)   at the same position
+// This function handles FRAME N of the two-frame soft-tap sequence:
+//   - Emits one TipSwitch=1 contact entry (contact appears).
+//   - Transitions slot to SLOT_SOFT_PENDING_UP.
+//   - Preserves LastNormX/Y for the next frame's TipSwitch=0 emission.
 //
-// Both share the same ContactID so Windows sees a clean tap gesture.
+// Frame N+1 is handled in Phase 3 under the SLOT_SOFT_PENDING_UP case.
 //
-// The slot is immediately transitioned to COOLDOWN so no further processing
-// occurs for it this frame. LastNormX/Y are zeroed after use (COOLDOWN
-// invariant requires them to be 0).
+// Returns updated reportSlots count.
 //
-// Returns the new reportSlots count (incremented by 0, 1, or 2 depending
-// on remaining capacity).
-//
+// ContactCount rule: this entry IS counted (TipSwitch=1 = active contact).
+// ---------------------------------------------------------------------------
 static UCHAR
 AmtEmitSoftTap(
     _In_    PDEVICE_CONTEXT pCtx,
@@ -322,15 +279,14 @@ AmtEmitSoftTap(
     PSLOT_STATE st = &pCtx->Slots[slot];
     ULONG contactID;
 
-    // Assign a unique ContactID for this synthetic tap.
     contactID = pCtx->NextContactID++;
     st->ContactID = contactID;
 
     TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_INPUT,
-        "%!FUNC! soft tap: slot=%llu normX=%u normY=%u ContactID=%lu",
+        "%!FUNC! soft tap frame N: slot=%llu normX=%u normY=%u ContactID=%lu",
         (ULONG64)slot, normX, normY, contactID);
 
-    // Tip-down entry.
+    // Emit TipSwitch=1 — contact appears this frame.
     if (reportSlots < PTP_MAX_CONTACT_POINTS) {
         PtpReport->Contacts[reportSlots].ContactID  = contactID;
         PtpReport->Contacts[reportSlots].X          = normX;
@@ -340,31 +296,30 @@ AmtEmitSoftTap(
         reportSlots++;
     }
 
-    // Tip-up entry immediately following — same report, next slot.
-    // Windows PTP processes contacts in array order within one report,
-    // so tip-down then tip-up in the same report constitutes a valid tap.
-    if (reportSlots < PTP_MAX_CONTACT_POINTS) {
-        PtpReport->Contacts[reportSlots].ContactID  = contactID;
-        PtpReport->Contacts[reportSlots].X          = normX;
-        PtpReport->Contacts[reportSlots].Y          = normY;
-        PtpReport->Contacts[reportSlots].TipSwitch  = 0;
-        PtpReport->Contacts[reportSlots].Confidence = 1;
-        reportSlots++;
-    }
-
-    // Transition to COOLDOWN — all fields must satisfy COOLDOWN invariant.
-    st->Phase        = SLOT_COOLDOWN;
-    st->Cooldown     = 2;
+    // Transition to SOFT_PENDING_UP — TipSwitch=0 will be emitted next frame.
+    // LastNormX/Y carry the position forward for that emission.
+    st->Phase        = SLOT_SOFT_PENDING_UP;
     st->TipConfirmed = 0;
     st->FingerKey    = SLOT_KEY_NONE;
     st->HystX        = 0;
     st->HystY        = 0;
-    st->LastNormX    = 0;    // COOLDOWN requires LastNormX == 0
-    st->LastNormY    = 0;    // COOLDOWN requires LastNormY == 0
+    st->LastNormX    = normX;   // preserved for frame N+1 tip-up
+    st->LastNormY    = normY;
 
     return reportSlots;
 }
 
+// ---------------------------------------------------------------------------
+// AmtPtpProcessTouchFrame
+//
+// Produces one PTP_REPORT snapshot from a raw USB frame.
+// Called exclusively from ProcessingThread.c at PASSIVE_LEVEL.
+//
+// ContactCount = number of TipSwitch=1 entries in this snapshot.
+// TipSwitch=0 entries (lifts) are included in the Contacts array so
+// Windows can match them to their ContactID, but they do NOT increment
+// the ContactCount per PTP specification.
+// ---------------------------------------------------------------------------
 VOID
 AmtPtpProcessTouchFrame(
     _In_    PDEVICE_CONTEXT pCtx,
@@ -378,7 +333,12 @@ AmtPtpProcessTouchFrame(
         + pCtx->DeviceInfo->tp_delta;
     const struct TRACKPAD_FINGER* f;
     size_t i, s;
-    UCHAR reportSlots = *pReportSlots;
+
+    // reportSlots  : total entries written to PtpReport->Contacts
+    // activeTipCount: entries with TipSwitch=1 (= ContactCount)
+    UCHAR reportSlots  = *pReportSlots;
+    UCHAR activeTipCount = 0;   // will become ContactCount
+
     INT rebindMaxDelta = AmtGetRebindMaxDelta(pCtx);
 
     // Phase 0: cooldown countdown.
@@ -420,7 +380,6 @@ AmtPtpProcessTouchFrame(
 
         AmtNormalizeFinger(pCtx, f, &fingerNormX[i], &fingerNormY[i]);
 
-        // Palm rejection: if this finger looks like a palm, ignore it.
         if (AmtIsPalm(f, pCtx->DeviceInfo, fingerNormX[i], fingerNormY[i])) {
             fingerTipDown[i] = FALSE;
             TraceEvents(TRACE_LEVEL_VERBOSE, TRACE_INPUT,
@@ -439,8 +398,7 @@ AmtPtpProcessTouchFrame(
     for (i = 0; i < PTP_MAX_CONTACT_POINTS; i++) slotForFinger[i] = SLOT_NONE;
     for (s = 0; s < PTP_MAX_CONTACT_POINTS; s++) fingerForSlot[s] = SLOT_NONE;
 
-    // 2a. Match by key (works only when the controller happens to keep a
-    // tracked finger at the same array index across frames).
+    // 2a. Key match.
     for (i = 0; i < raw_n; i++) {
         if (!fingerTipDown[i]) continue;
         UCHAR key = fingerKey[i];
@@ -457,16 +415,7 @@ AmtPtpProcessTouchFrame(
         }
     }
 
-    // 2a-bis. Position rebind for slots/fingers left unmatched.
-    //
-    // Greedy global mutual-best-match: repeatedly find the closest
-    // remaining (slot, finger) pair within rebindMaxDelta and bind it.
-    // Because each iteration picks the single globally-closest pair, a
-    // slot can never grab a finger that some other still-unmatched slot
-    // is closer to (that other pair would have been picked first), and
-    // vice versa for fingers. This is equivalent to enforcing mutual
-    // best-match without an O(n^2) stable-matching pass, which is
-    // unnecessary at n <= PTP_MAX_CONTACT_POINTS (5).
+    // 2a-bis. Position rebind (greedy global mutual-best-match).
     for (;;) {
         UCHAR bestSlot   = SLOT_NONE;
         UCHAR bestFinger = SLOT_NONE;
@@ -495,7 +444,7 @@ AmtPtpProcessTouchFrame(
         }
 
         if (bestSlot == SLOT_NONE) {
-            break;  // no remaining candidate pair within rebindMaxDelta
+            break;
         }
 
         slotForFinger[bestFinger] = bestSlot;
@@ -525,11 +474,7 @@ AmtPtpProcessTouchFrame(
                     (ULONG64)s, (INT)i);
 
                 st->Phase = SLOT_CONFIRMING;
-                // Seed LastNormX/Y so 2a-bis can rebind on the next frame
-                // even if TipConfirmed hasn't reached ACTIVE yet.
-                // (Invariant checker allows LastNormX/Y to be non-zero in
-                //  CONFIRMING only when noted here — CONFIRMING invariant
-                //  in AmtAssertSlotInvariants does NOT require them to be 0.)
+                // Seed position for 2a-bis and soft-tap emission.
                 st->LastNormX = fingerNormX[i];
                 st->LastNormY = fingerNormY[i];
                 break;
@@ -537,15 +482,25 @@ AmtPtpProcessTouchFrame(
         }
     }
 
-    // Phase 3: advance slots with no finger match this frame.
+    // Phase 3: advance slots that have no finger match this frame.
     for (s = 0; s < PTP_MAX_CONTACT_POINTS; s++) {
         if (fingerForSlot[s] != SLOT_NONE) continue;
 
         PSLOT_STATE st = &pCtx->Slots[s];
 
         switch (st->Phase) {
-        case SLOT_PENDING_RELEASE:
-            // PENDING_RELEASE -> emit lift, enter COOLDOWN.
+
+        // ------------------------------------------------------------------
+        // SOFT_PENDING_UP: frame N+1 of synthetic soft tap.
+        // Emit TipSwitch=0 (contact disappears) then -> COOLDOWN.
+        // This entry is a lift; it does NOT increment activeTipCount.
+        // ------------------------------------------------------------------
+        case SLOT_SOFT_PENDING_UP:
+        {
+            TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_INPUT,
+                "%!FUNC! slot=%llu SOFT_PENDING_UP -> COOLDOWN (soft tap frame N+1, ContactID=%lu)",
+                (ULONG64)s, st->ContactID);
+
             if (reportSlots < PTP_MAX_CONTACT_POINTS) {
                 PtpReport->Contacts[reportSlots].ContactID  = st->ContactID;
                 PtpReport->Contacts[reportSlots].X          = st->LastNormX;
@@ -553,9 +508,38 @@ AmtPtpProcessTouchFrame(
                 PtpReport->Contacts[reportSlots].TipSwitch  = 0;
                 PtpReport->Contacts[reportSlots].Confidence = 1;
                 reportSlots++;
+                // TipSwitch=0 → lift → NOT counted in activeTipCount
             } else {
-                // No room in this report — the lift will be emitted next frame
-                // because the slot remains PENDING_RELEASE.
+                // No room — stay in SOFT_PENDING_UP, retry next frame.
+                TraceEvents(TRACE_LEVEL_WARNING, TRACE_INPUT,
+                    "%!FUNC! slot=%llu SOFT_PENDING_UP: report full, tip-up deferred",
+                    (ULONG64)s);
+                break;
+            }
+
+            st->Phase     = SLOT_COOLDOWN;
+            st->Cooldown  = 2;
+            st->LastNormX = 0;
+            st->LastNormY = 0;
+            break;
+        }
+
+        // ------------------------------------------------------------------
+        // PENDING_RELEASE: normal finger lift.
+        // Emit TipSwitch=0 then -> COOLDOWN.
+        // Lift entry does NOT increment activeTipCount.
+        // ------------------------------------------------------------------
+        case SLOT_PENDING_RELEASE:
+        {
+            if (reportSlots < PTP_MAX_CONTACT_POINTS) {
+                PtpReport->Contacts[reportSlots].ContactID  = st->ContactID;
+                PtpReport->Contacts[reportSlots].X          = st->LastNormX;
+                PtpReport->Contacts[reportSlots].Y          = st->LastNormY;
+                PtpReport->Contacts[reportSlots].TipSwitch  = 0;
+                PtpReport->Contacts[reportSlots].Confidence = 1;
+                reportSlots++;
+                // TipSwitch=0 → NOT counted in activeTipCount
+            } else {
                 TraceEvents(TRACE_LEVEL_WARNING, TRACE_INPUT,
                     "%!FUNC! slot=%llu PENDING_RELEASE: report full, lift deferred",
                     (ULONG64)s);
@@ -570,9 +554,15 @@ AmtPtpProcessTouchFrame(
             st->LastNormX = 0;
             st->LastNormY = 0;
             break;
+        }
 
+        // ------------------------------------------------------------------
+        // ACTIVE: finger left surface — begin release sequence.
+        // No emission this frame; lift appears in the NEXT frame when the
+        // slot is seen in PENDING_RELEASE.
+        // ------------------------------------------------------------------
         case SLOT_ACTIVE:
-            // ACTIVE -> PENDING_RELEASE.
+        {
             TraceEvents(TRACE_LEVEL_VERBOSE, TRACE_INPUT,
                 "%!FUNC! slot=%llu ACTIVE -> PENDING_RELEASE", (ULONG64)s);
 
@@ -582,54 +572,56 @@ AmtPtpProcessTouchFrame(
             st->HystX        = 0;
             st->HystY        = 0;
             break;
+        }
 
+        // ------------------------------------------------------------------
+        // CONFIRMING (no match): finger lifted before reaching ACTIVE.
+        //
+        //   TipConfirmed >= 1 → genuine soft tap → frame N: emit TipSwitch=1,
+        //                        slot -> SOFT_PENDING_UP.
+        //                        Frame N+1 (above) emits TipSwitch=0.
+        //
+        //   TipConfirmed == 0 → brand-new slot, finger already gone →
+        //                        almost certainly noise → discard silently.
+        // ------------------------------------------------------------------
         case SLOT_CONFIRMING:
-            // CONFIRMING (no match) -> the finger lifted before we could
-            // confirm it as ACTIVE.
-            //
-            // FIX: If TipConfirmed >= 1 the hardware saw at least one
-            // real tip-down frame — this was a genuine (soft) tap.
-            // Synthesise a compressed tip-down + tip-up in this report so
-            // Windows registers the tap gesture.
-            //
-            // If TipConfirmed == 0 the slot was brand-new this frame and
-            // the finger is already gone — almost certainly electrical
-            // noise.  Discard silently.
+        {
             if (st->TipConfirmed >= 1) {
                 TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_INPUT,
-                    "%!FUNC! slot=%llu CONFIRMING -> synthetic soft tap "
-                    "(TipConfirmed=%d)", (ULONG64)s, st->TipConfirmed);
+                    "%!FUNC! slot=%llu CONFIRMING -> SOFT_PENDING_UP "
+                    "(soft tap frame N, TipConfirmed=%d)",
+                    (ULONG64)s, st->TipConfirmed);
 
-                // Use the last known position seeded in Phase 2b.
+                // AmtEmitSoftTap emits TipSwitch=1 and moves to SOFT_PENDING_UP.
+                // This IS an active contact this frame → count it.
                 reportSlots = AmtEmitSoftTap(
                     pCtx, s,
                     st->LastNormX, st->LastNormY,
                     PtpReport, reportSlots);
-                // AmtEmitSoftTap transitions the slot to COOLDOWN and
-                // clears all fields — nothing more to do here.
+                activeTipCount++;   // TipSwitch=1 entry
             } else {
                 TraceEvents(TRACE_LEVEL_VERBOSE, TRACE_INPUT,
                     "%!FUNC! slot=%llu CONFIRMING -> FREE (noise, tip=0)",
                     (ULONG64)s);
 
-                // Clean transition to FREE — clear all fields.
                 st->Phase        = SLOT_FREE;
                 st->TipConfirmed = 0;
                 st->FingerKey    = SLOT_KEY_NONE;
-                st->LastNormX    = 0;   // was seeded in Phase 2b; clear now
+                st->LastNormX    = 0;
                 st->LastNormY    = 0;
             }
             break;
+        }
 
         case SLOT_FREE:
         case SLOT_COOLDOWN:
         default:
-            // Nothing to do — handled in Phase 0 or already idle.
             break;
         }
     }
 
-    // Phase 4/5: emit contacts for matched fingers (with smoothing).
+    // Phase 4/5: emit contacts for matched (active) fingers.
+    // Every entry here has TipSwitch=1 — count each in activeTipCount.
     for (i = 0; i < raw_n; i++) {
         if (!fingerTipDown[i]) continue;
 
@@ -647,8 +639,7 @@ AmtPtpProcessTouchFrame(
             st->TipConfirmed >= TIP_CONFIRM_FRAMES);
 
         if (!alreadyActive && !justConfirmed) {
-            // Still CONFIRMING — update LastNormX/Y so 2a-bis stays
-            // accurate on the next frame even though we don't emit yet.
+            // Still CONFIRMING — update position for 2a-bis.
             st->LastNormX = fingerNormX[i];
             st->LastNormY = fingerNormY[i];
             continue;
@@ -659,20 +650,16 @@ AmtPtpProcessTouchFrame(
                 "%!FUNC! slot=%d CONFIRMING -> ACTIVE (ContactID=%lu)",
                 (INT)slot, pCtx->NextContactID);
 
-            st->Phase = SLOT_ACTIVE;
-            st->HystX = fingerNormX[i];
-            st->HystY = fingerNormY[i];
-            // Seed the smoother with the first active position.
+            st->Phase     = SLOT_ACTIVE;
+            st->HystX     = fingerNormX[i];
+            st->HystY     = fingerNormY[i];
             st->SmoothedX = fingerNormX[i];
             st->SmoothedY = fingerNormY[i];
-            // Assign a globally unique ContactID so that Windows PTP
-            // can track this physical finger across frames.
             st->ContactID = pCtx->NextContactID++;
         }
 
         USHORT reportX, reportY;
 
-        // Apply deadzone, then EMA smoothing.
         USHORT afterDeadzoneX = AmtApplyDeadzone(fingerNormX[i], &st->HystX);
         USHORT afterDeadzoneY = AmtApplyDeadzone(fingerNormY[i], &st->HystY);
 
@@ -686,23 +673,26 @@ AmtPtpProcessTouchFrame(
             f = (const struct TRACKPAD_FINGER*)(f_base + i * pCtx->DeviceInfo->tp_fsize);
             BOOLEAN confidence = (AmtRawToInteger(f->touch_minor) << 1) > 0;
 
-            // Use the stable ContactID assigned at CONFIRMING->ACTIVE.
-            // Using slot index as ContactID causes cursor jumps when
-            // a fast 2-finger tap is followed by a 1-finger tap, because
-            // the new finger reuses a slot whose old ContactID Windows
-            // still associates with the previous gesture's position.
             PtpReport->Contacts[reportSlots].ContactID  = st->ContactID;
             PtpReport->Contacts[reportSlots].X          = reportX;
             PtpReport->Contacts[reportSlots].Y          = reportY;
             PtpReport->Contacts[reportSlots].TipSwitch  = 1;
             PtpReport->Contacts[reportSlots].Confidence = confidence ? 1 : 0;
             reportSlots++;
+            activeTipCount++;   // TipSwitch=1 → active contact
         }
 
         st->LastNormX = reportX;
         st->LastNormY = reportY;
     }
 
+    // ContactCount = number of contacts with TipSwitch=1 in this snapshot.
+    // Lift entries (TipSwitch=0) are present in Contacts[] so Windows can
+    // match them by ContactID, but they are not "active" contacts.
+    PtpReport->ContactCount = activeTipCount;
+
+    // pReportSlots carries the total slot count back to the caller so it
+    // can pass the correct value to WdfMemoryCopyFromBuffer.
     *pReportSlots = reportSlots;
 
     AmtAssertSlotInvariants(pCtx);

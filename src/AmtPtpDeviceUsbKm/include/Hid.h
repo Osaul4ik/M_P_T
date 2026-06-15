@@ -92,92 +92,105 @@ typedef UCHAR HID_REPORT_DESCRIPTOR, *PHID_REPORT_DESCRIPTOR;
 // ---------------------------------------------------------------------------
 // Per-finger slot state machine (InterruptTouch.c / ProcessingThread.c)
 //
-// Lifecycle: FREE -> CONFIRMING -> ACTIVE -> PENDING_RELEASE -> COOLDOWN -> FREE
+// Lifecycle:
+//   FREE -> CONFIRMING -> ACTIVE -> PENDING_RELEASE -> COOLDOWN -> FREE
 //
-// Consolidates what used to be 8 parallel arrays (SlotInUse,
-// SlotPendingRelease, SlotCooldown, SlotTipConfirmed, SlotFingerKey,
-// LastNormX/Y, HystX/Y) into one struct per slot. The explicit Phase field
-// makes the FSM state unambiguous and keeps per-slot data co-located,
-// eliminating a whole class of "forgot to reset array N" bugs.
+//   CONFIRMING (lift before ACTIVE) -> SOFT_PENDING_UP -> COOLDOWN -> FREE
+//     Frame N  : SOFT_PENDING_UP emits TipSwitch=1 (contact appears)
+//     Frame N+1: SOFT_PENDING_UP emits TipSwitch=0 (contact disappears),
+//                slot -> COOLDOWN
+//
+// Each PTP_REPORT is a pure snapshot of contacts active in that frame.
+// TipSwitch transitions MUST span two separate frames — never within one
+// report.  ContactCount counts only TipSwitch=1 entries in the snapshot.
+//
+// Consolidates what used to be 8 parallel arrays into one struct per slot.
+// The explicit Phase field makes the FSM state unambiguous and keeps
+// per-slot data co-located, eliminating a whole class of
+// "forgot to reset array N" bugs.
 //
 // Field validity by phase (checked by AmtAssertSlotInvariants in
 // InterruptTouch.c, debug builds only):
 //
-//   FREE            : TipConfirmed==0, Cooldown==0, FingerKey==SLOT_KEY_NONE,
-//                      LastNormX/Y==0, HystX/Y==0
+//   FREE              : TipConfirmed==0, Cooldown==0, FingerKey==SLOT_KEY_NONE,
+//                        LastNormX/Y==0, HystX/Y==0
 //
-//   CONFIRMING      : 1 <= TipConfirmed < TIP_CONFIRM_FRAMES, Cooldown==0,
-//                      HystX/Y==0.
-//                      NOTE: LastNormX/Y ARE non-zero in CONFIRMING — they
-//                      are seeded in Phase 2b (FREE->CONFIRMING) and updated
-//                      in Phase 4/5 on every subsequent confirm frame.  They
-//                      serve as the position reference for 2a-bis rebind and
-//                      for the soft-tap emission on CONFIRMING->FREE.
-//                      AmtAssertSlotInvariants does NOT require them to be 0
-//                      in CONFIRMING (unlike the earlier design).
+//   CONFIRMING        : 1 <= TipConfirmed < TIP_CONFIRM_FRAMES, Cooldown==0,
+//                        HystX/Y==0.
+//                        NOTE: LastNormX/Y ARE non-zero in CONFIRMING — seeded
+//                        in Phase 2b (FREE->CONFIRMING) and updated each confirm
+//                        frame.  Used for 2a-bis rebind and soft-tap position.
 //
-//   ACTIVE          : TipConfirmed==TIP_CONFIRM_FRAMES, Cooldown==0,
-//                      FingerKey != SLOT_KEY_NONE
+//   ACTIVE            : TipConfirmed==TIP_CONFIRM_FRAMES, Cooldown==0,
+//                        FingerKey != SLOT_KEY_NONE
 //
-//   PENDING_RELEASE : TipConfirmed==0, Cooldown==0, HystX/Y==0,
-//                      FingerKey==SLOT_KEY_NONE.
-//                      LastNormX/Y hold the last reported position and are
-//                      used for the lift report; zeroed on ->COOLDOWN.
+//   PENDING_RELEASE   : TipConfirmed==0, Cooldown==0, HystX/Y==0,
+//                        FingerKey==SLOT_KEY_NONE.
+//                        LastNormX/Y hold last reported position for lift report;
+//                        zeroed on ->COOLDOWN.
 //
-//   COOLDOWN        : Cooldown>0, TipConfirmed==0, HystX/Y==0,
-//                      LastNormX/Y==0
+//   SOFT_PENDING_UP   : Synthetic soft-tap second frame.
+//                        TipConfirmed==0, Cooldown==0, HystX/Y==0,
+//                        FingerKey==SLOT_KEY_NONE.
+//                        LastNormX/Y hold the tap position; zeroed on ->COOLDOWN.
+//                        Frame N+1 emits TipSwitch=0 for ContactID, then ->COOLDOWN.
+//
+//   COOLDOWN          : Cooldown>0, TipConfirmed==0, HystX/Y==0,
+//                        LastNormX/Y==0
 // ---------------------------------------------------------------------------
 typedef enum _SLOT_PHASE {
-	SLOT_FREE            = 0,
-	SLOT_CONFIRMING      = 1,
-	SLOT_ACTIVE          = 2,
-	SLOT_PENDING_RELEASE = 3,
-	SLOT_COOLDOWN        = 4,
+    SLOT_FREE            = 0,
+    SLOT_CONFIRMING      = 1,
+    SLOT_ACTIVE          = 2,
+    SLOT_PENDING_RELEASE = 3,
+    SLOT_COOLDOWN        = 4,
+    SLOT_SOFT_PENDING_UP = 5,   // soft-tap: waiting to emit TipSwitch=0 next frame
 } SLOT_PHASE;
 
 #define SLOT_KEY_NONE  ((UCHAR)0xFF)
 
 typedef struct _SLOT_STATE {
-	SLOT_PHASE  Phase;
+    SLOT_PHASE  Phase;
 
-	// Debounce counter while CONFIRMING (0..TIP_CONFIRM_FRAMES).
-	UCHAR       TipConfirmed;
+    // Debounce counter while CONFIRMING (0..TIP_CONFIRM_FRAMES).
+    UCHAR       TipConfirmed;
 
-	// Frames remaining in COOLDOWN.
-	UCHAR       Cooldown;
+    // Frames remaining in COOLDOWN.
+    UCHAR       Cooldown;
 
-	// Identity key used for Phase 2a key-match. This is the USB-array
-	// index at the time of (re)bind, NOT a hardware finger ID -- the T2
-	// controller does not expose one. SLOT_KEY_NONE when not tracking.
-	UCHAR       FingerKey;
+    // Identity key used for Phase 2a key-match. This is the USB-array
+    // index at the time of (re)bind, NOT a hardware finger ID -- the T2
+    // controller does not expose one. SLOT_KEY_NONE when not tracking.
+    UCHAR       FingerKey;
 
-	// Stable ContactID assigned at CONFIRMING->ACTIVE transition (or
-	// synthesised by AmtEmitSoftTap for soft taps that never reach ACTIVE).
-	// Uses a monotonically increasing global counter so that every new
-	// contact gets a unique ID.  Windows PTP uses this to track physical
-	// fingers — if a new finger gets the same ContactID as an old one
-	// that just lifted, Windows may interpret it as a cursor jump.
-	ULONG       ContactID;
+    // Stable ContactID assigned at CONFIRMING->ACTIVE transition (or
+    // synthesised by AmtEmitSoftTap for soft taps that never reach ACTIVE).
+    // Uses a monotonically increasing global counter so that every new
+    // contact gets a unique ID.  Windows PTP uses this to track physical
+    // fingers — if a new finger gets the same ContactID as an old one
+    // that just lifted, Windows may interpret it as a cursor jump.
+    ULONG       ContactID;
 
-	// Last reported normalised coordinate.
-	//   CONFIRMING    : seeded on FREE->CONFIRMING (Phase 2b), updated
-	//                   each confirm frame (Phase 4/5).  Used for 2a-bis
-	//                   rebind and soft-tap position.
-	//   ACTIVE        : updated every frame; used as rebind reference.
-	//   PENDING_RELEASE: holds last ACTIVE position for the lift report.
-	//   FREE/COOLDOWN : must be 0.
-	USHORT      LastNormX;
-	USHORT      LastNormY;
+    // Last reported normalised coordinate.
+    //   CONFIRMING        : seeded on FREE->CONFIRMING (Phase 2b), updated
+    //                       each confirm frame (Phase 4/5).  Used for 2a-bis
+    //                       rebind and soft-tap position.
+    //   ACTIVE            : updated every frame; used as rebind reference.
+    //   PENDING_RELEASE   : holds last ACTIVE position for the lift report.
+    //   SOFT_PENDING_UP   : holds tap position for the TipSwitch=0 frame.
+    //   FREE/COOLDOWN     : must be 0.
+    USHORT      LastNormX;
+    USHORT      LastNormY;
 
-	// Hysteresis/deadzone baseline. Scoped to a single ACTIVE gesture:
-	// seeded on CONFIRMING->ACTIVE, zeroed on ACTIVE exit.
-	USHORT      HystX;
-	USHORT      HystY;
+    // Hysteresis/deadzone baseline. Scoped to a single ACTIVE gesture:
+    // seeded on CONFIRMING->ACTIVE, zeroed on ACTIVE exit.
+    USHORT      HystX;
+    USHORT      HystY;
 
-	// EMA smoothed coordinates (for cursor smoothness).
-	// Seeded on CONFIRMING->ACTIVE, updated every ACTIVE frame.
-	USHORT      SmoothedX;
-	USHORT      SmoothedY;
+    // EMA smoothed coordinates (for cursor smoothness).
+    // Seeded on CONFIRMING->ACTIVE, updated every ACTIVE frame.
+    USHORT      SmoothedX;
+    USHORT      SmoothedY;
 } SLOT_STATE, *PSLOT_STATE;
 
 #define PTP_BUTTON_TYPE_CLICK_PAD 0
@@ -190,70 +203,71 @@ typedef struct _SLOT_STATE {
 #define PTP_CONTACT_TIPSWITCH_BIT    2
 
 typedef struct _PTP_DEVICE_CAPS_FEATURE_REPORT {
-	UCHAR ReportID;
-	UCHAR MaximumContactPoints;
-	UCHAR ButtonType;
+    UCHAR ReportID;
+    UCHAR MaximumContactPoints;
+    UCHAR ButtonType;
 } PTP_DEVICE_CAPS_FEATURE_REPORT, *PPTP_DEVICE_CAPS_FEATURE_REPORT;
 
 typedef struct _PTP_DEVICE_HQA_CERTIFICATION_REPORT {
-	UCHAR ReportID;
-	UCHAR CertificationBlob[256];
+    UCHAR ReportID;
+    UCHAR CertificationBlob[256];
 } PTP_DEVICE_HQA_CERTIFICATION_REPORT, *PPTP_DEVICE_HQA_CERTIFICATION_REPORT;
 
 typedef struct _PTP_DEVICE_INPUT_MODE_REPORT {
-	UCHAR ReportID;
-	UCHAR Mode;
+    UCHAR ReportID;
+    UCHAR Mode;
 } PTP_DEVICE_INPUT_MODE_REPORT, *PPTP_DEVICE_INPUT_MODE_REPORT;
 
 #pragma pack(push)
 #pragma pack(1)
 typedef struct _PTP_DEVICE_SELECTIVE_REPORT_MODE_REPORT {
-	UCHAR ReportID;
-	UCHAR DeviceMode;
-	UCHAR ButtonReport : 1;
-	UCHAR SurfaceReport : 1;
-	UCHAR Padding : 6;
+    UCHAR ReportID;
+    UCHAR DeviceMode;
+    UCHAR ButtonReport : 1;
+    UCHAR SurfaceReport : 1;
+    UCHAR Padding : 6;
 } PTP_DEVICE_SELECTIVE_REPORT_MODE_REPORT, * PPTP_DEVICE_SELECTIVE_REPORT_MODE_REPORT;
 #pragma pack(pop)
 
 #pragma pack(push)
 #pragma pack(1)
 typedef struct _PTP_CONTACT {
-	UCHAR		Confidence : 1;
-	UCHAR		TipSwitch : 1;
-	UCHAR		Padding : 6;
-	ULONG		ContactID;
-	USHORT		X;
-	USHORT		Y;
+    UCHAR		Confidence : 1;
+    UCHAR		TipSwitch : 1;
+    UCHAR		Padding : 6;
+    ULONG		ContactID;
+    USHORT		X;
+    USHORT		Y;
 } PTP_CONTACT, * PPTP_CONTACT;
 #pragma pack(pop)
 
 /*
  * PTP input report — must match HID descriptor layout:
- *   ReportID       1 byte
- *   Contacts[5]   45 bytes (9 bytes each)
- *   ScanTime       2 bytes
- *   ContactCount   1 byte
+ *   ReportID        1 byte
+ *   Contacts[5]    45 bytes (9 bytes each)
+ *   ScanTime        2 bytes
+ *   ContactCount    1 byte
  *   IsButtonClicked 1 byte
- *   Total:        50 bytes
+ *   Total:         50 bytes
  *
- * ContactID is now a global counter, not slot index.
+ * ContactCount is the number of contacts with TipSwitch=1 in this snapshot.
+ * ContactID is a global counter, never a slot index.
  * See SLOT_STATE::ContactID and DEVICE_CONTEXT::NextContactID.
  */
 #pragma pack(push)
 #pragma pack(1)
 typedef struct _PTP_REPORT {
-	UCHAR       ReportID;
-	PTP_CONTACT Contacts[5];    // 5 × 9 = 45 bytes
-	USHORT      ScanTime;
-	UCHAR       ContactCount;
-	UCHAR       IsButtonClicked;
+    UCHAR       ReportID;
+    PTP_CONTACT Contacts[5];    // 5 × 9 = 45 bytes
+    USHORT      ScanTime;
+    UCHAR       ContactCount;
+    UCHAR       IsButtonClicked;
 } PTP_REPORT, *PPTP_REPORT;
 #pragma pack(pop)
 
 typedef struct _PTP_USERMODEAPP_CONF_REPORT {
-	UCHAR		ReportID;
-	UCHAR		PressureQualificationLevel;
-	UCHAR		SingleContactSizeQualificationLevel;
-	UCHAR		MultipleContactSizeQualificationLevel;
+    UCHAR		ReportID;
+    UCHAR		PressureQualificationLevel;
+    UCHAR		SingleContactSizeQualificationLevel;
+    UCHAR		MultipleContactSizeQualificationLevel;
 } PTP_USERMODEAPP_CONF_REPORT, *PPTP_USERMODEAPP_CONF_REPORT;
