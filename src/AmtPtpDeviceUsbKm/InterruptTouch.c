@@ -52,7 +52,7 @@
 
 // Palm rejection thresholds.
 #define PALM_ASPECT_RATIO_THRESHOLD  6
-#define PALM_MAJOR_THRESHOLD         350
+#define PALM_MAJOR_THRESHOLD         300
 
 // Coordinate smoothing (EMA) alpha.
 #define SMOOTHING_ALPHA_NUM  3
@@ -136,7 +136,7 @@ AmtIsPalm(
         }
     }
 
-    return (score >= 75);
+    return (score >= 70);
 }
 
 static inline INT
