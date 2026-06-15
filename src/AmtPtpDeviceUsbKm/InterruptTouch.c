@@ -44,7 +44,7 @@
 #define TIP_CONFIRM_FRAMES   2
 
 // Deadzone: hold last value if movement is below this many raw units.
-#define XY_DEADZONE_UNITS    1
+#define XY_DEADZONE_UNITS    2
 
 // Max position delta (raw units) for 2a-bis rebind; adaptive, see below.
 #define REBIND_MAX_DELTA_DENOM  300
@@ -334,10 +334,26 @@ AmtPtpProcessTouchFrame(
     const struct TRACKPAD_FINGER* f;
     size_t i, s;
 
-    // reportSlots  : total entries written to PtpReport->Contacts
-    // activeTipCount: entries with TipSwitch=1 (= ContactCount)
-    UCHAR reportSlots  = *pReportSlots;
-    UCHAR activeTipCount = 0;   // will become ContactCount
+    // reportSlots: total entries written to PtpReport->Contacts[].
+    //
+    // ContactCount = reportSlots (ALL entries, including TipSwitch=0 lifts).
+    //
+    // The PTP/HID spec says ContactCount tells Windows how many Contacts[]
+    // entries to read.  Windows iterates Contacts[0..ContactCount-1] and uses
+    // the per-entry TipSwitch bit to determine up/down state.
+    // If ContactCount < actual entries written, trailing entries are silently
+    // dropped — causing ghosts (lifts never delivered) and missed active
+    // contacts (scroll stops, single-tap not recognised).
+    //
+    // Ordering rule: emit TipSwitch=1 (active) entries BEFORE TipSwitch=0
+    // (lift) entries within a single frame.  This ensures that even if a
+    // future reader caps at an arbitrary ContactCount it sees active contacts
+    // first.  The ordering is enforced structurally: Phase 4/5 (active) runs
+    // before the lift-emission pass (Phase 3b).
+    UCHAR reportSlots      = *pReportSlots;
+    UCHAR liftSlots        = 0;   // TipSwitch=0 entries staged below
+    PTP_CONTACT liftBuf[PTP_MAX_CONTACT_POINTS];   // lift staging buffer
+    RtlZeroMemory(liftBuf, sizeof(liftBuf));
 
     INT rebindMaxDelta = AmtGetRebindMaxDelta(pCtx);
 
@@ -482,7 +498,10 @@ AmtPtpProcessTouchFrame(
         }
     }
 
-    // Phase 3: advance slots that have no finger match this frame.
+    // Phase 3a: state transitions for unmatched slots (no lift emission yet).
+    // Lift entries are collected into liftBuf and appended AFTER active
+    // contacts in Phase 3b, so that Windows always sees TipSwitch=1 entries
+    // first regardless of ContactCount.
     for (s = 0; s < PTP_MAX_CONTACT_POINTS; s++) {
         if (fingerForSlot[s] != SLOT_NONE) continue;
 
@@ -492,27 +511,28 @@ AmtPtpProcessTouchFrame(
 
         // ------------------------------------------------------------------
         // SOFT_PENDING_UP: frame N+1 of synthetic soft tap.
-        // Emit TipSwitch=0 (contact disappears) then -> COOLDOWN.
-        // This entry is a lift; it does NOT increment activeTipCount.
+        // Stage TipSwitch=0 into liftBuf; append after active contacts.
+        // SLOT_SOFT_PENDING_UP slots must NOT be matched by Phase 2a/2a-bis
+        // (FingerKey==SLOT_KEY_NONE, Phase not ACTIVE/CONFIRMING — already
+        // excluded from matching loops).
         // ------------------------------------------------------------------
         case SLOT_SOFT_PENDING_UP:
         {
             TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_INPUT,
-                "%!FUNC! slot=%llu SOFT_PENDING_UP -> COOLDOWN (soft tap frame N+1, ContactID=%lu)",
+                "%!FUNC! slot=%llu SOFT_PENDING_UP stage lift (ContactID=%lu)",
                 (ULONG64)s, st->ContactID);
 
-            if (reportSlots < PTP_MAX_CONTACT_POINTS) {
-                PtpReport->Contacts[reportSlots].ContactID  = st->ContactID;
-                PtpReport->Contacts[reportSlots].X          = st->LastNormX;
-                PtpReport->Contacts[reportSlots].Y          = st->LastNormY;
-                PtpReport->Contacts[reportSlots].TipSwitch  = 0;
-                PtpReport->Contacts[reportSlots].Confidence = 1;
-                reportSlots++;
-                // TipSwitch=0 → lift → NOT counted in activeTipCount
+            if (liftSlots < PTP_MAX_CONTACT_POINTS) {
+                liftBuf[liftSlots].ContactID  = st->ContactID;
+                liftBuf[liftSlots].X          = st->LastNormX;
+                liftBuf[liftSlots].Y          = st->LastNormY;
+                liftBuf[liftSlots].TipSwitch  = 0;
+                liftBuf[liftSlots].Confidence = 1;
+                liftSlots++;
             } else {
-                // No room — stay in SOFT_PENDING_UP, retry next frame.
+                // Staging buffer full — defer to next frame.
                 TraceEvents(TRACE_LEVEL_WARNING, TRACE_INPUT,
-                    "%!FUNC! slot=%llu SOFT_PENDING_UP: report full, tip-up deferred",
+                    "%!FUNC! slot=%llu SOFT_PENDING_UP: lift buffer full, deferred",
                     (ULONG64)s);
                 break;
             }
@@ -526,22 +546,20 @@ AmtPtpProcessTouchFrame(
 
         // ------------------------------------------------------------------
         // PENDING_RELEASE: normal finger lift.
-        // Emit TipSwitch=0 then -> COOLDOWN.
-        // Lift entry does NOT increment activeTipCount.
+        // Stage TipSwitch=0 into liftBuf; append after active contacts.
         // ------------------------------------------------------------------
         case SLOT_PENDING_RELEASE:
         {
-            if (reportSlots < PTP_MAX_CONTACT_POINTS) {
-                PtpReport->Contacts[reportSlots].ContactID  = st->ContactID;
-                PtpReport->Contacts[reportSlots].X          = st->LastNormX;
-                PtpReport->Contacts[reportSlots].Y          = st->LastNormY;
-                PtpReport->Contacts[reportSlots].TipSwitch  = 0;
-                PtpReport->Contacts[reportSlots].Confidence = 1;
-                reportSlots++;
-                // TipSwitch=0 → NOT counted in activeTipCount
+            if (liftSlots < PTP_MAX_CONTACT_POINTS) {
+                liftBuf[liftSlots].ContactID  = st->ContactID;
+                liftBuf[liftSlots].X          = st->LastNormX;
+                liftBuf[liftSlots].Y          = st->LastNormY;
+                liftBuf[liftSlots].TipSwitch  = 0;
+                liftBuf[liftSlots].Confidence = 1;
+                liftSlots++;
             } else {
                 TraceEvents(TRACE_LEVEL_WARNING, TRACE_INPUT,
-                    "%!FUNC! slot=%llu PENDING_RELEASE: report full, lift deferred",
+                    "%!FUNC! slot=%llu PENDING_RELEASE: lift buffer full, deferred",
                     (ULONG64)s);
                 break;
             }
@@ -559,7 +577,7 @@ AmtPtpProcessTouchFrame(
         // ------------------------------------------------------------------
         // ACTIVE: finger left surface — begin release sequence.
         // No emission this frame; lift appears in the NEXT frame when the
-        // slot is seen in PENDING_RELEASE.
+        // slot is seen in PENDING_RELEASE (and staged into liftBuf there).
         // ------------------------------------------------------------------
         case SLOT_ACTIVE:
         {
@@ -577,12 +595,13 @@ AmtPtpProcessTouchFrame(
         // ------------------------------------------------------------------
         // CONFIRMING (no match): finger lifted before reaching ACTIVE.
         //
-        //   TipConfirmed >= 1 → genuine soft tap → frame N: emit TipSwitch=1,
-        //                        slot -> SOFT_PENDING_UP.
-        //                        Frame N+1 (above) emits TipSwitch=0.
+        //   TipConfirmed >= 1 → genuine soft tap.
+        //     AmtEmitSoftTap writes TipSwitch=1 directly into Contacts[]
+        //     (active contact, frame N).  Slot -> SOFT_PENDING_UP.
+        //     Frame N+1 (above) stages TipSwitch=0 into liftBuf.
         //
         //   TipConfirmed == 0 → brand-new slot, finger already gone →
-        //                        almost certainly noise → discard silently.
+        //     almost certainly noise → discard silently, no emission.
         // ------------------------------------------------------------------
         case SLOT_CONFIRMING:
         {
@@ -592,16 +611,15 @@ AmtPtpProcessTouchFrame(
                     "(soft tap frame N, TipConfirmed=%d)",
                     (ULONG64)s, st->TipConfirmed);
 
-                // AmtEmitSoftTap emits TipSwitch=1 and moves to SOFT_PENDING_UP.
-                // This IS an active contact this frame → count it.
+                // Emits TipSwitch=1 directly to Contacts[reportSlots].
+                // Soft-tap down is an active contact — goes BEFORE lifts.
                 reportSlots = AmtEmitSoftTap(
                     pCtx, s,
                     st->LastNormX, st->LastNormY,
                     PtpReport, reportSlots);
-                activeTipCount++;   // TipSwitch=1 entry
             } else {
                 TraceEvents(TRACE_LEVEL_VERBOSE, TRACE_INPUT,
-                    "%!FUNC! slot=%llu CONFIRMING -> FREE (noise, tip=0)",
+                    "%!FUNC! slot=%llu CONFIRMING -> FREE (noise, TipConfirmed=0)",
                     (ULONG64)s);
 
                 st->Phase        = SLOT_FREE;
@@ -620,8 +638,9 @@ AmtPtpProcessTouchFrame(
         }
     }
 
-    // Phase 4/5: emit contacts for matched (active) fingers.
-    // Every entry here has TipSwitch=1 — count each in activeTipCount.
+    // Phase 4/5: emit active (TipSwitch=1) contacts for matched fingers.
+    // These are written BEFORE lift entries (Phase 3b below) so Windows
+    // sees active contacts at lower Contacts[] indices.
     for (i = 0; i < raw_n; i++) {
         if (!fingerTipDown[i]) continue;
 
@@ -639,7 +658,7 @@ AmtPtpProcessTouchFrame(
             st->TipConfirmed >= TIP_CONFIRM_FRAMES);
 
         if (!alreadyActive && !justConfirmed) {
-            // Still CONFIRMING — update position for 2a-bis.
+            // Still CONFIRMING — update position for 2a-bis, no emission.
             st->LastNormX = fingerNormX[i];
             st->LastNormY = fingerNormY[i];
             continue;
@@ -658,13 +677,11 @@ AmtPtpProcessTouchFrame(
             st->ContactID = pCtx->NextContactID++;
         }
 
-        USHORT reportX, reportY;
-
         USHORT afterDeadzoneX = AmtApplyDeadzone(fingerNormX[i], &st->HystX);
         USHORT afterDeadzoneY = AmtApplyDeadzone(fingerNormY[i], &st->HystY);
 
-        reportX = AmtSmoothCoord(afterDeadzoneX, st->SmoothedX);
-        reportY = AmtSmoothCoord(afterDeadzoneY, st->SmoothedY);
+        USHORT reportX = AmtSmoothCoord(afterDeadzoneX, st->SmoothedX);
+        USHORT reportY = AmtSmoothCoord(afterDeadzoneY, st->SmoothedY);
 
         st->SmoothedX = reportX;
         st->SmoothedY = reportY;
@@ -679,20 +696,28 @@ AmtPtpProcessTouchFrame(
             PtpReport->Contacts[reportSlots].TipSwitch  = 1;
             PtpReport->Contacts[reportSlots].Confidence = confidence ? 1 : 0;
             reportSlots++;
-            activeTipCount++;   // TipSwitch=1 → active contact
         }
 
         st->LastNormX = reportX;
         st->LastNormY = reportY;
     }
 
-    // ContactCount = number of contacts with TipSwitch=1 in this snapshot.
-    // Lift entries (TipSwitch=0) are present in Contacts[] so Windows can
-    // match them by ContactID, but they are not "active" contacts.
-    PtpReport->ContactCount = activeTipCount;
+    // Phase 3b: append staged lift entries (TipSwitch=0) after active contacts.
+    // Ordering guarantee: active contacts (TipSwitch=1) already written above;
+    // lift entries follow so Windows processes them in the correct order when
+    // it iterates Contacts[0..ContactCount-1].
+    for (UCHAR li = 0; li < liftSlots && reportSlots < PTP_MAX_CONTACT_POINTS; li++) {
+        PtpReport->Contacts[reportSlots] = liftBuf[li];
+        reportSlots++;
+    }
 
-    // pReportSlots carries the total slot count back to the caller so it
-    // can pass the correct value to WdfMemoryCopyFromBuffer.
+    // ContactCount = total entries written (TipSwitch=1 AND TipSwitch=0).
+    // Windows uses this as the loop bound for Contacts[].  Missing lifts
+    // (ContactCount too low) leave ghost contacts; missing actives cause
+    // dropped fingers and gestures that stop prematurely.
+    PtpReport->ContactCount = reportSlots;
+
+    // Return total entries to caller (used for WdfMemoryCopyFromBuffer sizing).
     *pReportSlots = reportSlots;
 
     AmtAssertSlotInvariants(pCtx);
