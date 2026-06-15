@@ -44,23 +44,46 @@
 #define TIP_CONFIRM_FRAMES 2
 
 // Deadzone: hold last value if movement is below this many raw units.
+// macOS keeps the cursor rock-steady when the finger is resting; a small
+// deadzone removes sensor jitter without adding perceptible lag.  Kept at 2
+// (raw sensor units) — large enough to swallow noise, small enough that slow
+// deliberate scrolls and fine cursor moves are not "stair-stepped".
 #define XY_DEADZONE_UNITS 2
 
 // Max position delta (raw units) for 2a-bis rebind; adaptive, see below.
 #define REBIND_MAX_DELTA_DENOM 300
 #define REBIND_MIN_DELTA 30
 
-// Palm rejection: unused threshold constants (kept as documentation
-// for the scoring function thresholds).
-#define PALM_ASPECT_RATIO_THRESHOLD 6
-#define PALM_MAJOR_THRESHOLD 300
+// ---------------------------------------------------------------------------
+// Palm rejection thresholds (macOS-style two-tier model).
+//
+// macOS does NOT freeze the whole trackpad when a palm touches down: it
+// rejects only the offending contact and keeps tracking the other fingers,
+// so a two-finger scroll keeps working even while a thumb/palm rests on the
+// surface.  Only a LARGE flat palm (the "resting whole hand while typing"
+// case) suppresses all input.
+//
+// We mirror that with two tiers:
+//   - PER-CONTACT reject  : a contact that scores as palm is dropped from
+//                           THIS frame only; other fingers keep tracking.
+//   - GLOBAL suppress     : only triggered by a clearly LARGE palm
+//                           (touch_major >= PALM_LARGE_MAJOR) — a flat hand
+//                           resting on the pad.  Blocks all input until every
+//                           contact lifts (prevents typing-palm false input).
+// ---------------------------------------------------------------------------
+#define PALM_LARGE_MAJOR 460   // flat-palm footprint → global suppress
 
 // Coordinate smoothing (EMA) alpha = ALPHA_NUM / ALPHA_DEN.
 // Higher numerator = more responsive (less smoothing).
-// At 5/8 = 0.625 the finger position tracks 62.5% new value per frame —
-// responsive enough for fast scrolls while still filtering sensor noise.
+//
+// macOS feel: cursor/scroll motion should be smooth but NOT laggy.  At 5/8 =
+// 0.625 the position tracks 62.5% of the new value each frame.  Combined with
+// the per-axis deadzone this filters sensor noise while keeping fast flicks
+// and scrolls feeling 1:1.  (Lower this toward 1/2 for more glide, raise it
+// toward 3/4 for snappier tracking.)
 #define SMOOTHING_ALPHA_NUM 5
 #define SMOOTHING_ALPHA_DEN 8
+
 
 #define SLOT_NONE ((UCHAR)PTP_MAX_CONTACT_POINTS)
 
@@ -108,7 +131,14 @@ AmtSmoothCoord(
     return (USHORT)(blended < 0 ? 0 : blended);
 }
 
-static inline BOOLEAN
+// Palm classification result (macOS-style two-tier).
+typedef enum _PALM_CLASS {
+    PALM_NONE  = 0,   // normal finger / thumb — track it
+    PALM_LOCAL = 1,   // palm-like contact — reject THIS contact only
+    PALM_LARGE = 2,   // large flat palm — suppress ALL input globally
+} PALM_CLASS;
+
+static inline PALM_CLASS
 AmtIsPalm(
     _In_ const struct TRACKPAD_FINGER *f,
     _In_ const struct BCM5974_CONFIG *devInfo,
@@ -116,6 +146,16 @@ AmtIsPalm(
     _In_ USHORT normY)
 {
     INT score = 0;
+
+    // A very large footprint is a flat resting palm: this is the only case
+    // that should freeze the whole trackpad (matches macOS "ignore while a
+    // hand rests on the pad" behaviour).  A thumb or palm EDGE does NOT reach
+    // this size and is handled as a per-contact reject below.
+    if (f->touch_major >= PALM_LARGE_MAJOR)
+    {
+        return PALM_LARGE;
+    }
+
 
     // Size-based scoring.
     // Apple trackpad sends touch_major/touch_minor in raw sensor units
@@ -172,8 +212,13 @@ AmtIsPalm(
     // With these weights a palm with touch_major ~270 and ratio ~10:1
     // scores 35+20 = 55 (or 35+20+8 = 63 on edge), while a large finger
     // (touch_major ~220, ratio ~1.5:1) scores at most 15+0 = 15.
-    return (score >= 55);
+    //
+    // A score-based palm is rejected PER-CONTACT only (PALM_LOCAL): the other
+    // fingers in the frame keep tracking, so two-finger scroll/gestures survive
+    // a thumb or palm edge resting on the pad — just like macOS.
+    return (score >= 55) ? PALM_LOCAL : PALM_NONE;
 }
+
 
 static inline INT
 AmtAbsDelta(_In_ INT a, _In_ INT b)
@@ -430,20 +475,22 @@ VOID AmtPtpProcessTouchFrame(
 
     // Phase 1: per-finger tip-down + normalised coords + array-index key.
     //
-    // Palm-lock logic:
-    //   - If ANY finger is classified as palm, ALL fingers are rejected
-    //     (fingerTipDown[i] = FALSE for every i) and pCtx->PalmDetected is set.
-    //   - In the NEXT frame after the last palm lifts, input is still blocked
-    //     (drain frame) so existing slot state machines can properly sequence
-    //     PENDING_RELEASE->COOLDOWN->FREE.  After that frame PalmDetected is
-    //     cleared and normal processing resumes.
-    //   - This prevents false touches from non-palm fingers while the user is
-    //     resting a palm on the trackpad (e.g., while typing).
+    // Palm rejection (macOS-style two-tier):
+    //   - PER-CONTACT (PALM_LOCAL): a single contact that scores as a palm /
+    //     thumb edge is dropped (fingerTipDown[i] = FALSE) but the OTHER
+    //     fingers keep tracking.  This is what lets a two-finger scroll keep
+    //     working while a thumb or palm edge rests on the pad.
+    //   - GLOBAL  (PALM_LARGE): a large flat palm footprint suppresses ALL
+    //     input and arms pCtx->PalmDetected.  Input stays blocked until EVERY
+    //     contact has physically lifted (prevents typing-palm false input).
+    //   - After the last contact lifts, PalmDetected is cleared on a later
+    //     frame so existing slot state machines can drain
+    //     PENDING_RELEASE->COOLDOWN->FREE cleanly.
     BOOLEAN fingerTipDown[PTP_MAX_CONTACT_POINTS] = {FALSE};
     USHORT fingerNormX[PTP_MAX_CONTACT_POINTS] = {0};
     USHORT fingerNormY[PTP_MAX_CONTACT_POINTS] = {0};
     UCHAR fingerKey[PTP_MAX_CONTACT_POINTS];
-    BOOLEAN anyPalmThisFrame = FALSE;
+    BOOLEAN largePalmThisFrame = FALSE;
 
     for (i = 0; i < PTP_MAX_CONTACT_POINTS; i++)
         fingerKey[i] = SLOT_KEY_NONE;
@@ -465,11 +512,24 @@ VOID AmtPtpProcessTouchFrame(
 
         AmtNormalizeFinger(pCtx, f, &fingerNormX[i], &fingerNormY[i]);
 
-        if (AmtIsPalm(f, pCtx->DeviceInfo, fingerNormX[i], fingerNormY[i]))
+        PALM_CLASS palm = AmtIsPalm(f, pCtx->DeviceInfo, fingerNormX[i], fingerNormY[i]);
+
+        if (palm == PALM_LARGE)
         {
-            anyPalmThisFrame = TRUE;
+            // Flat resting palm — arm the global suppress.  Other fingers are
+            // cleared below once largePalmThisFrame is known.
+            largePalmThisFrame = TRUE;
             TraceEvents(TRACE_LEVEL_VERBOSE, TRACE_INPUT,
-                        "%!FUNC! finger=%d rejected as palm", (INT)i);
+                        "%!FUNC! finger=%d LARGE palm — global suppress", (INT)i);
+            continue;
+        }
+
+        if (palm == PALM_LOCAL)
+        {
+            // Reject only THIS contact; the others remain valid (macOS-like).
+            fingerTipDown[i] = FALSE;
+            TraceEvents(TRACE_LEVEL_VERBOSE, TRACE_INPUT,
+                        "%!FUNC! finger=%d rejected as palm (per-contact)", (INT)i);
             continue;
         }
 
@@ -477,19 +537,19 @@ VOID AmtPtpProcessTouchFrame(
         fingerKey[i] = (UCHAR)i;
     }
 
-    // Palm-lock gate: once a palm is detected, ALL touch input is
-    // suppressed until ALL fingers have been lifted from the surface.
+    // Palm-lock gate: only a LARGE flat palm suppresses ALL touch input, and
+    // it stays suppressed until ALL fingers have been lifted from the surface.
     //
-    // Rationale: when a palm is present, the controller's finger data
+    // Rationale: when a flat palm is present, the controller's finger data
     // is unreliable — the partially-lifted palm may fail the per-frame
     // scoring classifier but still have a valid tip-down footprint on
     // the sensor.  If we unblock while any contact remains, that contact
     // can inject false gestures (cursor jumps, phantom scrolls, taps).
     //
     // Therefore the lock is released only when a frame arrives with
-    // ZERO tip-down contacts — proving that the user has physically
-    // removed ALL fingers (including the palm) from the surface.
-    if (anyPalmThisFrame)
+    // ZERO contacts — proving that the user has physically removed ALL
+    // fingers (including the palm) from the surface.
+    if (largePalmThisFrame)
     {
         pCtx->PalmDetected = TRUE;
         for (i = 0; i < PTP_MAX_CONTACT_POINTS; i++)
@@ -497,12 +557,13 @@ VOID AmtPtpProcessTouchFrame(
             fingerTipDown[i] = FALSE;
         }
         TraceEvents(TRACE_LEVEL_VERBOSE, TRACE_INPUT,
-                    "%!FUNC! Palm detected — all input suppressed");
+                    "%!FUNC! Large palm detected — all input suppressed");
     }
     else if (pCtx->PalmDetected)
     {
         // Check if ALL physical contacts have been completely lifted
         // from the surface.  We use a raw presence test (any non-zero
+
         // touch_major or touch_minor) rather than the tip-down threshold,
         // because a partially-lifted palm may still have a light footprint
         // on the sensor below TIP_MAJOR/MINOR_THRESHOLD but should still
