@@ -118,6 +118,13 @@ typedef struct _DEVICE_CONTEXT
     ULONG               NextContactID;
 
     // ---------------------------------------------------------------
+    // Palm lock: when TRUE, ALL touch inputs are rejected
+    // until no palm is detected for one full frame.
+    // Owned by processing thread (PASSIVE_LEVEL) only.
+    // ---------------------------------------------------------------
+    BOOLEAN             PalmDetected;
+
+    // ---------------------------------------------------------------
     // Diagnostics (interlocked — safe from any level)
     // ---------------------------------------------------------------
     volatile LONG       DroppedPackets;   // incremented when ring is full

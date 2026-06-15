@@ -397,14 +397,26 @@ VOID AmtPtpProcessTouchFrame(
     }
 
     // Phase 1: per-finger tip-down + normalised coords + array-index key.
+    //
+    // Palm-lock logic:
+    //   - If ANY finger is classified as palm, ALL fingers are rejected
+    //     (fingerTipDown[i] = FALSE for every i) and pCtx->PalmDetected is set.
+    //   - In the NEXT frame after the last palm lifts, input is still blocked
+    //     (drain frame) so existing slot state machines can properly sequence
+    //     PENDING_RELEASE->COOLDOWN->FREE.  After that frame PalmDetected is
+    //     cleared and normal processing resumes.
+    //   - This prevents false touches from non-palm fingers while the user is
+    //     resting a palm on the trackpad (e.g., while typing).
     BOOLEAN fingerTipDown[PTP_MAX_CONTACT_POINTS] = {FALSE};
     USHORT fingerNormX[PTP_MAX_CONTACT_POINTS] = {0};
     USHORT fingerNormY[PTP_MAX_CONTACT_POINTS] = {0};
     UCHAR fingerKey[PTP_MAX_CONTACT_POINTS];
+    BOOLEAN anyPalmThisFrame = FALSE;
 
     for (i = 0; i < PTP_MAX_CONTACT_POINTS; i++)
         fingerKey[i] = SLOT_KEY_NONE;
 
+    // First pass: classify all fingers.
     for (i = 0; i < raw_n; i++)
     {
         f = (const struct TRACKPAD_FINGER *)(f_base + i * pCtx->DeviceInfo->tp_fsize);
@@ -423,7 +435,7 @@ VOID AmtPtpProcessTouchFrame(
 
         if (AmtIsPalm(f, pCtx->DeviceInfo, fingerNormX[i], fingerNormY[i]))
         {
-            fingerTipDown[i] = FALSE;
+            anyPalmThisFrame = TRUE;
             TraceEvents(TRACE_LEVEL_VERBOSE, TRACE_INPUT,
                         "%!FUNC! finger=%d rejected as palm", (INT)i);
             continue;
@@ -432,6 +444,36 @@ VOID AmtPtpProcessTouchFrame(
         fingerTipDown[i] = TRUE;
         fingerKey[i] = (UCHAR)i;
     }
+
+    // Palm-lock gate: if a palm was detected this frame, or if the palm
+    // lock is still active from the previous frame (drain frame), suppress
+    // ALL touch input so no non-palm finger can generate events.
+    if (anyPalmThisFrame)
+    {
+        pCtx->PalmDetected = TRUE;
+        for (i = 0; i < PTP_MAX_CONTACT_POINTS; i++)
+        {
+            fingerTipDown[i] = FALSE;
+        }
+        TraceEvents(TRACE_LEVEL_VERBOSE, TRACE_INPUT,
+                    "%!FUNC! Palm detected — all input suppressed");
+    }
+    else if (pCtx->PalmDetected)
+    {
+        // Drain frame: no palms this frame, but the lock was active.
+        // Block all input for one more frame so slot state machines
+        // can drain (ACTIVE->PENDING_RELEASE->COOLDOWN->FREE).
+        // After this frame we release the lock.
+        pCtx->PalmDetected = FALSE;
+        for (i = 0; i < PTP_MAX_CONTACT_POINTS; i++)
+        {
+            fingerTipDown[i] = FALSE;
+        }
+        TraceEvents(TRACE_LEVEL_VERBOSE, TRACE_INPUT,
+                    "%!FUNC! Palm lifted — drain frame, input suppressed");
+    }
+    // else: normal operation — PalmDetected is FALSE and no palm this frame.
+    // fingerTipDown values from the per-finger pass are used as-is.
 
     // Phase 2: match tip-down fingers to slots.
     UCHAR slotForFinger[PTP_MAX_CONTACT_POINTS];

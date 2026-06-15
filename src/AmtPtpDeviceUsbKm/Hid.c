@@ -336,25 +336,34 @@ AmtPtpReportFeatures(
 
 	switch (pHidPacket->reportId)
 	{
-		case REPORTID_DEVICE_CAPS:
-		{
-			TraceEvents(
-				TRACE_LEVEL_INFORMATION, TRACE_DRIVER,
-				"%!FUNC! Report REPORTID_DEVICE_CAPS is requested"
-			);
+        case REPORTID_DEVICE_CAPS:
+        {
+            TraceEvents(
+                TRACE_LEVEL_INFORMATION, TRACE_DRIVER,
+                "%!FUNC! Report REPORTID_DEVICE_CAPS is requested"
+            );
 
-			// Size sanity check
-			ReportSize = sizeof(PTP_DEVICE_CAPS_FEATURE_REPORT);
-			if (pHidPacket->reportBufferLen < ReportSize) {
-				status = STATUS_INVALID_BUFFER_SIZE;
-				TraceEvents(
-					TRACE_LEVEL_ERROR, TRACE_DRIVER,
-					"%!FUNC! Report buffer is too small"
-				);
-				goto exit;
-			}
+            if (pHidPacket->reportBuffer == NULL) {
+                status = STATUS_INVALID_PARAMETER;
+                TraceEvents(
+                    TRACE_LEVEL_ERROR, TRACE_DRIVER,
+                    "%!FUNC! Report buffer pointer is NULL for DEVICE_CAPS"
+                );
+                goto exit;
+            }
 
-			PPTP_DEVICE_CAPS_FEATURE_REPORT capsReport = (PPTP_DEVICE_CAPS_FEATURE_REPORT) pHidPacket->reportBuffer;
+            // Size sanity check
+            ReportSize = sizeof(PTP_DEVICE_CAPS_FEATURE_REPORT);
+            if (pHidPacket->reportBufferLen < ReportSize) {
+                status = STATUS_INVALID_BUFFER_SIZE;
+                TraceEvents(
+                    TRACE_LEVEL_ERROR, TRACE_DRIVER,
+                    "%!FUNC! Report buffer is too small"
+                );
+                goto exit;
+            }
+
+            PPTP_DEVICE_CAPS_FEATURE_REPORT capsReport = (PPTP_DEVICE_CAPS_FEATURE_REPORT) pHidPacket->reportBuffer;
 			capsReport->MaximumContactPoints = PTP_MAX_CONTACT_POINTS;
 			capsReport->ButtonType = PTP_BUTTON_TYPE_CLICK_PAD;
 			capsReport->ReportID = REPORTID_DEVICE_CAPS;
