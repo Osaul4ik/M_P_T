@@ -114,37 +114,46 @@ AmtIsPalm(
 {
     INT score = 0;
 
+    // Size-based scoring.
+    // Apple trackpad sends touch_major/touch_minor in raw sensor units
+    // (range ~0-2048). A normal finger is ~100-250, thumb ~200-350,
+    // palm flat >380, palm edge ~250-380.
     if (f->touch_major >= 380)
     {
-        score += 45; // майже гарантована долоня
+        score += 50; // large contact — almost certainly palm
     }
     else if (f->touch_major > 260)
     {
-        score += 25; // великий палець / частина долоні
+        score += 35; // medium-large — thumb or palm edge
     }
     else if (f->touch_major > 190)
     {
-        score += 10; // середній палець (майже не чіпаємо)
+        score += 15; // medium — large finger or thumb tip
     }
 
+    // Aspect ratio: palm has large major but small minor (elongated shape).
+    // A normal finger has ratio ~100-300, thumb ~200-500, palm >600.
     if (f->touch_minor > 0 && f->touch_major > 120)
     {
         INT ratio = (INT)f->touch_major * 100 / (INT)f->touch_minor;
 
         if (ratio > 1200)
-            score += 18; // плоска долоня
+            score += 30; // extremely elongated (certain palm)
         else if (ratio > 900)
-            score += 10;
-        else if (ratio > 650)
-            score += 4;
+            score += 20; // very elongated (likely palm)
+        else if (ratio > 600)
+            score += 10; // elongated (possible palm)
     }
 
-    if (f->touch_major > 220)
+    // Edge proximity: palms tend to rest at the edges/corners.
+    // Lowered the size threshold so even medium contacts near the
+    // edge get a bonus.
+    if (f->touch_major > 150)
     {
         INT xRange = devInfo->x.max - devInfo->x.min;
         INT yRange = devInfo->y.max - devInfo->y.min;
 
-        INT edgePctX = xRange / 28; // трохи ширше (було 32)
+        INT edgePctX = xRange / 28;
         INT edgePctY = yRange / 28;
 
         if (normX < edgePctX ||
@@ -152,11 +161,15 @@ AmtIsPalm(
             normY < edgePctY ||
             normY > (yRange - edgePctY))
         {
-            score += 6;
+            score += 8;
         }
     }
 
-    return (score >= 60);
+    // Threshold: 55.
+    // With these weights a palm with touch_major ~270 and ratio ~10:1
+    // scores 35+20 = 55 (or 35+20+8 = 63 on edge), while a large finger
+    // (touch_major ~220, ratio ~1.5:1) scores at most 15+0 = 15.
+    return (score >= 55);
 }
 
 static inline INT
