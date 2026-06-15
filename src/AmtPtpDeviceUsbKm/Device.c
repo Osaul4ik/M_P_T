@@ -84,8 +84,13 @@ AmtPtpResetSlotState(
     pCtx->PalmCooldown = 0;
 
     // Reset the global ContactID allocator so that IDs are unique
-    // within each D0 power cycle. 1-based so that 0 means "no contact".
-    pCtx->NextContactID = 1;
+    // within each D0 power cycle.  Start at a semi-random offset to
+    // minimise the chance that a ContactID collides with one that
+    // Windows still associates with a previous gesture.
+    // Use lower bits of the performance counter for seed.
+    LARGE_INTEGER perfCount;
+    KeQueryPerformanceCounter(&perfCount);
+    pCtx->NextContactID = 1000 + (ULONG)(perfCount.QuadPart & 0xFFFF);
 }
 
 // ---- CreateDevice ----------------------------------------------------------
