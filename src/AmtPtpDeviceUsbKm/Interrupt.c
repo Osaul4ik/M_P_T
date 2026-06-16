@@ -255,9 +255,6 @@ AmtPtpEvtUsbInterruptPipeReadComplete(
 
         for (i = 0; i < raw_n; i++) fingerAlive[i] = FALSE;
 
-        INT xRange = pDeviceContext->DeviceInfo->x.max - pDeviceContext->DeviceInfo->x.min;
-        INT yRange = pDeviceContext->DeviceInfo->y.max - pDeviceContext->DeviceInfo->y.min;
-
         for (i = 0; i < raw_n; i++)
         {
             f = (const struct TRACKPAD_FINGER*)(f_base + i * fingerprintSize);
