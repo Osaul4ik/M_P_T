@@ -1,0 +1,103 @@
+name: Build Drivers
+
+on:
+  push:
+    branches: [ master ]
+  workflow_dispatch:
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  build:
+    runs-on: windows-2022
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Add MSBuild to PATH
+      uses: microsoft/setup-msbuild@v2
+
+    - name: Install WDK
+      run: |
+        $wdkUrl = "https://go.microsoft.com/fwlink/?linkid=2085767"
+        $wdkInstaller = "$env:TEMP\wdksetup.exe"
+        Invoke-WebRequest -Uri $wdkUrl -OutFile $wdkInstaller
+        Start-Process -FilePath $wdkInstaller -ArgumentList "/quiet /norestart" -Wait
+      shell: powershell
+
+    - name: Build SPI Driver
+      run: |
+        msbuild src/AmtPtpDeviceSpiKm/AmtPtpDeviceSpiKm.vcxproj `
+          /p:Configuration=Release `
+          /p:Platform=x64 `
+          /p:WindowsTargetPlatformVersion=10.0.26100.0
+      shell: powershell
+
+    - name: Build USB KM Driver
+      run: |
+        msbuild src/AmtPtpDeviceUsbKm/AmtPtpDeviceUsbKm.vcxproj `
+          /p:Configuration=Release `
+          /p:Platform=x64 `
+          /p:WindowsTargetPlatformVersion=10.0.26100.0
+      shell: powershell
+
+    - name: Build USB UM (User-mode) Driver
+      run: |
+        msbuild src/AmtPtpDeviceUsbUm/MagicTrackpad2PtpDevice.vcxproj `
+          /p:Configuration=Release `
+          /p:Platform=x64 `
+          /p:WindowsTargetPlatformVersion=10.0.26100.0
+      shell: powershell
+
+    - name: Build HID Filter Driver
+      run: |
+        msbuild src/AmtPtpHidFilter/AmtPtpHidFilter.vcxproj `
+          /p:Configuration=Release `
+          /p:Platform=x64 `
+          /p:WindowsTargetPlatformVersion=10.0.26100.0
+      shell: powershell
+
+    - name: Upload SPI Driver artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: AmtPtpDeviceSpiKm-Release-x64
+        path: |
+          src/AmtPtpDeviceSpiKm/build/AmtPtpDeviceSpiKm/x64/Release/*.sys
+          src/AmtPtpDeviceSpiKm/build/AmtPtpDeviceSpiKm/x64/Release/*.inf
+          src/AmtPtpDeviceSpiKm/build/AmtPtpDeviceSpiKm/x64/Release/*.cat
+
+    - name: Upload USB KM Driver artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: AmtPtpDeviceUsbKm-Release-x64
+        path: |
+          src/AmtPtpDeviceUsbKm/build/AmtPtpDeviceUsbKm/x64/Release/*.sys
+          src/AmtPtpDeviceUsbKm/build/AmtPtpDeviceUsbKm/x64/Release/*.inf
+          src/AmtPtpDeviceUsbKm/build/AmtPtpDeviceUsbKm/x64/Release/*.cat
+
+    - name: Upload USB UM (User-mode) artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: AmtPtpDeviceUsbUm-Release-x64
+        path: |
+          src/AmtPtpDeviceUsbUm/build/MagicTrackpad2PtpDevice/x64/Release/*.dll
+          src/AmtPtpDeviceUsbUm/build/MagicTrackpad2PtpDevice/x64/Release/*.sys
+          src/AmtPtpDeviceUsbUm/build/MagicTrackpad2PtpDevice/x64/Release/*.inf
+          src/AmtPtpDeviceUsbUm/build/MagicTrackpad2PtpDevice/x64/Release/*.cat
+
+    - name: Upload HID Filter artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: AmtPtpHidFilter-Release-x64
+        path: |
+          src/AmtPtpHidFilter/build/AmtPtpHidFilter/x64/Release/*.sys
+          src/AmtPtpHidFilter/build/AmtPtpHidFilter/x64/Release/*.inf
+          src/AmtPtpHidFilter/build/AmtPtpHidFilter/x64/Release/*.cat
+
+    - name: Upload all drivers (combined)
+      uses: actions/upload-artifact@v4
+      with:
+        name: AmtPtp-AllDrivers-Release-x64
+        path: |
+          src/**/build/**/x64/Release/*.*
