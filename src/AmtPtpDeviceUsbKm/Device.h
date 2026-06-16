@@ -44,6 +44,16 @@ typedef struct _DEVICE_CONTEXT
 	// Timer
 	LARGE_INTEGER LastReportTime;
 
+	// Palm rejection
+	BOOLEAN PalmDetected;
+
+	// Per-finger smoothing (indexed by raw finger index 0..PTP_MAX_CONTACT_POINTS-1)
+	USHORT SmoothedX[PTP_MAX_CONTACT_POINTS];
+	USHORT SmoothedY[PTP_MAX_CONTACT_POINTS];
+	USHORT HystX[PTP_MAX_CONTACT_POINTS];
+	USHORT HystY[PTP_MAX_CONTACT_POINTS];
+	BOOLEAN SlotActive[PTP_MAX_CONTACT_POINTS];
+
 } DEVICE_CONTEXT, *PDEVICE_CONTEXT;
 
 //
