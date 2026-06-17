@@ -451,19 +451,31 @@ AmtPtpEvtUsbInterruptPipeReadComplete(
         if (largePalm) {
             pCtx->PalmDetected = TRUE;
         } else if (pCtx->PalmDetected) {
-            // Stay locked until ALL large-palm contacts lift.
-            // FIX: check only contacts >= PALM_LARGE_MAJOR, not every contact.
-            // The palm itself has major >= PALM_LARGE_MAJOR and will keep
-            // anyContact=TRUE forever if we check all nonzero contacts.
-            BOOLEAN anyLargePalm = FALSE;
+            //
+            // Stay locked until ALL contacts are physically lifted.
+            //
+            // Previously the lock was released as soon as the large-palm
+            // contact itself disappeared (major < PALM_LARGE_MAJOR).  That
+            // meant a user could: 1) rest a palm on the pad (lock engaged),
+            // 2) place another finger, 3) lift the palm — and the pad would
+            // immediately unlock and process that other finger, causing an
+            // unwanted cursor jump.
+            //
+            // Fix: while palm-locked, check for ANY nonzero contact in the
+            // raw USB frame.  Only when every contact has lifted do we
+            // release the lock and allow tracking again.
+            //
+            BOOLEAN anyContact = FALSE;
             for (i = 0; i < raw_n; i++) {
                 f = (const struct TRACKPAD_FINGER*)(f_base + i * fingerSize);
-                if (AmtRawToInteger(f->touch_major) >= PALM_LARGE_MAJOR) {
-                    anyLargePalm = TRUE;
+                INT major = AmtRawToInteger(f->touch_major);
+                INT minor = AmtRawToInteger(f->touch_minor);
+                if (major > 0 || minor > 0) {
+                    anyContact = TRUE;
                     break;
                 }
             }
-            if (!anyLargePalm) {
+            if (!anyContact) {
                 pCtx->PalmDetected = FALSE;
                 for (i = 0; i < PTP_MAX_CONTACT_POINTS; i++)
                     AmtClearSlot(pCtx, i);
