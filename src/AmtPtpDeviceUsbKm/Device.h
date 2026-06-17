@@ -41,6 +41,19 @@ typedef struct _DEVICE_CONTEXT
     BOOLEAN SlotActive[PTP_MAX_CONTACT_POINTS];
 
     //
+    // FIX (tip-size debounce / cursor-jump):
+    // Counts consecutive frames where a slot that is SlotActive has a
+    // nonzero touch_major/touch_minor but failed the `tip` size threshold.
+    // A single noisy frame (major/minor briefly dips below threshold while
+    // the finger is still physically down) must NOT be treated as lift-off,
+    // or the slot resets (SlotActive=FALSE) and the very next frame re-arms
+    // with a fresh smoothing baseline -- producing a visible cursor snap.
+    // Only after TIP_DROP_DEBOUNCE_FRAMES consecutive sub-threshold frames
+    // do we treat the contact as genuinely lifted.
+    //
+    UCHAR   TipDropCount[PTP_MAX_CONTACT_POINTS];
+
+    //
     // FIX (inertia / lift-off):
     // Track which slots were included in the PREVIOUS HID report with
     // TipSwitch=1.  On the next frame, any slot that was reported but is

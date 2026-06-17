@@ -12,6 +12,18 @@
 // Per-contact score threshold for PALM_LOCAL (edge/thumb rejection).
 #define PALM_SCORE_THRESH   45
 
+//
+// FIX (cursor-jump, tip-size debounce):
+// Number of consecutive frames a SlotActive contact is allowed to dip below
+// the `tip` size threshold (major/minor too small) while still being
+// nonzero, before it is actually treated as lifted.  T2 touch_major/minor
+// readings are noisy near the lower bound -- a single low sample no longer
+// kills the slot outright.  Kept small (not a real "hold" state) so a true
+// quick lift-and-retouch within 1-2 frames still lifts promptly; this only
+// absorbs single-frame measurement noise, not real lift-off.
+//
+#define TIP_DROP_DEBOUNCE_FRAMES 2
+
 static inline INT
 AmtRawToInteger(_In_ USHORT x)
 {
@@ -54,11 +66,12 @@ AmtSmoothCoord(_In_ USHORT rawVal, _In_ USHORT prevVal)
 static inline VOID
 AmtClearSlot(_In_ PDEVICE_CONTEXT ctx, _In_ size_t i)
 {
-    ctx->SmoothedX[i]  = 0;
-    ctx->SmoothedY[i]  = 0;
-    ctx->HystX[i]      = 0;
-    ctx->HystY[i]      = 0;
-    ctx->SlotActive[i] = FALSE;
+    ctx->SmoothedX[i]     = 0;
+    ctx->SmoothedY[i]     = 0;
+    ctx->HystX[i]         = 0;
+    ctx->HystY[i]         = 0;
+    ctx->SlotActive[i]    = FALSE;
+    ctx->TipDropCount[i]  = 0;   // FIX: clear debounce counter with the slot
 }
 
 typedef enum { PALM_NONE = 0, PALM_LOCAL = 1, PALM_LARGE = 2 } PALM_CLASS;
@@ -297,6 +310,24 @@ AmtPtpEvtUsbInterruptPipeReadComplete(
             return;
         }
 
+        //
+        // NOTE (pre-existing architectural limitation, not patched here):
+        // `i` below is the raw USB record index for this frame, and is also
+        // used directly as the persistent slot/ContactID for SmoothedX/Y,
+        // HystX/Y, SlotActive, TipDropCount, SlotReportedLastFrame.  If the
+        // hardware drops a finger's record so raw_n shrinks (e.g. 3 fingers
+        // down -> one lifts -> raw_n goes 3 -> 2), the record that used to
+        // be at index 2 is no longer at index 2; whatever finger is now at
+        // index 1 inherits index 1's old smoothing baseline/hysteresis even
+        // though it may be a physically different contact.  This is a
+        // genuine identity-leak source of cursor snap, but fixing it
+        // requires real slot matching (nearest-position assignment or a
+        // persistent ContactID scheme, as already implemented for the SPI
+        // variant's FSM) rather than a local patch, since it changes how
+        // ContactID is assigned for the whole frame. Flagging explicitly
+        // rather than silently reshuffling index semantics here.
+        //
+
         // ----------------------------------------------------------------
         // Pass 1: classify all contacts.
         //
@@ -325,8 +356,13 @@ AmtPtpEvtUsbInterruptPipeReadComplete(
             INT minor = AmtRawToInteger(f->touch_minor);
 
             // Skip completely silent slots (hardware placeholder rows).
-            if (major <= 0 && minor <= 0)
+            if (major <= 0 && minor <= 0) {
+                // FIX: a slot going fully silent (0/0) is unambiguous
+                // lift-off, not measurement noise -- reset its debounce
+                // counter immediately so a future re-touch starts clean.
+                pCtx->TipDropCount[i] = 0;
                 continue;
+            }
 
             INT nx = (INT)AmtClampCoord(AmtRawToInteger(f->abs_x),
                                         pCtx->DeviceInfo->x.min,
@@ -357,9 +393,54 @@ AmtPtpEvtUsbInterruptPipeReadComplete(
             // This replaces the old `tip` pre-filter but runs AFTER palm
             // classification so palms are never confused with small fingers.
             BOOLEAN tip = (major << 1) >= 200 || (minor << 1) >= 150;
-            if (!tip)
-                continue;
 
+            if (!tip) {
+                //
+                // FIX (cursor-jump): tip-size debounce.
+                //
+                // Previously, a single frame where major/minor dipped below
+                // threshold (common sensor noise on T2 while a finger is
+                // firmly down) caused `alive[i] = FALSE` here.  Phase A then
+                // emitted an immediate lift-off for this slot, and the next
+                // frame -- seeing the contact again -- re-armed it via
+                // `!pCtx->SlotActive[i]`, resetting SmoothedX/Y to the new
+                // raw position with NO smoothing applied.  That hard reset
+                // is what produced the visible cursor jump/snap during
+                // sustained contact.
+                //
+                // Fix: if this slot was already SlotActive (a real, ongoing
+                // contact), tolerate up to TIP_DROP_DEBOUNCE_FRAMES
+                // consecutive sub-threshold frames before declaring lift-off.
+                // While in the debounce window we keep the slot alive and
+                // simply hold position (no panic reset), so Phase B will
+                // continue smoothing from the last known-good coordinate.
+                // If the slot was NOT yet active (a brand-new low-confidence
+                // touch), there is no smoothing state to protect, so it is
+                // treated as not-yet-a-tip immediately, same as before.
+                //
+                if (pCtx->SlotActive[i] &&
+                    pCtx->TipDropCount[i] < TIP_DROP_DEBOUNCE_FRAMES) {
+                    pCtx->TipDropCount[i]++;
+                    alive[i]  = TRUE;
+                    // Reuse last known-good normalized position so Phase B's
+                    // deadzone/smoothing sees a stable input instead of a
+                    // noisy low-confidence sample.
+                    normXi[i] = pCtx->SmoothedX[i];
+                    normYi[i] = pCtx->SmoothedY[i];
+                    TraceEvents(TRACE_LEVEL_VERBOSE, TRACE_INPUT,
+                        "%!FUNC! slot %llu: tip below threshold, debounced (%u/%u)",
+                        (ULONG64)i, pCtx->TipDropCount[i], TIP_DROP_DEBOUNCE_FRAMES);
+                    continue;
+                }
+
+                // Debounce window exhausted (or never active) — genuine
+                // non-tip / lift-off.
+                pCtx->TipDropCount[i] = 0;
+                continue;
+            }
+
+            // Healthy tip-sized contact — clear any accumulated debounce.
+            pCtx->TipDropCount[i] = 0;
             alive[i] = TRUE;
         }
 
