@@ -1,28 +1,14 @@
 /*
  * AmtPtpKbdHook.c
  *
- * Minimal keyboard upper-filter driver that fires the named callback
- * \Callback\AmtPtpKbdActivity on every key-down event.
+ * Keyboard upper-filter driver that fires \Callback\AmtPtpKbdActivity on
+ * every key-down completion, allowing AmtPtpDeviceUsbKm to suppress touchpad
+ * input for 500 ms after each keystroke.
  *
- * This driver installs as an upper filter on the keyboard HID device
- * (Class = Keyboard) and is loaded alongside AmtPtpDeviceUsbKm.
- *
- * Build: add as a second KMDF project in the same solution, DriverType=KMDF,
- * DriverTargetPlatform=Universal.  Link against ntstrsafe.lib only.
- *
- * INF: add UpperFilters = AmtPtpKbdHook under [DDInstall.HW] for
- * Class=Keyboard.
- *
- * -------------------------------------------------------------------------
- * How it connects to AmtPtpDeviceUsbKm:
- *
- *   AmtPtpDeviceUsbKm (D0Entry)  ─── ExCreateCallback ──►  \Callback\AmtPtpKbdActivity
- *                                      ExRegisterCallback ──►  AmtPtpKeyboardNotifyCallback()
- *
- *   AmtPtpKbdHook (key down)  ────── ExNotifyCallback ───►  (same object)
- *                                      └─► AmtPtpKeyboardNotifyCallback() fires
- *                                           └─► TypingSuppressUntil += 500 ms
- * -------------------------------------------------------------------------
+ * Build: separate KMDF project, DriverType=KMDF, Universal.
+ * Link:  ntstrsafe.lib only.
+ * INF:   add UpperFilters = AmtPtpKbdHook under [DDInstall.HW] for
+ *        Class=Keyboard.
  */
 
 #include <ntddk.h>
@@ -37,16 +23,19 @@ typedef struct _KBD_FILTER_CONTEXT {
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(KBD_FILTER_CONTEXT, KbdFilterGetContext)
 
-// ---------------------------------------------------------------------------
-// Forward declarations
-// ---------------------------------------------------------------------------
-EVT_WDF_DRIVER_DEVICE_ADD     KbdHookEvtDeviceAdd;
-EVT_WDF_IO_QUEUE_IO_READ      KbdHookEvtIoRead;
-EVT_WDF_REQUEST_COMPLETION_ROUTINE KbdHookReadCompletion;
+EVT_WDF_DRIVER_DEVICE_ADD              KbdHookEvtDeviceAdd;
+EVT_WDF_IO_QUEUE_IO_READ               KbdHookEvtIoRead;
+EVT_WDF_REQUEST_COMPLETION_ROUTINE     KbdHookReadCompletion;
+
+// FIX: release the callback object reference when the device is cleaned up.
+// Original code had no cleanup callback, so CallbackObject was leaked on
+// device removal.
+EVT_WDF_OBJECT_CONTEXT_CLEANUP         KbdHookEvtDeviceContextCleanup;
 
 // ---------------------------------------------------------------------------
 // DriverEntry
 // ---------------------------------------------------------------------------
+
 NTSTATUS
 DriverEntry(
     _In_ PDRIVER_OBJECT  DriverObject,
@@ -59,8 +48,25 @@ DriverEntry(
 }
 
 // ---------------------------------------------------------------------------
+// KbdHookEvtDeviceContextCleanup
+// FIX: was missing entirely — CallbackObject reference was leaked on removal.
+// ---------------------------------------------------------------------------
+
+VOID
+KbdHookEvtDeviceContextCleanup(_In_ WDFOBJECT Device)
+{
+    PKBD_FILTER_CONTEXT pCtx = KbdFilterGetContext((WDFDEVICE)Device);
+
+    if (pCtx->CallbackObject != NULL) {
+        ObDereferenceObject(pCtx->CallbackObject);
+        pCtx->CallbackObject = NULL;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // KbdHookEvtDeviceAdd
 // ---------------------------------------------------------------------------
+
 NTSTATUS
 KbdHookEvtDeviceAdd(
     _In_    WDFDRIVER       Driver,
@@ -78,17 +84,20 @@ KbdHookEvtDeviceAdd(
 
     UNREFERENCED_PARAMETER(Driver);
 
-    // Mark as filter driver.
     WdfFdoInitSetFilter(DeviceInit);
 
     WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&devAttribs, KBD_FILTER_CONTEXT);
+
+    // FIX: register the cleanup callback so CallbackObject is released on removal.
+    devAttribs.EvtCleanupCallback = KbdHookEvtDeviceContextCleanup;
+
     status = WdfDeviceCreate(&DeviceInit, &devAttribs, &device);
     if (!NT_SUCCESS(status)) return status;
 
     pCtx = KbdFilterGetContext(device);
     pCtx->CallbackObject = NULL;
 
-    // Open (or create) the named callback object.
+    // Open or create the named callback object.
     RtlInitUnicodeString(&cbName, CALLBACK_OBJECT_NAME);
     InitializeObjectAttributes(&oa, &cbName,
                                OBJ_CASE_INSENSITIVE | OBJ_PERMANENT, NULL, NULL);
@@ -97,12 +106,15 @@ KbdHookEvtDeviceAdd(
                               TRUE,   // create if absent
                               TRUE);  // allow multiple registrations
     if (NT_SUCCESS(status)) {
+        // Hold one reference; released in KbdHookEvtDeviceContextCleanup.
         pCtx->CallbackObject = cbObj;
+    } else {
+        TraceEvents(TRACE_LEVEL_WARNING, TRACE_DRIVER,
+            "%!FUNC! ExCreateCallback failed %!STATUS! (non-fatal)", status);
+        // Non-fatal: touchpad driver still works, suppression is simply absent.
+        status = STATUS_SUCCESS;
     }
-    // Non-fatal: if the touchpad driver hasn't registered yet we still create
-    // the object; the touchpad driver will find it when it calls ExCreateCallback.
 
-    // Install a read-dispatch queue to intercept keyboard read IRPs.
     WDF_IO_QUEUE_CONFIG_INIT_DEFAULT_QUEUE(&queueConfig, WdfIoQueueDispatchParallel);
     queueConfig.EvtIoRead = KbdHookEvtIoRead;
 
@@ -113,8 +125,8 @@ KbdHookEvtDeviceAdd(
 
 // ---------------------------------------------------------------------------
 // KbdHookEvtIoRead
-// Forward the read to the lower driver and attach a completion routine.
 // ---------------------------------------------------------------------------
+
 VOID
 KbdHookEvtIoRead(
     _In_ WDFQUEUE   Queue,
@@ -124,20 +136,17 @@ KbdHookEvtIoRead(
     WDFDEVICE device = WdfIoQueueGetDevice(Queue);
     UNREFERENCED_PARAMETER(Length);
 
-    // Forward the read with a completion routine.
     WdfRequestFormatRequestUsingCurrentType(Request);
     WdfRequestSetCompletionRoutine(Request, KbdHookReadCompletion,
                                    KbdFilterGetContext(device));
-    WdfRequestSend(Request,
-                   WdfDeviceGetIoTarget(device),
-                   WDF_NO_SEND_OPTIONS);
+    WdfRequestSend(Request, WdfDeviceGetIoTarget(device), WDF_NO_SEND_OPTIONS);
 }
 
 // ---------------------------------------------------------------------------
 // KbdHookReadCompletion
 // Called at DISPATCH_LEVEL when the lower keyboard driver completes a read.
-// Fire the named callback so AmtPtpDeviceUsbKm bumps its suppression timer.
 // ---------------------------------------------------------------------------
+
 VOID
 KbdHookReadCompletion(
     _In_ WDFREQUEST                     Request,
@@ -150,10 +159,8 @@ KbdHookReadCompletion(
     UNREFERENCED_PARAMETER(Target);
     UNREFERENCED_PARAMETER(Params);
 
-    if (pCtx->CallbackObject != NULL) {
-        // Argument1 and Argument2 are unused by our callback; pass NULL.
+    if (pCtx->CallbackObject != NULL)
         ExNotifyCallback(pCtx->CallbackObject, NULL, NULL);
-    }
 
     WdfRequestComplete(Request, WdfRequestGetStatus(Request));
 }

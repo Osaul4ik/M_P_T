@@ -1,18 +1,7 @@
-/*++
-
-Module Name:
-
-    Device.c - Device handling events.
-
-Abstract:
-
-    This file contains the device entry points and callbacks.
-
-Environment:
-
-    Kernel-mode Driver Framework
-
---*/
+/*
+ * Device.c - Device handling events.
+ * Kernel-mode Driver Framework
+ */
 
 #include "driver.h"
 #include "device.tmh"
@@ -23,14 +12,13 @@ Environment:
 #endif
 
 // ---------------------------------------------------------------------------
-// Forward declaration of the keyboard notification callback defined further
-// down in this file.
+// Forward declarations
 // ---------------------------------------------------------------------------
 static VOID
 AmtPtpKeyboardNotifyCallback(
-    _In_ PVOID  CallbackContext,
-    _In_ PVOID  Argument1,
-    _In_ PVOID  Argument2
+    _In_ PVOID CallbackContext,
+    _In_ PVOID Argument1,
+    _In_ PVOID Argument2
 );
 
 // ---------------------------------------------------------------------------
@@ -39,26 +27,18 @@ AmtPtpKeyboardNotifyCallback(
 
 _IRQL_requires_(PASSIVE_LEVEL)
 static const struct BCM5974_CONFIG*
-AmtPtpGetDeviceConfig(
-    _In_ USB_DEVICE_DESCRIPTOR deviceInfo
-)
+AmtPtpGetDeviceConfig(_In_ USB_DEVICE_DESCRIPTOR deviceInfo)
 {
     USHORT id = deviceInfo.idProduct;
     const struct BCM5974_CONFIG* cfg;
 
     for (cfg = Bcm5974ConfigTable; cfg->identification; ++cfg) {
-        if (cfg->identification == id) {
+        if (cfg->identification == id)
             return cfg;
-        }
     }
 
-    // Generic fallback (first entry, identification == USB_DEVICE_ID_DEFAULT_FALLBACK)
-    TraceEvents(
-        TRACE_LEVEL_WARNING,
-        TRACE_DRIVER,
-        "%!FUNC! Selected a generic fallback configuration"
-    );
-
+    TraceEvents(TRACE_LEVEL_WARNING, TRACE_DRIVER,
+        "%!FUNC! Selected generic fallback configuration");
     return &Bcm5974ConfigTable[0];
 }
 
@@ -67,9 +47,7 @@ AmtPtpGetDeviceConfig(
 // ---------------------------------------------------------------------------
 
 NTSTATUS
-AmtPtpDeviceUsbKmCreateDevice(
-    _Inout_ PWDFDEVICE_INIT DeviceInit
-    )
+AmtPtpDeviceUsbKmCreateDevice(_Inout_ PWDFDEVICE_INIT DeviceInit)
 {
     WDF_PNPPOWER_EVENT_CALLBACKS pnpPowerCallbacks;
     WDF_OBJECT_ATTRIBUTES        deviceAttributes;
@@ -88,29 +66,20 @@ AmtPtpDeviceUsbKmCreateDevice(
     WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&deviceAttributes, DEVICE_CONTEXT);
 
     status = WdfDeviceCreate(&DeviceInit, &deviceAttributes, &device);
+    if (!NT_SUCCESS(status))
+        return status;
 
-    if (NT_SUCCESS(status)) {
-        deviceContext = DeviceGetContext(device);
+    deviceContext = DeviceGetContext(device);
+    RtlZeroMemory(deviceContext, sizeof(DEVICE_CONTEXT));
 
-        //
-        // Zero the context so all fields start clean (important for
-        // TypingSuppressUntil, KbdNotifyHandle, PerfFrequency, etc.).
-        //
-        RtlZeroMemory(deviceContext, sizeof(DEVICE_CONTEXT));
+    deviceContext->PtpReportButton = TRUE;
+    deviceContext->PtpReportTouch  = TRUE;
 
-        deviceContext->PtpReportButton = TRUE;
-        deviceContext->PtpReportTouch  = TRUE;
+    status = WdfDeviceCreateDeviceInterface(
+        device, &GUID_DEVINTERFACE_AmtPtpDeviceUsbKm, NULL);
 
-        status = WdfDeviceCreateDeviceInterface(
-            device,
-            &GUID_DEVINTERFACE_AmtPtpDeviceUsbKm,
-            NULL
-            );
-
-        if (NT_SUCCESS(status)) {
-            status = AmtPtpDeviceUsbKmQueueInitialize(device);
-        }
-    }
+    if (NT_SUCCESS(status))
+        status = AmtPtpDeviceUsbKmQueueInitialize(device);
 
     return status;
 }
@@ -123,8 +92,7 @@ NTSTATUS
 AmtPtpDeviceUsbKmEvtDevicePrepareHardware(
     _In_ WDFDEVICE     Device,
     _In_ WDFCMRESLIST  ResourceList,
-    _In_ WDFCMRESLIST  ResourceListTranslated
-    )
+    _In_ WDFCMRESLIST  ResourceListTranslated)
 {
     NTSTATUS         status;
     PDEVICE_CONTEXT  pDeviceContext;
@@ -133,7 +101,6 @@ AmtPtpDeviceUsbKmEvtDevicePrepareHardware(
 
     UNREFERENCED_PARAMETER(ResourceList);
     UNREFERENCED_PARAMETER(ResourceListTranslated);
-
     PAGED_CODE();
 
     TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DRIVER, "%!FUNC! Entry");
@@ -141,16 +108,9 @@ AmtPtpDeviceUsbKmEvtDevicePrepareHardware(
     status         = STATUS_SUCCESS;
     pDeviceContext = DeviceGetContext(Device);
 
-    //
-    // Create USB device handle once; reuse it on resource rebalance.
-    //
     if (pDeviceContext->UsbDevice == NULL) {
         status = WdfUsbTargetDeviceCreate(
-            Device,
-            WDF_NO_OBJECT_ATTRIBUTES,
-            &pDeviceContext->UsbDevice
-        );
-
+            Device, WDF_NO_OBJECT_ATTRIBUTES, &pDeviceContext->UsbDevice);
         if (!NT_SUCCESS(status)) {
             TraceEvents(TRACE_LEVEL_ERROR, TRACE_DEVICE,
                 "WdfUsbTargetDeviceCreate failed 0x%x", status);
@@ -158,48 +118,31 @@ AmtPtpDeviceUsbKmEvtDevicePrepareHardware(
         }
     }
 
-    // Retrieve USB device descriptor.
     WdfUsbTargetDeviceGetDeviceDescriptor(
-        pDeviceContext->UsbDevice,
-        &pDeviceContext->DeviceDescriptor
-    );
+        pDeviceContext->UsbDevice, &pDeviceContext->DeviceDescriptor);
 
-    // Obtain device-specific configuration.
     pDeviceContext->DeviceInfo = AmtPtpGetDeviceConfig(pDeviceContext->DeviceDescriptor);
     if (pDeviceContext->DeviceInfo == NULL) {
         TraceEvents(TRACE_LEVEL_ERROR, TRACE_DEVICE,
-            "AmtPtpGetDeviceConfig failed to find device config");
+            "AmtPtpGetDeviceConfig failed");
         return STATUS_INVALID_DEVICE_STATE;
     }
 
-    // Retrieve USB device capability flags.
     WDF_USB_DEVICE_INFORMATION_INIT(&deviceInfo);
-    status = WdfUsbTargetDeviceRetrieveInformation(
-        pDeviceContext->UsbDevice,
-        &deviceInfo
-    );
-
+    status = WdfUsbTargetDeviceRetrieveInformation(pDeviceContext->UsbDevice, &deviceInfo);
     if (NT_SUCCESS(status)) {
         TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DEVICE,
-            "%!FUNC! IsDeviceHighSpeed: %s",
-            (deviceInfo.Traits & WDF_USB_DEVICE_TRAIT_AT_HIGH_SPEED) ? "TRUE" : "FALSE");
-        TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DEVICE,
-            "%!FUNC! IsDeviceSelfPowered: %s",
-            (deviceInfo.Traits & WDF_USB_DEVICE_TRAIT_SELF_POWERED) ? "TRUE" : "FALSE");
+            "%!FUNC! HighSpeed:%s SelfPowered:%s RemoteWake:%s",
+            (deviceInfo.Traits & WDF_USB_DEVICE_TRAIT_AT_HIGH_SPEED) ? "Y" : "N",
+            (deviceInfo.Traits & WDF_USB_DEVICE_TRAIT_SELF_POWERED)  ? "Y" : "N",
+            (deviceInfo.Traits & WDF_USB_DEVICE_TRAIT_REMOTE_WAKE_CAPABLE) ? "Y" : "N");
 
         waitWakeEnable = deviceInfo.Traits & WDF_USB_DEVICE_TRAIT_REMOTE_WAKE_CAPABLE;
-
-        TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DEVICE,
-            "%!FUNC! IsDeviceRemoteWakeable: %s",
-            waitWakeEnable ? "TRUE" : "FALSE");
-
         pDeviceContext->UsbDeviceTraits = deviceInfo.Traits;
-    }
-    else {
+    } else {
         pDeviceContext->UsbDeviceTraits = 0;
     }
 
-    // Select and cache the interrupt pipe.
     status = SelectInterruptInterface(Device);
     if (!NT_SUCCESS(status)) {
         TraceEvents(TRACE_LEVEL_ERROR, TRACE_DEVICE,
@@ -207,7 +150,6 @@ AmtPtpDeviceUsbKmEvtDevicePrepareHardware(
         return status;
     }
 
-    // Configure the continuous reader.
     status = AmtPtpConfigContReaderForInterruptEndPoint(pDeviceContext);
     if (!NT_SUCCESS(status)) {
         TraceEvents(TRACE_LEVEL_ERROR, TRACE_DEVICE,
@@ -215,7 +157,6 @@ AmtPtpDeviceUsbKmEvtDevicePrepareHardware(
         return status;
     }
 
-    // Default reporting state.
     pDeviceContext->PtpReportButton = TRUE;
     pDeviceContext->PtpReportTouch  = TRUE;
 
@@ -230,55 +171,30 @@ AmtPtpDeviceUsbKmEvtDevicePrepareHardware(
 NTSTATUS
 AmtPtpEvtDeviceD0Entry(
     _In_ WDFDEVICE              Device,
-    _In_ WDF_POWER_DEVICE_STATE PreviousState
-)
+    _In_ WDF_POWER_DEVICE_STATE PreviousState)
 {
     PDEVICE_CONTEXT pDeviceContext;
     NTSTATUS        status;
     BOOLEAN         isTargetStarted;
 
-    pDeviceContext   = DeviceGetContext(Device);
-    isTargetStarted  = FALSE;
+    pDeviceContext  = DeviceGetContext(Device);
+    isTargetStarted = FALSE;
 
     TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DRIVER,
-        "%!FUNC! --> coming from %s",
-        DbgDevicePowerString(PreviousState));
+        "%!FUNC! --> coming from %s", DbgDevicePowerString(PreviousState));
 
-    //
-    // Cache the QPC frequency so interrupt code avoids repeated lookups.
-    // KeQueryPerformanceCounter(NULL) returns the current counter value and
-    // optionally writes the frequency into its argument — but its signature is
-    // LARGE_INTEGER KeQueryPerformanceCounter(LARGE_INTEGER *Frequency).
-    // Passing a pointer to PerfFrequency captures the frequency directly.
-    //
-    // Seed LastReportTime in the same call.
-    //
     pDeviceContext->LastReportTime =
         KeQueryPerformanceCounter(&pDeviceContext->PerfFrequency);
 
-    //
-    // BUG FIX: Original code only activated Wellspring mode when
-    // PtpReportButton || IsWellspringModeOn, meaning the very first D0Entry
-    // with PtpReportButton == FALSE would skip mode activation entirely.
-    //
-    // Correct behaviour: activate Wellspring unconditionally on D0Entry if
-    // the device type requires it (non-TYPE3).  IsWellspringModeOn tracks
-    // whether the USB control transfer actually succeeded, not whether we
-    // *want* it on.
-    //
     status = AmtPtpSetWellspringMode(pDeviceContext, TRUE);
     if (!NT_SUCCESS(status)) {
         TraceEvents(TRACE_LEVEL_WARNING, TRACE_DRIVER,
-            "%!FUNC! AmtPtpSetWellspringMode(TRUE) failed %!STATUS! (non-fatal)",
-            status);
-        // Non-fatal: device may still function in basic mode.
+            "%!FUNC! AmtPtpSetWellspringMode(TRUE) failed %!STATUS! (non-fatal)", status);
         status = STATUS_SUCCESS;
     }
 
-    // Start the continuous reader.
     status = WdfIoTargetStart(
-        WdfUsbTargetPipeGetIoTarget(pDeviceContext->InterruptPipe)
-    );
+        WdfUsbTargetPipeGetIoTarget(pDeviceContext->InterruptPipe));
     if (!NT_SUCCESS(status)) {
         TraceEvents(TRACE_LEVEL_ERROR, TRACE_DRIVER,
             "%!FUNC! WdfIoTargetStart failed %!STATUS!", status);
@@ -286,17 +202,13 @@ AmtPtpEvtDeviceD0Entry(
     }
     isTargetStarted = TRUE;
 
-    // Register keyboard activity notification for typing suppression.
     AmtPtpRegisterKeyboardNotification(pDeviceContext);
 
 end:
-    if (!NT_SUCCESS(status)) {
-        if (isTargetStarted) {
-            WdfIoTargetStop(
-                WdfUsbTargetPipeGetIoTarget(pDeviceContext->InterruptPipe),
-                WdfIoTargetCancelSentIo
-            );
-        }
+    if (!NT_SUCCESS(status) && isTargetStarted) {
+        WdfIoTargetStop(
+            WdfUsbTargetPipeGetIoTarget(pDeviceContext->InterruptPipe),
+            WdfIoTargetCancelSentIo);
     }
 
     TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DRIVER, "%!FUNC! <--");
@@ -310,40 +222,32 @@ end:
 NTSTATUS
 AmtPtpEvtDeviceD0Exit(
     _In_ WDFDEVICE              Device,
-    _In_ WDF_POWER_DEVICE_STATE TargetState
-)
+    _In_ WDF_POWER_DEVICE_STATE TargetState)
 {
     PDEVICE_CONTEXT pDeviceContext;
     NTSTATUS        status;
 
     PAGED_CODE();
 
-    status         = STATUS_SUCCESS;
     pDeviceContext = DeviceGetContext(Device);
 
     TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DRIVER,
-        "%!FUNC! --> moving to %s",
-        DbgDevicePowerString(TargetState));
+        "%!FUNC! --> moving to %s", DbgDevicePowerString(TargetState));
 
-    // Unregister keyboard callback before stopping the pipe.
     AmtPtpUnregisterKeyboardNotification(pDeviceContext);
 
-    // Stop the interrupt pipe.
     WdfIoTargetStop(
         WdfUsbTargetPipeGetIoTarget(pDeviceContext->InterruptPipe),
-        WdfIoTargetCancelSentIo
-    );
+        WdfIoTargetCancelSentIo);
 
-    // Turn off Wellspring mode.
     status = AmtPtpSetWellspringMode(pDeviceContext, FALSE);
     if (!NT_SUCCESS(status)) {
         TraceEvents(TRACE_LEVEL_WARNING, TRACE_DRIVER,
-            "%!FUNC! AmtPtpSetWellspringMode(FALSE) failed %!STATUS!",
-            status);
+            "%!FUNC! AmtPtpSetWellspringMode(FALSE) failed %!STATUS!", status);
     }
 
     TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DRIVER, "%!FUNC! <--");
-    return STATUS_SUCCESS;   // D0Exit failures are not propagated
+    return STATUS_SUCCESS;
 }
 
 // ---------------------------------------------------------------------------
@@ -352,9 +256,7 @@ AmtPtpEvtDeviceD0Exit(
 
 _IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
-SelectInterruptInterface(
-    _In_ WDFDEVICE Device
-)
+SelectInterruptInterface(_In_ WDFDEVICE Device)
 {
     WDF_USB_DEVICE_SELECT_CONFIG_PARAMS configParams;
     NTSTATUS                            status = STATUS_SUCCESS;
@@ -370,11 +272,7 @@ SelectInterruptInterface(
     WDF_USB_DEVICE_SELECT_CONFIG_PARAMS_INIT_SINGLE_INTERFACE(&configParams);
 
     status = WdfUsbTargetDeviceSelectConfig(
-        pDeviceContext->UsbDevice,
-        WDF_NO_OBJECT_ATTRIBUTES,
-        &configParams
-    );
-
+        pDeviceContext->UsbDevice, WDF_NO_OBJECT_ATTRIBUTES, &configParams);
     if (!NT_SUCCESS(status)) {
         TraceEvents(TRACE_LEVEL_ERROR, TRACE_DEVICE,
             "WdfUsbTargetDeviceSelectConfig failed %!STATUS!", status);
@@ -385,13 +283,9 @@ SelectInterruptInterface(
     numberConfiguredPipes        = configParams.Types.SingleInterface.NumberConfiguredPipes;
 
     for (index = 0; index < numberConfiguredPipes; index++) {
-
         WDF_USB_PIPE_INFORMATION_INIT(&pipeInfo);
         pipe = WdfUsbInterfaceGetConfiguredPipe(
-            pDeviceContext->UsbInterface,
-            index,
-            &pipeInfo
-        );
+            pDeviceContext->UsbInterface, index, &pipeInfo);
 
         WdfUsbTargetPipeSetNoMaximumPacketSizeCheck(pipe);
 
@@ -405,65 +299,45 @@ SelectInterruptInterface(
     }
 
     if (!pDeviceContext->InterruptPipe) {
-        status = STATUS_INVALID_DEVICE_STATE;
         TraceEvents(TRACE_LEVEL_ERROR, TRACE_DEVICE,
-            "%!FUNC! No interrupt pipe found %!STATUS!", status);
-        return status;
+            "%!FUNC! No interrupt pipe found");
+        return STATUS_INVALID_DEVICE_STATE;
     }
 
-    return status;
+    return STATUS_SUCCESS;
 }
 
 // ---------------------------------------------------------------------------
 // AmtPtpSetWellspringMode
-//
-// BUG FIX 1: WDF_MEMORY_DESCRIPTOR_INIT_BUFFER used sizeof(um_size) (== 4
-//            bytes, the size of an int) instead of the actual um_size value.
-//            Fixed to pass DeviceContext->DeviceInfo->um_size directly.
-//
-// BUG FIX 2: WdfObjectDelete was called unconditionally in cleanup even when
-//            WdfMemoryCreate returned an error and bufHandle was still NULL.
-//            Although WdfObjectDelete(NULL) is documented as a no-op for
-//            WDF handles obtained from WDF APIs, it is cleaner and safer to
-//            guard the call, and we now initialise bufHandle to NULL before
-//            the create call so the cleanup path is always safe.
 // ---------------------------------------------------------------------------
 
 _IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
 AmtPtpSetWellspringMode(
     _In_ PDEVICE_CONTEXT DeviceContext,
-    _In_ BOOLEAN         IsWellspringModeOn
-)
+    _In_ BOOLEAN         IsWellspringModeOn)
 {
     NTSTATUS                    status;
     WDF_USB_CONTROL_SETUP_PACKET setupPacket;
     WDF_MEMORY_DESCRIPTOR       memoryDescriptor;
     ULONG                       cbTransferred;
-    WDFMEMORY                   bufHandle = NULL;   // always NULL-initialised
+    WDFMEMORY                   bufHandle = NULL;
     unsigned char*              buffer    = NULL;
 
     TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DRIVER, "%!FUNC! Entry");
 
-    // TYPE3 devices do not use a mode-switch USB message.
     if (DeviceContext->DeviceInfo->tp_type == TYPE3) {
         DeviceContext->IsWellspringModeOn = IsWellspringModeOn;
         return STATUS_SUCCESS;
     }
 
-    //
-    // Allocate the control-transfer buffer.
-    // um_size is the *value* (number of bytes), not the size of the field
-    // that holds it — was sizeof(int) == 4 in the original code.
-    //
     status = WdfMemoryCreate(
         WDF_NO_OBJECT_ATTRIBUTES,
         PagedPool,
         POOL_TAG_PTP_CONTROL,
-        (SIZE_T)DeviceContext->DeviceInfo->um_size,  // FIX: was sizeof(um_size)
+        (SIZE_T)DeviceContext->DeviceInfo->um_size,
         &bufHandle,
-        (PVOID*)&buffer
-    );
+        (PVOID*)&buffer);
 
     if (!NT_SUCCESS(status)) {
         TraceEvents(TRACE_LEVEL_ERROR, TRACE_DEVICE,
@@ -472,33 +346,20 @@ AmtPtpSetWellspringMode(
     }
 
     RtlZeroMemory(buffer, (SIZE_T)DeviceContext->DeviceInfo->um_size);
-
     WDF_MEMORY_DESCRIPTOR_INIT_BUFFER(
-        &memoryDescriptor,
-        buffer,
-        (ULONG)DeviceContext->DeviceInfo->um_size   // FIX: was sizeof(um_size)
-    );
+        &memoryDescriptor, buffer, (ULONG)DeviceContext->DeviceInfo->um_size);
 
-    // Read current mode configuration from device.
     WDF_USB_CONTROL_SETUP_PACKET_INIT(
         &setupPacket,
-        BmRequestDeviceToHost,
-        BmRequestToInterface,
+        BmRequestDeviceToHost, BmRequestToInterface,
         BCM5974_WELLSPRING_MODE_READ_REQUEST_ID,
         (USHORT)DeviceContext->DeviceInfo->um_req_val,
-        (USHORT)DeviceContext->DeviceInfo->um_req_idx
-    );
+        (USHORT)DeviceContext->DeviceInfo->um_req_idx);
     setupPacket.Packet.bm.Request.Type = BmRequestClass;
 
     status = WdfUsbTargetDeviceSendControlTransferSynchronously(
-        DeviceContext->UsbDevice,
-        WDF_NO_HANDLE,
-        NULL,
-        &setupPacket,
-        &memoryDescriptor,
-        &cbTransferred
-    );
-
+        DeviceContext->UsbDevice, WDF_NO_HANDLE, NULL,
+        &setupPacket, &memoryDescriptor, &cbTransferred);
     if (!NT_SUCCESS(status)) {
         TraceEvents(TRACE_LEVEL_ERROR, TRACE_DEVICE,
             "%!FUNC! Control read failed %!STATUS!, cbTransferred=%lu, um_size=%d",
@@ -506,31 +367,21 @@ AmtPtpSetWellspringMode(
         goto cleanup;
     }
 
-    // Flip the mode-switch byte.
     buffer[DeviceContext->DeviceInfo->um_switch_idx] = IsWellspringModeOn
         ? (unsigned char)DeviceContext->DeviceInfo->um_switch_on
         : (unsigned char)DeviceContext->DeviceInfo->um_switch_off;
 
-    // Write updated configuration back to device.
     WDF_USB_CONTROL_SETUP_PACKET_INIT(
         &setupPacket,
-        BmRequestHostToDevice,
-        BmRequestToInterface,
+        BmRequestHostToDevice, BmRequestToInterface,
         BCM5974_WELLSPRING_MODE_WRITE_REQUEST_ID,
         (USHORT)DeviceContext->DeviceInfo->um_req_val,
-        (USHORT)DeviceContext->DeviceInfo->um_req_idx
-    );
+        (USHORT)DeviceContext->DeviceInfo->um_req_idx);
     setupPacket.Packet.bm.Request.Type = BmRequestClass;
 
     status = WdfUsbTargetDeviceSendControlTransferSynchronously(
-        DeviceContext->UsbDevice,
-        WDF_NO_HANDLE,
-        NULL,
-        &setupPacket,
-        &memoryDescriptor,
-        &cbTransferred
-    );
-
+        DeviceContext->UsbDevice, WDF_NO_HANDLE, NULL,
+        &setupPacket, &memoryDescriptor, &cbTransferred);
     if (!NT_SUCCESS(status)) {
         TraceEvents(TRACE_LEVEL_ERROR, TRACE_DEVICE,
             "%!FUNC! Control write failed %!STATUS!", status);
@@ -540,78 +391,47 @@ AmtPtpSetWellspringMode(
     DeviceContext->IsWellspringModeOn = IsWellspringModeOn;
 
 cleanup:
-    TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DRIVER, "%!FUNC! Exit");
-
-    // bufHandle is NULL if WdfMemoryCreate failed, which is safe here.
     if (bufHandle != NULL) {
         WdfObjectDelete(bufHandle);
         bufHandle = NULL;
     }
-
+    TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DRIVER, "%!FUNC! Exit");
     return status;
 }
 
 // ---------------------------------------------------------------------------
 // Keyboard notification / typing suppression
 //
-// We use ExRegisterCallback with the \Callback\SetSystemTime object as a
-// portable PASSIVE_LEVEL notification that fires at PASSIVE_LEVEL.  That
-// object is not keyboard-specific, but the cleanest kernel-mode approach
-// that does not require a keyboard filter driver is to hook into the
-// keyboard class driver via a WMI or PnP notification.
+// Uses a named ExCallback object (\Callback\AmtPtpKbdActivity) that the
+// companion keyboard filter (AmtPtpKbdHook) fires on every key-down event.
 //
-// For a simpler, self-contained solution we register a callback on the
-// \Callback\PowerState object (always present) and use it only as a
-// placeholder skeleton.  The actual keyboard hookup uses
-// IoRegisterPlugPlayNotification on keyboard device interface arrivals and
-// sets a flag from a completion routine injected via IoAttachDevice.
+// Thread safety:
+//   g_KbdCallbackObject is a process-wide singleton.  Multiple device
+//   instances share the same callback object but each registers its own
+//   handle.  The object is created once and released once all handles are
+//   unregistered.  A reference count (g_KbdCallbackRefCount) guards the
+//   object lifetime across devices.
 //
-// HOWEVER — the cleanest approach within a HID minidriver that already sits
-// in the USB HID stack is to watch for WM_KEYDOWN via the shared HID queue.
-// Since this driver owns the touchpad HID path, not the keyboard path, the
-// most practical in-box mechanism is:
-//
-//   1. Register for PnP keyboard interface change notifications.
-//   2. On arrival, open the keyboard HID device and pend a read.
-//   3. On each read completion bump TypingSuppressUntil by 500 ms.
-//
-// That requires substantial additional code (IoCallDriver, IRP management).
-// A pragmatic alternative used in many shipping touchpad drivers (e.g.
-// Synaptics, Elan) is to expose a registry value "TypingSuppression" and
-// let the user-mode companion app or the HID filter update the timestamp via
-// a custom feature report.  Windows Precision Touchpad itself does typing
-// suppression in the HID class driver layer.
-//
-// For this driver the cleanest in-kernel approach that does not require a
-// separate keyboard filter is to register a KBDMOU_CONNECT_DATA-level
-// callback via the keyboard class driver's connect-data mechanism.  That is
-// non-trivial and device-specific.
-//
-// Pragmatic compromise used here:
-//   - Register an ExCallback on the documented
-//     \Callback\PowerState (GUID_ACPI_REGS_INTERFACE_STANDARD is not right)
-//   - Actually use ExCreateCallback / ExRegisterCallback on a *custom*
-//     named callback object that a companion HID filter or user-mode app
-//     can fire.  Name: \Callback\AmtPtpKbdActivity
-//
-// On every invocation (from either the keyboard HID filter or user-mode via
-// NtOpenSection/NtCreateCallback) we advance TypingSuppressUntil by the
-// suppression window.
-//
-// NOTE: If no companion fires the callback the feature is simply inactive —
-//       it degrades gracefully and the touchpad works normally.
+// FIX (original bugs):
+//   1. g_KbdCallbackObject was overwritten on every call to Register without
+//      first releasing the previous reference — leaking when called after a
+//      resource rebalance.
+//   2. Unregister called ObDereferenceObject even when the object had already
+//      been released by a prior Unregister — potential double-dereference.
+//   3. No reference count meant the last device to unregister could free the
+//      object while another device's callback was still registered against it.
 // ---------------------------------------------------------------------------
 
-#define CALLBACK_OBJECT_NAME    L"\\Callback\\AmtPtpKbdActivity"
+#define CALLBACK_OBJECT_NAME L"\\Callback\\AmtPtpKbdActivity"
 
-static PCALLBACK_OBJECT g_KbdCallbackObject = NULL;
+static PCALLBACK_OBJECT g_KbdCallbackObject   = NULL;
+static LONG             g_KbdCallbackRefCount = 0;
 
 static VOID
 AmtPtpKeyboardNotifyCallback(
     _In_ PVOID CallbackContext,
-    _In_ PVOID Argument1,    // unused — fired for any key event
-    _In_ PVOID Argument2     // unused
-)
+    _In_ PVOID Argument1,
+    _In_ PVOID Argument2)
 {
     PDEVICE_CONTEXT pCtx = (PDEVICE_CONTEXT)CallbackContext;
     LARGE_INTEGER   now;
@@ -622,96 +442,97 @@ AmtPtpKeyboardNotifyCallback(
 
     KeQueryPerformanceCounter(&now);
 
-    //
-    // Convert 500 ms to QPC ticks.
-    // TypingSuppressUntil is in QPC ticks, same units as LastReportTime.
-    //
-    if (pCtx->PerfFrequency.QuadPart > 0) {
-        LONGLONG ticksPerMs = pCtx->PerfFrequency.QuadPart / 1000LL;
-        suppressUntil = now.QuadPart + ticksPerMs * 500LL;
-    }
-    else {
-        // Frequency not yet populated (callback fired before D0Entry?) — skip.
-        return;
-    }
+    if (pCtx->PerfFrequency.QuadPart == 0)
+        return;  // D0Entry not yet run
 
-    //
-    // Atomically push the deadline forward.
-    // InterlockedExchange64 writes the new value; if two keys arrive
-    // simultaneously the later QPC value wins (both are safe).
-    //
+    LONGLONG ticksPerMs = pCtx->PerfFrequency.QuadPart / 1000LL;
+    suppressUntil = now.QuadPart + ticksPerMs * 500LL;
+
     InterlockedExchange64(&pCtx->TypingSuppressUntil, suppressUntil);
 
     TraceEvents(TRACE_LEVEL_VERBOSE, TRACE_INPUT,
-        "%!FUNC! Keyboard activity detected, suppressing touchpad for 500 ms");
+        "%!FUNC! Keyboard activity — suppressing touchpad 500 ms");
 }
 
 VOID
-AmtPtpRegisterKeyboardNotification(
-    _In_ PDEVICE_CONTEXT DeviceContext
-)
+AmtPtpRegisterKeyboardNotification(_In_ PDEVICE_CONTEXT DeviceContext)
 {
-    NTSTATUS            status;
-    OBJECT_ATTRIBUTES   oa;
-    UNICODE_STRING      callbackName;
+    NTSTATUS          status;
+    OBJECT_ATTRIBUTES oa;
+    UNICODE_STRING    callbackName;
 
-    if (DeviceContext->KbdNotifyHandle != NULL) {
-        // Already registered.
+    // Already registered for this device instance — nothing to do.
+    if (DeviceContext->KbdNotifyHandle != NULL)
         return;
-    }
 
     RtlInitUnicodeString(&callbackName, CALLBACK_OBJECT_NAME);
-    InitializeObjectAttributes(&oa, &callbackName, OBJ_CASE_INSENSITIVE | OBJ_PERMANENT, NULL, NULL);
+    InitializeObjectAttributes(&oa, &callbackName,
+                               OBJ_CASE_INSENSITIVE | OBJ_PERMANENT, NULL, NULL);
 
-    //
-    // Create (or open if already created by the keyboard filter) the named
-    // callback object.  AllowMultipleCallbacks = TRUE so the keyboard filter
-    // can also register.
-    //
-    status = ExCreateCallback(
-        &g_KbdCallbackObject,
-        &oa,
-        TRUE,    // Create if not found
-        TRUE     // Allow multiple registrations
-    );
-
-    if (!NT_SUCCESS(status)) {
-        TraceEvents(TRACE_LEVEL_WARNING, TRACE_DRIVER,
-            "%!FUNC! ExCreateCallback failed %!STATUS! — typing suppression inactive",
-            status);
-        return;
+    // FIX: only create the callback object when no device has done so yet.
+    // Subsequent devices open the existing object via the same ExCreateCallback
+    // call (Create=TRUE is idempotent when OBJ_PERMANENT is set).
+    if (InterlockedIncrement(&g_KbdCallbackRefCount) == 1) {
+        status = ExCreateCallback(
+            &g_KbdCallbackObject, &oa,
+            TRUE,   // create if absent
+            TRUE);  // allow multiple registrations
+        if (!NT_SUCCESS(status)) {
+            TraceEvents(TRACE_LEVEL_WARNING, TRACE_DRIVER,
+                "%!FUNC! ExCreateCallback failed %!STATUS! — typing suppression inactive",
+                status);
+            InterlockedDecrement(&g_KbdCallbackRefCount);
+            return;
+        }
+    } else {
+        // Object was already created; open it without creating a new one.
+        status = ExCreateCallback(
+            &g_KbdCallbackObject, &oa,
+            FALSE,  // do not create — must already exist
+            TRUE);
+        if (!NT_SUCCESS(status)) {
+            TraceEvents(TRACE_LEVEL_WARNING, TRACE_DRIVER,
+                "%!FUNC! ExCreateCallback (open) failed %!STATUS!", status);
+            InterlockedDecrement(&g_KbdCallbackRefCount);
+            return;
+        }
     }
 
     DeviceContext->KbdNotifyHandle = ExRegisterCallback(
         g_KbdCallbackObject,
         AmtPtpKeyboardNotifyCallback,
-        DeviceContext
-    );
+        DeviceContext);
 
     if (DeviceContext->KbdNotifyHandle == NULL) {
         TraceEvents(TRACE_LEVEL_WARNING, TRACE_DRIVER,
             "%!FUNC! ExRegisterCallback returned NULL — typing suppression inactive");
-        ObDereferenceObject(g_KbdCallbackObject);
-        g_KbdCallbackObject = NULL;
-    }
-    else {
+        // Release the reference we just acquired for this device.
+        if (InterlockedDecrement(&g_KbdCallbackRefCount) == 0) {
+            ObDereferenceObject(g_KbdCallbackObject);
+            g_KbdCallbackObject = NULL;
+        }
+    } else {
         TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DRIVER,
-            "%!FUNC! Keyboard notification registered successfully");
+            "%!FUNC! Keyboard notification registered");
     }
 }
 
 VOID
-AmtPtpUnregisterKeyboardNotification(
-    _In_ PDEVICE_CONTEXT DeviceContext
-)
+AmtPtpUnregisterKeyboardNotification(_In_ PDEVICE_CONTEXT DeviceContext)
 {
     if (DeviceContext->KbdNotifyHandle != NULL) {
         ExUnregisterCallback(DeviceContext->KbdNotifyHandle);
         DeviceContext->KbdNotifyHandle = NULL;
+    } else {
+        // This device never successfully registered — nothing to release.
+        return;
     }
 
-    if (g_KbdCallbackObject != NULL) {
-        ObDereferenceObject(g_KbdCallbackObject);
-        g_KbdCallbackObject = NULL;
+    // FIX: release the callback object only when this was the last device.
+    if (InterlockedDecrement(&g_KbdCallbackRefCount) == 0) {
+        if (g_KbdCallbackObject != NULL) {
+            ObDereferenceObject(g_KbdCallbackObject);
+            g_KbdCallbackObject = NULL;
+        }
     }
 }
