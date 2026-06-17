@@ -465,6 +465,12 @@ AmtPtpEvtUsbInterruptPipeReadComplete(
             // raw USB frame.  Only when every contact has lifted do we
             // release the lock and allow tracking again.
             //
+            // IMPORTANT: alive[] was already populated by the classification
+            // loop above.  If the lock remains active (anyContact == TRUE),
+            // we MUST force alive[] to all-FALSE here, otherwise Phase B
+            // will process those contacts and the cursor will move despite
+            // the palm lock.
+            //
             BOOLEAN anyContact = FALSE;
             for (i = 0; i < raw_n; i++) {
                 f = (const struct TRACKPAD_FINGER*)(f_base + i * fingerSize);
@@ -481,8 +487,12 @@ AmtPtpEvtUsbInterruptPipeReadComplete(
                     AmtClearSlot(pCtx, i);
                 TraceEvents(TRACE_LEVEL_VERBOSE, TRACE_INPUT,
                     "%!FUNC! Palm released — resuming");
+            } else {
+                // Lock still active — suppress all contacts that the
+                // classification loop may have marked as alive.
+                for (i = 0; i < PTP_MAX_CONTACT_POINTS; i++)
+                    alive[i] = FALSE;
             }
-            // alive[] stays all-FALSE while palm lock is active.
         }
 
         // ----------------------------------------------------------------
