@@ -245,24 +245,16 @@ AmtPtpEvtDeviceD0Entry(
         DbgDevicePowerString(PreviousState));
 
     //
-    // Cache the QPC frequency once here so that interrupt code can use it
-    // without calling KeQueryPerformanceFrequency every packet.
+    // Cache the QPC frequency so interrupt code avoids repeated lookups.
+    // KeQueryPerformanceCounter(NULL) returns the current counter value and
+    // optionally writes the frequency into its argument — but its signature is
+    // LARGE_INTEGER KeQueryPerformanceCounter(LARGE_INTEGER *Frequency).
+    // Passing a pointer to PerfFrequency captures the frequency directly.
     //
-    KeQueryPerformanceCounter(&pDeviceContext->PerfFrequency);
-    // KeQueryPerformanceCounter returns the current counter; we only need the
-    // frequency.  Capture it properly:
-    {
-        LARGE_INTEGER freq;
-        KeQueryPerformanceCounter(&freq);          // discard counter value
-        KeQuerySystemTimePrecise(NULL);            // warm up (harmless)
-        pDeviceContext->PerfFrequency.QuadPart =
-            KeQueryTimeIncrement();                // fallback — overwrite below
-    }
-    // Correct approach: use KeQueryPerformanceFrequency (exported since Win2k).
-    KeQueryPerformanceFrequency(&pDeviceContext->PerfFrequency);
-
-    // Seed the last-report timestamp.
-    KeQueryPerformanceCounter(&pDeviceContext->LastReportTime);
+    // Seed LastReportTime in the same call.
+    //
+    pDeviceContext->LastReportTime =
+        KeQueryPerformanceCounter(&pDeviceContext->PerfFrequency);
 
     //
     // BUG FIX: Original code only activated Wellspring mode when
@@ -612,7 +604,7 @@ cleanup:
 
 #define CALLBACK_OBJECT_NAME    L"\\Callback\\AmtPtpKbdActivity"
 
-static CALLBACK_OBJECT* g_KbdCallbackObject = NULL;
+static PCALLBACK_OBJECT g_KbdCallbackObject = NULL;
 
 static VOID
 AmtPtpKeyboardNotifyCallback(
