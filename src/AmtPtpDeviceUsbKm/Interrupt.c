@@ -379,6 +379,10 @@ AmtPtpEvtUsbInterruptPipeReadComplete(
                 largePalm = TRUE;
                 TraceEvents(TRACE_LEVEL_VERBOSE, TRACE_INPUT,
                     "%!FUNC! slot %llu: LARGE palm (major=%d)", (ULONG64)i, major);
+                // FIX: clear alive[] for ALL slots immediately so no contact
+                // leaks through to Phase B while palm lock is active.
+                for (size_t j = 0; j < PTP_MAX_CONTACT_POINTS; j++)
+                    alive[j] = FALSE;
                 break;
             }
 
@@ -447,17 +451,19 @@ AmtPtpEvtUsbInterruptPipeReadComplete(
         if (largePalm) {
             pCtx->PalmDetected = TRUE;
         } else if (pCtx->PalmDetected) {
-            // Stay locked until ALL contacts lift.
-            BOOLEAN anyContact = FALSE;
+            // Stay locked until ALL large-palm contacts lift.
+            // FIX: check only contacts >= PALM_LARGE_MAJOR, not every contact.
+            // The palm itself has major >= PALM_LARGE_MAJOR and will keep
+            // anyContact=TRUE forever if we check all nonzero contacts.
+            BOOLEAN anyLargePalm = FALSE;
             for (i = 0; i < raw_n; i++) {
                 f = (const struct TRACKPAD_FINGER*)(f_base + i * fingerSize);
-                if (AmtRawToInteger(f->touch_major) > 0 ||
-                    AmtRawToInteger(f->touch_minor) > 0) {
-                    anyContact = TRUE;
+                if (AmtRawToInteger(f->touch_major) >= PALM_LARGE_MAJOR) {
+                    anyLargePalm = TRUE;
                     break;
                 }
             }
-            if (!anyContact) {
+            if (!anyLargePalm) {
                 pCtx->PalmDetected = FALSE;
                 for (i = 0; i < PTP_MAX_CONTACT_POINTS; i++)
                     AmtClearSlot(pCtx, i);
