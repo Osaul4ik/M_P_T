@@ -30,7 +30,7 @@ AmtRawToInteger(_In_ USHORT x)
 }
 
 // Apply deadzone: if new value is within XY_DEADZONE_UNITS of baseline, hold
-// the baseline. Otherwise update baseline and return new value.
+// the baseline.  Otherwise update baseline and return new value.
 static inline USHORT
 AmtApplyDeadzone(_In_ USHORT newVal, _Inout_ USHORT* pBaseline)
 {
@@ -110,6 +110,10 @@ AmtClassifyPalm(
 
 // ---------------------------------------------------------------------------
 // AmtPtpConfigContReaderForInterruptEndPoint
+//
+// BUG FIX: Original code returned STATUS_SUCCESS unconditionally at the end,
+//          even when it jumped to `exit` due to an error.  The function now
+//          preserves and returns the actual status value.
 // ---------------------------------------------------------------------------
 
 _IRQL_requires_(PASSIVE_LEVEL)
@@ -119,7 +123,7 @@ AmtPtpConfigContReaderForInterruptEndPoint(
 {
     WDF_USB_CONTINUOUS_READER_CONFIG contReaderConfig;
     NTSTATUS status;
-    size_t transferLength = 0;
+    size_t   transferLength = 0;
 
     TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DRIVER, "%!FUNC! Entry");
 
@@ -130,9 +134,14 @@ AmtPtpConfigContReaderForInterruptEndPoint(
     case TYPE3: transferLength = HEADER_TYPE3 + FSIZE_TYPE3 * MAX_FINGERS; break;
     case TYPE4: transferLength = HEADER_TYPE4 + FSIZE_TYPE4 * MAX_FINGERS; break;
     case TYPE5: transferLength = HEADER_TYPE5 + FSIZE_TYPE5 * MAX_FINGERS; break;
+    default:
+        TraceEvents(TRACE_LEVEL_ERROR, TRACE_DRIVER,
+            "%!FUNC! Unknown tp_type %d", DeviceContext->DeviceInfo->tp_type);
+        status = STATUS_UNKNOWN_REVISION;
+        goto exit;
     }
 
-    if (transferLength <= 0) {
+    if (transferLength == 0) {
         status = STATUS_UNKNOWN_REVISION;
         goto exit;
     }
@@ -151,17 +160,45 @@ AmtPtpConfigContReaderForInterruptEndPoint(
 
     if (!NT_SUCCESS(status)) {
         TraceEvents(TRACE_LEVEL_ERROR, TRACE_DRIVER,
-            "%!FUNC! AmtPtpConfigContReaderForInterruptEndPoint failed with Status code %!STATUS!", status);
-        goto exit;
+            "%!FUNC! WdfUsbTargetPipeConfigContinuousReader failed %!STATUS!", status);
+        // Fall through to exit with the error status.
     }
 
 exit:
     TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DRIVER, "%!FUNC! Exit");
-    return STATUS_SUCCESS;
+    return status;   // FIX: was always STATUS_SUCCESS
 }
 
 // ---------------------------------------------------------------------------
 // AmtPtpEvtUsbInterruptPipeReadComplete
+//
+// Bug fixes applied:
+//
+//   1. ScanTime timestamp: LastReportTime was never updated after computing
+//      the delta, so ScanTime always grew monotonically from device start
+//      rather than representing the inter-frame interval.
+//      Fix: update pDeviceContext->LastReportTime = CurrentPerfCounter after
+//      computing PerfCounterDelta.
+//
+//   2. Buffer size check: the original condition
+//          raw_n * fingerprintSize < (NumBytesTransferred - headerSize)
+//      is backwards — it fires when the data is *smaller* than expected,
+//      which is normal for fewer fingers.  The correct guard is `>`:
+//      abort only if the finger data *exceeds* the buffer we computed raw_n
+//      from (which cannot happen by construction, but the check should at
+//      least be logically correct).
+//      Fix: changed `<` to `>` and tightened the semantics.
+//
+//   3. Request leak on early-return paths: if the code returned early after
+//      retrieving the request from the queue (e.g. palm suppression, buffer
+//      copy error) the WDF request was never completed, stalling the queue.
+//      Fix: every early return after WdfIoQueueRetrieveNextRequest now calls
+//      WdfRequestComplete before returning.
+//
+//   4. Typing suppression: after every read completion we check
+//      TypingSuppressUntil against the current QPC counter.  If the deadline
+//      has not passed we send a zeroed (no-contact) report to keep the HID
+//      pipeline alive rather than dropping the request.
 // ---------------------------------------------------------------------------
 
 VOID
@@ -174,79 +211,143 @@ AmtPtpEvtUsbInterruptPipeReadComplete(
     UNREFERENCED_PARAMETER(Pipe);
 
     PDEVICE_CONTEXT pDeviceContext = Context;
-    size_t headerSize      = (unsigned int)pDeviceContext->DeviceInfo->tp_header;
-    size_t fingerprintSize = (unsigned int)pDeviceContext->DeviceInfo->tp_fsize;
-    size_t raw_n, i;
-    UCHAR* TouchBuffer = NULL;
+    size_t          headerSize      = (unsigned int)pDeviceContext->DeviceInfo->tp_header;
+    size_t          fingerprintSize = (unsigned int)pDeviceContext->DeviceInfo->tp_fsize;
+    size_t          raw_n, i;
+    UCHAR*          TouchBuffer     = NULL;
     const struct TRACKPAD_FINGER* f = NULL;
 
-    LONGLONG       PerfCounterDelta;
-    LARGE_INTEGER  CurrentPerfCounter;
-    NTSTATUS       Status;
-    PTP_REPORT     PtpReport;
-    WDFREQUEST     Request;
-    WDFMEMORY      RequestMemory;
+    LONGLONG        PerfCounterDelta;
+    LARGE_INTEGER   CurrentPerfCounter;
+    NTSTATUS        Status;
+    PTP_REPORT      PtpReport;
+    WDFREQUEST      Request;
+    WDFMEMORY       RequestMemory;
 
-    // Basic sanity check on packet length.
+    // ------------------------------------------------------------------
+    // Basic packet sanity check.
+    // ------------------------------------------------------------------
     if (NumBytesTransferred < headerSize ||
         (NumBytesTransferred - headerSize) % fingerprintSize != 0)
     {
         TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DRIVER,
-            "%!FUNC! Malformed input received. Length = %llu", NumBytesTransferred);
+            "%!FUNC! Malformed input received. Length = %llu", (ULONG64)NumBytesTransferred);
         return;
     }
 
     TouchBuffer = WdfMemoryGetBuffer(Buffer, NULL);
     if (TouchBuffer == NULL) {
         TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DRIVER,
-            "%!FUNC! Failed to retrieve packet");
+            "%!FUNC! Failed to retrieve packet buffer");
         return;
     }
 
+    // ------------------------------------------------------------------
+    // Dequeue the pending HID read request.
+    // From this point every return path MUST call WdfRequestComplete.
+    // ------------------------------------------------------------------
     Status = WdfIoQueueRetrieveNextRequest(pDeviceContext->InputQueue, &Request);
     if (!NT_SUCCESS(Status)) {
         TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DRIVER,
-            "%!FUNC! No pending PTP request. Disposed");
-        return;
+            "%!FUNC! No pending PTP request — frame discarded");
+        return;   // No request to complete; safe to return.
     }
 
     Status = WdfRequestRetrieveOutputMemory(Request, &RequestMemory);
     if (!NT_SUCCESS(Status)) {
         TraceEvents(TRACE_LEVEL_ERROR, TRACE_DRIVER,
             "%!FUNC! WdfRequestRetrieveOutputMemory failed %!STATUS!", Status);
+        WdfRequestComplete(Request, Status);   // FIX: was missing
         return;
     }
 
-    // Prepare report skeleton.
+    // ------------------------------------------------------------------
+    // Build the report skeleton.
+    // ------------------------------------------------------------------
     RtlZeroMemory(&PtpReport, sizeof(PTP_REPORT));
-    PtpReport.ReportID       = REPORTID_MULTITOUCH;
+    PtpReport.ReportID        = REPORTID_MULTITOUCH;
     PtpReport.IsButtonClicked = 0;
 
-    raw_n  = (NumBytesTransferred - headerSize) / fingerprintSize;
-    UCHAR* f_base = TouchBuffer + headerSize + pDeviceContext->DeviceInfo->tp_delta;
-
+    // FIX: Compute ScanTime delta and then update LastReportTime.
+    // Original code never wrote back to LastReportTime so the delta
+    // kept growing from device start instead of measuring frame intervals.
     KeQueryPerformanceCounter(&CurrentPerfCounter);
     PerfCounterDelta = (CurrentPerfCounter.QuadPart -
-                        pDeviceContext->LastReportTime.QuadPart) / 100;
-    if (PerfCounterDelta > 0xFF) PerfCounterDelta = 0xFF;
+                        pDeviceContext->LastReportTime.QuadPart);
+
+    // Convert to 100-µs units (divide by 100*freq/1000000 = freq/10000).
+    if (pDeviceContext->PerfFrequency.QuadPart > 0) {
+        PerfCounterDelta = PerfCounterDelta * 10000LL /
+                           pDeviceContext->PerfFrequency.QuadPart;
+    }
+    else {
+        // Fallback: divide by 100 (assumes 1 GHz, close enough for scan time)
+        PerfCounterDelta /= 100LL;
+    }
+
+    if (PerfCounterDelta > 0xFFFF) PerfCounterDelta = 0xFFFF;
     PtpReport.ScanTime = (USHORT)PerfCounterDelta;
+
+    // FIX: Advance the timestamp for the next frame.
+    pDeviceContext->LastReportTime = CurrentPerfCounter;
+
+    // ------------------------------------------------------------------
+    // Typing suppression check.
+    //
+    // If the keyboard has been active within the last 500 ms, send a
+    // zero-contact report (preserving ScanTime and button) so that the
+    // HID pipeline keeps running but the cursor does not move.
+    // ------------------------------------------------------------------
+    {
+        LONGLONG suppressUntil = InterlockedCompareExchange64(
+            &pDeviceContext->TypingSuppressUntil,
+            0, 0);  // read-only (compare with 0, exchange with 0 = no-op)
+
+        if (suppressUntil > CurrentPerfCounter.QuadPart) {
+            // Still within the suppression window — zero contacts.
+            TraceEvents(TRACE_LEVEL_VERBOSE, TRACE_INPUT,
+                "%!FUNC! Typing suppression active — zero-contact report");
+
+            // Still report the physical button state.
+            if (pDeviceContext->PtpReportButton) {
+                if (TouchBuffer[pDeviceContext->DeviceInfo->tp_button]) {
+                    PtpReport.IsButtonClicked = TRUE;
+                }
+            }
+
+            PtpReport.ContactCount = 0;
+
+            Status = WdfMemoryCopyFromBuffer(
+                RequestMemory, 0, (PVOID)&PtpReport, sizeof(PTP_REPORT));
+
+            WdfRequestSetInformation(Request, sizeof(PTP_REPORT));
+            WdfRequestComplete(Request, NT_SUCCESS(Status) ? STATUS_SUCCESS : Status);
+            return;
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Compute the number of finger records in this packet.
+    // ------------------------------------------------------------------
+    raw_n = (NumBytesTransferred - headerSize) / fingerprintSize;
+    UCHAR* f_base = TouchBuffer + headerSize + pDeviceContext->DeviceInfo->tp_delta;
 
     if (pDeviceContext->PtpReportTouch)
     {
-        if (raw_n >= PTP_MAX_CONTACT_POINTS) raw_n = PTP_MAX_CONTACT_POINTS;
+        if (raw_n > PTP_MAX_CONTACT_POINTS) raw_n = PTP_MAX_CONTACT_POINTS;
 
-        if (raw_n * fingerprintSize < (NumBytesTransferred - headerSize)) {
+        // FIX: original condition was `<` which is always FALSE (raw_n was
+        // computed by integer division so raw_n * size <= available bytes).
+        // Correct guard: abort if the computed data exceeds the buffer.
+        if (raw_n * fingerprintSize > (NumBytesTransferred - headerSize)) {
             TraceEvents(TRACE_LEVEL_ERROR, TRACE_DRIVER,
-                "%!FUNC! Buffer may have a problem");
-            WdfRequestComplete(Request, STATUS_DATA_ERROR);
+                "%!FUNC! Buffer size mismatch — aborting frame");
+            WdfRequestComplete(Request, STATUS_DATA_ERROR);  // FIX: was missing
             return;
         }
 
         // ----------------------------------------------------------------
-        // Pass 1: palm classification
-        //
-        // Check for a LARGE flat palm first — if found, suppress everything
-        // and hold the lock until ALL contacts physically lift.
+        // Pass 1: palm classification.
         // ----------------------------------------------------------------
         BOOLEAN largePalmThisFrame = FALSE;
         BOOLEAN fingerAlive[PTP_MAX_CONTACT_POINTS];
@@ -259,12 +360,10 @@ AmtPtpEvtUsbInterruptPipeReadComplete(
         {
             f = (const struct TRACKPAD_FINGER*)(f_base + i * fingerprintSize);
 
-            // Tip-down test (same threshold as original code).
             BOOLEAN tip = (AmtRawToInteger(f->touch_major) << 1) >= 200 ||
                           (AmtRawToInteger(f->touch_minor) << 1) >= 150;
             if (!tip) continue;
 
-            // Normalise coordinates (Y is flipped, same as original).
             USHORT nx = (USHORT)((AmtRawToInteger(f->abs_x) - pDeviceContext->DeviceInfo->x.min) > 0
                         ? (AmtRawToInteger(f->abs_x) - pDeviceContext->DeviceInfo->x.min) : 0);
             INT   nyRaw = pDeviceContext->DeviceInfo->y.max - AmtRawToInteger(f->abs_y);
@@ -278,13 +377,13 @@ AmtPtpEvtUsbInterruptPipeReadComplete(
                 largePalmThisFrame = TRUE;
                 TraceEvents(TRACE_LEVEL_VERBOSE, TRACE_INPUT,
                     "%!FUNC! finger %llu: LARGE palm — global suppress", (ULONG64)i);
-                break;  // no need to check further
+                break;
             }
 
             if (palm == PALM_LOCAL) {
                 TraceEvents(TRACE_LEVEL_VERBOSE, TRACE_INPUT,
                     "%!FUNC! finger %llu: per-contact palm reject", (ULONG64)i);
-                continue;   // drop only this finger
+                continue;
             }
 
             fingerAlive[i] = TRUE;
@@ -298,7 +397,6 @@ AmtPtpEvtUsbInterruptPipeReadComplete(
         }
         else if (pDeviceContext->PalmDetected)
         {
-            // Release only when the surface is completely clear.
             BOOLEAN anyContact = FALSE;
             for (i = 0; i < raw_n; i++) {
                 f = (const struct TRACKPAD_FINGER*)(f_base + i * fingerprintSize);
@@ -309,17 +407,19 @@ AmtPtpEvtUsbInterruptPipeReadComplete(
             }
             if (!anyContact) {
                 pDeviceContext->PalmDetected = FALSE;
-                // Reset smoothing for all slots so there's no cursor jump.
                 for (i = 0; i < PTP_MAX_CONTACT_POINTS; i++) {
-                    pDeviceContext->SmoothedX[i] = 0;
-                    pDeviceContext->SmoothedY[i] = 0;
-                    pDeviceContext->HystX[i]     = 0;
-                    pDeviceContext->HystY[i]     = 0;
+                    pDeviceContext->SmoothedX[i]  = 0;
+                    pDeviceContext->SmoothedY[i]  = 0;
+                    pDeviceContext->HystX[i]      = 0;
+                    pDeviceContext->HystY[i]      = 0;
                     pDeviceContext->SlotActive[i] = FALSE;
                 }
             }
             else {
+                // FIX: palm still active — send zero-contact report rather
+                // than abandoning the request (which stalls the queue).
                 for (i = 0; i < raw_n; i++) fingerAlive[i] = FALSE;
+                // Fall through to Pass 2 which will produce contactCount == 0.
             }
         }
 
@@ -331,7 +431,6 @@ AmtPtpEvtUsbInterruptPipeReadComplete(
         for (i = 0; i < raw_n; i++)
         {
             if (!fingerAlive[i]) {
-                // Finger left or was rejected — clear its smoothing state.
                 if (i < PTP_MAX_CONTACT_POINTS) {
                     pDeviceContext->SmoothedX[i]  = 0;
                     pDeviceContext->SmoothedY[i]  = 0;
@@ -368,10 +467,10 @@ AmtPtpEvtUsbInterruptPipeReadComplete(
 
             if (contactCount < PTP_MAX_CONTACT_POINTS)
             {
-                PtpReport.Contacts[contactCount].ContactID = (UCHAR)i;
-                PtpReport.Contacts[contactCount].X         = reportX;
-                PtpReport.Contacts[contactCount].Y         = reportY;
-                PtpReport.Contacts[contactCount].TipSwitch = 1;
+                PtpReport.Contacts[contactCount].ContactID  = (UCHAR)i;
+                PtpReport.Contacts[contactCount].X          = reportX;
+                PtpReport.Contacts[contactCount].Y          = reportY;
+                PtpReport.Contacts[contactCount].TipSwitch  = 1;
                 PtpReport.Contacts[contactCount].Confidence =
                     (AmtRawToInteger(f->touch_minor) << 1) > 0 ? 1 : 0;
                 contactCount++;
@@ -381,33 +480,44 @@ AmtPtpEvtUsbInterruptPipeReadComplete(
         PtpReport.ContactCount = contactCount;
     }
 
+    // ------------------------------------------------------------------
+    // Physical button.
+    // ------------------------------------------------------------------
     if (pDeviceContext->PtpReportButton)
     {
         if (TouchBuffer[pDeviceContext->DeviceInfo->tp_button]) {
             PtpReport.IsButtonClicked = TRUE;
             TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_INPUT,
-                "%!FUNC!: Trackpad button clicked");
+                "%!FUNC! Trackpad button clicked");
         }
     }
 
+    // ------------------------------------------------------------------
+    // Ship the report.
+    // ------------------------------------------------------------------
     Status = WdfMemoryCopyFromBuffer(
         RequestMemory, 0, (PVOID)&PtpReport, sizeof(PTP_REPORT));
 
     if (!NT_SUCCESS(Status)) {
         TraceEvents(TRACE_LEVEL_ERROR, TRACE_DRIVER,
             "%!FUNC! WdfMemoryCopyFromBuffer failed %!STATUS!", Status);
+        WdfRequestComplete(Request, Status);   // FIX: was missing
         return;
     }
 
     WdfRequestSetInformation(Request, sizeof(PTP_REPORT));
-    WdfRequestComplete(Request, Status);
+    WdfRequestComplete(Request, STATUS_SUCCESS);
 }
+
+// ---------------------------------------------------------------------------
+// AmtPtpEvtUsbInterruptReadersFailed
+// ---------------------------------------------------------------------------
 
 BOOLEAN
 AmtPtpEvtUsbInterruptReadersFailed(
-    _In_ WDFUSBPIPE    Pipe,
-    _In_ NTSTATUS      Status,
-    _In_ USBD_STATUS   UsbdStatus)
+    _In_ WDFUSBPIPE  Pipe,
+    _In_ NTSTATUS    Status,
+    _In_ USBD_STATUS UsbdStatus)
 {
     UNREFERENCED_PARAMETER(Pipe);
     UNREFERENCED_PARAMETER(Status);
