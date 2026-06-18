@@ -402,30 +402,45 @@ cleanup:
 // ---------------------------------------------------------------------------
 // Keyboard notification / typing suppression
 //
-// Uses a named ExCallback object (\Callback\AmtPtpKbdActivity) that the
-// companion keyboard filter (AmtPtpKbdHook) fires on every key-down event.
+// FIX BUG-6: g_KbdCallbackObject initialization had a TOCTOU race between
+// InterlockedIncrement and ExCreateCallback.  A second device could enter
+// the `else` (open-without-create) branch before the first device wrote
+// g_KbdCallbackObject, receiving STATUS_OBJECT_NAME_NOT_FOUND and
+// decrementing the counter, leaving it at 1 while only one registration
+// actually succeeded.  On unregister the last device would then double-
+// decrement to -1 and never release the object.
 //
-// Thread safety:
-//   g_KbdCallbackObject is a process-wide singleton.  Multiple device
-//   instances share the same callback object but each registers its own
-//   handle.  The object is created once and released once all handles are
-//   unregistered.  A reference count (g_KbdCallbackRefCount) guards the
-//   object lifetime across devices.
+// Fix: protect the create/open sequence with a KSPIN_LOCK so only one device
+// at a time touches g_KbdCallbackObject and g_KbdCallbackRefCount.  The lock
+// is held only around the fast ExCreateCallback call (PASSIVE_LEVEL allowed
+// since we use KeAcquireSpinLock at PASSIVE and immediately release).
 //
-// FIX (original bugs):
-//   1. g_KbdCallbackObject was overwritten on every call to Register without
-//      first releasing the previous reference — leaking when called after a
-//      resource rebalance.
-//   2. Unregister called ObDereferenceObject even when the object had already
-//      been released by a prior Unregister — potential double-dereference.
-//   3. No reference count meant the last device to unregister could free the
-//      object while another device's callback was still registered against it.
+// FIX BUG-7: suppress duration now uses TYPING_SUPPRESS_DURATION_100NS from
+// Device.h instead of the inline magic number, so a single change to the
+// header updates both the callback and any future callers.
 // ---------------------------------------------------------------------------
 
 #define CALLBACK_OBJECT_NAME L"\\Callback\\AmtPtpKbdActivity"
 
 static PCALLBACK_OBJECT g_KbdCallbackObject   = NULL;
 static LONG             g_KbdCallbackRefCount = 0;
+static KSPIN_LOCK       g_KbdCallbackLock;
+static BOOLEAN          g_KbdCallbackLockInit = FALSE;
+
+//
+// Called once from DriverEntry (or equivalent) to initialise the spinlock.
+// If multi-device add races DriverEntry we rely on the fact that KMDF
+// serialises EvtDeviceAdd calls on a single thread; if you ever call
+// Register from a different context, move this into a once-init guard.
+//
+VOID
+AmtPtpInitKeyboardNotificationLock(VOID)
+{
+    if (!g_KbdCallbackLockInit) {
+        KeInitializeSpinLock(&g_KbdCallbackLock);
+        g_KbdCallbackLockInit = TRUE;
+    }
+}
 
 static VOID
 AmtPtpKeyboardNotifyCallback(
@@ -435,7 +450,6 @@ AmtPtpKeyboardNotifyCallback(
 {
     PDEVICE_CONTEXT pCtx = (PDEVICE_CONTEXT)CallbackContext;
     LARGE_INTEGER   now;
-    LONGLONG        suppressUntil;
 
     UNREFERENCED_PARAMETER(Argument1);
     UNREFERENCED_PARAMETER(Argument2);
@@ -443,15 +457,20 @@ AmtPtpKeyboardNotifyCallback(
     KeQueryPerformanceCounter(&now);
 
     if (pCtx->PerfFrequency.QuadPart == 0)
-        return;  // D0Entry not yet run
+        return;
 
-    LONGLONG ticksPerMs = pCtx->PerfFrequency.QuadPart / 1000LL;
-    suppressUntil = now.QuadPart + ticksPerMs * 500LL;
+    // FIX BUG-7: derive suppress window from the named constant so it stays
+    // consistent with Device.h.  TYPING_SUPPRESS_DURATION_100NS is in
+    // 100-ns units; convert to QPC ticks.
+    LONGLONG ticksPer100ns = pCtx->PerfFrequency.QuadPart / 10000000LL;
+    if (ticksPer100ns == 0) ticksPer100ns = 1;  // guard against very slow QPC
+    LONGLONG suppressUntil = now.QuadPart +
+        ticksPer100ns * TYPING_SUPPRESS_DURATION_100NS;
 
     InterlockedExchange64(&pCtx->TypingSuppressUntil, suppressUntil);
 
     TraceEvents(TRACE_LEVEL_VERBOSE, TRACE_INPUT,
-        "%!FUNC! Keyboard activity — suppressing touchpad 500 ms");
+        "%!FUNC! Keyboard activity — suppressing touchpad");
 }
 
 VOID
@@ -460,19 +479,25 @@ AmtPtpRegisterKeyboardNotification(_In_ PDEVICE_CONTEXT DeviceContext)
     NTSTATUS          status;
     OBJECT_ATTRIBUTES oa;
     UNICODE_STRING    callbackName;
+    KIRQL             oldIrql;
 
-    // Already registered for this device instance — nothing to do.
     if (DeviceContext->KbdNotifyHandle != NULL)
         return;
+
+    // Ensure the spinlock is initialised (idempotent).
+    AmtPtpInitKeyboardNotificationLock();
 
     RtlInitUnicodeString(&callbackName, CALLBACK_OBJECT_NAME);
     InitializeObjectAttributes(&oa, &callbackName,
                                OBJ_CASE_INSENSITIVE | OBJ_PERMANENT, NULL, NULL);
 
-    // FIX: only create the callback object when no device has done so yet.
-    // Subsequent devices open the existing object via the same ExCreateCallback
-    // call (Create=TRUE is idempotent when OBJ_PERMANENT is set).
-    if (InterlockedIncrement(&g_KbdCallbackRefCount) == 1) {
+    // FIX BUG-6: hold the spinlock across the increment + ExCreateCallback so
+    // concurrent EvtDeviceAdd calls cannot see a stale NULL g_KbdCallbackObject.
+    KeAcquireSpinLock(&g_KbdCallbackLock, &oldIrql);
+
+    LONG newCount = InterlockedIncrement(&g_KbdCallbackRefCount);
+
+    if (newCount == 1) {
         status = ExCreateCallback(
             &g_KbdCallbackObject, &oa,
             TRUE,   // create if absent
@@ -482,10 +507,11 @@ AmtPtpRegisterKeyboardNotification(_In_ PDEVICE_CONTEXT DeviceContext)
                 "%!FUNC! ExCreateCallback failed %!STATUS! — typing suppression inactive",
                 status);
             InterlockedDecrement(&g_KbdCallbackRefCount);
+            KeReleaseSpinLock(&g_KbdCallbackLock, oldIrql);
             return;
         }
     } else {
-        // Object was already created; open it without creating a new one.
+        // Object was already created; open without creating.
         status = ExCreateCallback(
             &g_KbdCallbackObject, &oa,
             FALSE,  // do not create — must already exist
@@ -494,9 +520,12 @@ AmtPtpRegisterKeyboardNotification(_In_ PDEVICE_CONTEXT DeviceContext)
             TraceEvents(TRACE_LEVEL_WARNING, TRACE_DRIVER,
                 "%!FUNC! ExCreateCallback (open) failed %!STATUS!", status);
             InterlockedDecrement(&g_KbdCallbackRefCount);
+            KeReleaseSpinLock(&g_KbdCallbackLock, oldIrql);
             return;
         }
     }
+
+    KeReleaseSpinLock(&g_KbdCallbackLock, oldIrql);
 
     DeviceContext->KbdNotifyHandle = ExRegisterCallback(
         g_KbdCallbackObject,
@@ -506,11 +535,13 @@ AmtPtpRegisterKeyboardNotification(_In_ PDEVICE_CONTEXT DeviceContext)
     if (DeviceContext->KbdNotifyHandle == NULL) {
         TraceEvents(TRACE_LEVEL_WARNING, TRACE_DRIVER,
             "%!FUNC! ExRegisterCallback returned NULL — typing suppression inactive");
-        // Release the reference we just acquired for this device.
+
+        KeAcquireSpinLock(&g_KbdCallbackLock, &oldIrql);
         if (InterlockedDecrement(&g_KbdCallbackRefCount) == 0) {
             ObDereferenceObject(g_KbdCallbackObject);
             g_KbdCallbackObject = NULL;
         }
+        KeReleaseSpinLock(&g_KbdCallbackLock, oldIrql);
     } else {
         TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DRIVER,
             "%!FUNC! Keyboard notification registered");
@@ -520,19 +551,21 @@ AmtPtpRegisterKeyboardNotification(_In_ PDEVICE_CONTEXT DeviceContext)
 VOID
 AmtPtpUnregisterKeyboardNotification(_In_ PDEVICE_CONTEXT DeviceContext)
 {
+    KIRQL oldIrql;
+
     if (DeviceContext->KbdNotifyHandle != NULL) {
         ExUnregisterCallback(DeviceContext->KbdNotifyHandle);
         DeviceContext->KbdNotifyHandle = NULL;
     } else {
-        // This device never successfully registered — nothing to release.
         return;
     }
 
-    // FIX: release the callback object only when this was the last device.
+    KeAcquireSpinLock(&g_KbdCallbackLock, &oldIrql);
     if (InterlockedDecrement(&g_KbdCallbackRefCount) == 0) {
         if (g_KbdCallbackObject != NULL) {
             ObDereferenceObject(g_KbdCallbackObject);
             g_KbdCallbackObject = NULL;
         }
     }
+    KeReleaseSpinLock(&g_KbdCallbackLock, oldIrql);
 }

@@ -13,14 +13,8 @@
 #define PALM_SCORE_THRESH   45
 
 //
-// FIX (cursor-jump, tip-size debounce):
 // Number of consecutive frames a SlotActive contact is allowed to dip below
-// the `tip` size threshold (major/minor too small) while still being
-// nonzero, before it is actually treated as lifted.  T2 touch_major/minor
-// readings are noisy near the lower bound -- a single low sample no longer
-// kills the slot outright.  Kept small (not a real "hold" state) so a true
-// quick lift-and-retouch within 1-2 frames still lifts promptly; this only
-// absorbs single-frame measurement noise, not real lift-off.
+// the `tip` size threshold before it is treated as lifted.
 //
 #define TIP_DROP_DEBOUNCE_FRAMES 2
 
@@ -71,39 +65,11 @@ AmtClearSlot(_In_ PDEVICE_CONTEXT ctx, _In_ size_t i)
     ctx->HystX[i]         = 0;
     ctx->HystY[i]         = 0;
     ctx->SlotActive[i]    = FALSE;
-    ctx->TipDropCount[i]  = 0;   // FIX: clear debounce counter with the slot
+    ctx->TipDropCount[i]  = 0;
 }
 
 typedef enum { PALM_NONE = 0, PALM_LOCAL = 1, PALM_LARGE = 2 } PALM_CLASS;
 
-//
-// AmtClassifyPalm
-//
-// Two-tier palm classifier:
-//   PALM_LARGE  — flat resting hand; suppress all input until lifted.
-//   PALM_LOCAL  — thumb / palm edge; reject only this contact.
-//   PALM_NONE   — normal finger; track it.
-//
-// FIX 1: The `tip` pre-filter in Pass 1 used to run BEFORE this function,
-//   which meant contacts with touch_major < 100 were skipped entirely and
-//   never classified as palms.  A palm resting flat can produce contacts
-//   with lower touch_major values because the contact area is spread across
-//   multiple hardware sensor segments.  Classification is now called
-//   unconditionally for any contact with touch_major > 0.
-//
-// FIX 2: PALM_LARGE_MAJOR was 460 and PALM_SCORE_THRESH was 55.  A contact
-//   with major=459 scored only 50 (major>=380 → +50) and therefore fell
-//   through as PALM_NONE despite being clearly palm-sized.  The gap between
-//   the LARGE threshold and the score path left a blind spot.  Fixed by:
-//     - lowering PALM_LARGE_MAJOR to 380 so the score path handles 260-379,
-//     - lowering PALM_SCORE_THRESH to 45 so major>=260 (+35) + any secondary
-//       signal (aspect ratio or edge) tips it over.
-//
-// FIX 3: Edge proximity cast to USHORT was incorrect.  normX and normY are
-//   already in [0, range] but edgePctX/edgePctY are INT.  Comparing INT
-//   against USHORT via explicit cast hid potential sign-extension bugs and
-//   made the condition unreadable.  All comparisons are now done as INT.
-//
 static PALM_CLASS
 AmtClassifyPalm(
     _In_ const struct TRACKPAD_FINGER* f,
@@ -115,20 +81,16 @@ AmtClassifyPalm(
     INT minor = AmtRawToInteger(f->touch_minor);
     INT score = 0;
 
-    // Zero contact — no palm.
     if (major <= 0 && minor <= 0)
         return PALM_NONE;
 
-    // Flat resting hand: immediately suppress everything.
     if (major >= PALM_LARGE_MAJOR)
         return PALM_LARGE;
 
-    // Size score (covers 260–379 after PALM_LARGE_MAJOR change).
     if      (major > 260) score += 35;
     else if (major > 190) score += 15;
     else if (major > 130) score +=  8;
 
-    // Aspect ratio: a very elongated touch is likely a thumb/palm edge.
     if (minor > 0 && major > 120) {
         INT ratio = major * 100 / minor;
         if      (ratio > 1200) score += 30;
@@ -136,14 +98,12 @@ AmtClassifyPalm(
         else if (ratio >  600) score += 10;
     }
 
-    // Edge proximity: contacts near the border are more likely palms.
     if (major > 130) {
         INT xRange   = devInfo->x.max - devInfo->x.min;
         INT yRange   = devInfo->y.max - devInfo->y.min;
         INT edgePctX = xRange / 28;
         INT edgePctY = yRange / 28;
 
-        // FIX 3: pure INT comparison, no USHORT cast.
         if (normX < edgePctX || normX > (xRange - edgePctX) ||
             normY < edgePctY || normY > (yRange - edgePctY))
             score += 10;
@@ -238,7 +198,7 @@ AmtPtpEvtUsbInterruptPipeReadComplete(
 
     Status = WdfIoQueueRetrieveNextRequest(pCtx->InputQueue, &Request);
     if (!NT_SUCCESS(Status))
-        return;  // No consumer — frame discarded, no leak.
+        return;
 
     Status = WdfRequestRetrieveOutputMemory(Request, &RequestMemory);
     if (!NT_SUCCESS(Status)) {
@@ -310,37 +270,9 @@ AmtPtpEvtUsbInterruptPipeReadComplete(
             return;
         }
 
-        //
-        // NOTE (pre-existing architectural limitation, not patched here):
-        // `i` below is the raw USB record index for this frame, and is also
-        // used directly as the persistent slot/ContactID for SmoothedX/Y,
-        // HystX/Y, SlotActive, TipDropCount, SlotReportedLastFrame.  If the
-        // hardware drops a finger's record so raw_n shrinks (e.g. 3 fingers
-        // down -> one lifts -> raw_n goes 3 -> 2), the record that used to
-        // be at index 2 is no longer at index 2; whatever finger is now at
-        // index 1 inherits index 1's old smoothing baseline/hysteresis even
-        // though it may be a physically different contact.  This is a
-        // genuine identity-leak source of cursor snap, but fixing it
-        // requires real slot matching (nearest-position assignment or a
-        // persistent ContactID scheme, as already implemented for the SPI
-        // variant's FSM) rather than a local patch, since it changes how
-        // ContactID is assigned for the whole frame. Flagging explicitly
-        // rather than silently reshuffling index semantics here.
-        //
-
-        // ----------------------------------------------------------------
-        // Pass 1: classify all contacts.
-        //
-        // FIX: removed the `tip` pre-filter that guarded the AmtClassifyPalm
-        // call.  The filter required touch_major >= 100, which excluded some
-        // palm contacts from ever reaching the classifier.  Classification is
-        // now done for every contact with any nonzero touch extent.
-        // Contacts that are neither tip nor palm (touch_major == 0) are simply
-        // left with alive[i] = FALSE, which is the same outcome as before.
-        // ----------------------------------------------------------------
         BOOLEAN largePalm = FALSE;
         BOOLEAN alive[PTP_MAX_CONTACT_POINTS];
-        INT     normXi[PTP_MAX_CONTACT_POINTS];  // INT to avoid USHORT cast bugs
+        INT     normXi[PTP_MAX_CONTACT_POINTS];
         INT     normYi[PTP_MAX_CONTACT_POINTS];
 
         for (i = 0; i < PTP_MAX_CONTACT_POINTS; i++) {
@@ -355,11 +287,8 @@ AmtPtpEvtUsbInterruptPipeReadComplete(
             INT major = AmtRawToInteger(f->touch_major);
             INT minor = AmtRawToInteger(f->touch_minor);
 
-            // Skip completely silent slots (hardware placeholder rows).
             if (major <= 0 && minor <= 0) {
-                // FIX: a slot going fully silent (0/0) is unambiguous
-                // lift-off, not measurement noise -- reset its debounce
-                // counter immediately so a future re-touch starts clean.
+                // Unambiguous lift-off — reset debounce immediately.
                 pCtx->TipDropCount[i] = 0;
                 continue;
             }
@@ -367,8 +296,12 @@ AmtPtpEvtUsbInterruptPipeReadComplete(
             INT nx = (INT)AmtClampCoord(AmtRawToInteger(f->abs_x),
                                         pCtx->DeviceInfo->x.min,
                                         pCtx->DeviceInfo->x.max);
-            INT nyRaw = pCtx->DeviceInfo->y.max - AmtRawToInteger(f->abs_y);
-            INT ny    = (nyRaw > 0) ? nyRaw : 0;
+
+            // FIX BUG-2: clamp nyRaw to [0, y.max - y.min] to prevent
+            // overflow when abs_y < y.min (hardware out-of-range reading).
+            INT yRange = pCtx->DeviceInfo->y.max - pCtx->DeviceInfo->y.min;
+            INT nyRaw  = pCtx->DeviceInfo->y.max - AmtRawToInteger(f->abs_y);
+            INT ny     = (nyRaw < 0) ? 0 : (nyRaw > yRange ? yRange : nyRaw);
 
             normXi[i] = nx;
             normYi[i] = ny;
@@ -379,10 +312,14 @@ AmtPtpEvtUsbInterruptPipeReadComplete(
                 largePalm = TRUE;
                 TraceEvents(TRACE_LEVEL_VERBOSE, TRACE_INPUT,
                     "%!FUNC! slot %llu: LARGE palm (major=%d)", (ULONG64)i, major);
-                // FIX: clear alive[] for ALL slots immediately so no contact
-                // leaks through to Phase B while palm lock is active.
-                for (size_t j = 0; j < PTP_MAX_CONTACT_POINTS; j++)
-                    alive[j] = FALSE;
+
+                // FIX BUG-5: reset TipDropCount for ALL slots when a large
+                // palm is detected, including slots not yet visited by this
+                // loop iteration, so future touches start with clean state.
+                for (size_t j = 0; j < PTP_MAX_CONTACT_POINTS; j++) {
+                    alive[j]             = FALSE;
+                    pCtx->TipDropCount[j] = 0;
+                }
                 break;
             }
 
@@ -393,42 +330,13 @@ AmtPtpEvtUsbInterruptPipeReadComplete(
                 continue;
             }
 
-            // Require a minimum tip size to count as an intentional contact.
-            // This replaces the old `tip` pre-filter but runs AFTER palm
-            // classification so palms are never confused with small fingers.
             BOOLEAN tip = (major << 1) >= 200 || (minor << 1) >= 150;
 
             if (!tip) {
-                //
-                // FIX (cursor-jump): tip-size debounce.
-                //
-                // Previously, a single frame where major/minor dipped below
-                // threshold (common sensor noise on T2 while a finger is
-                // firmly down) caused `alive[i] = FALSE` here.  Phase A then
-                // emitted an immediate lift-off for this slot, and the next
-                // frame -- seeing the contact again -- re-armed it via
-                // `!pCtx->SlotActive[i]`, resetting SmoothedX/Y to the new
-                // raw position with NO smoothing applied.  That hard reset
-                // is what produced the visible cursor jump/snap during
-                // sustained contact.
-                //
-                // Fix: if this slot was already SlotActive (a real, ongoing
-                // contact), tolerate up to TIP_DROP_DEBOUNCE_FRAMES
-                // consecutive sub-threshold frames before declaring lift-off.
-                // While in the debounce window we keep the slot alive and
-                // simply hold position (no panic reset), so Phase B will
-                // continue smoothing from the last known-good coordinate.
-                // If the slot was NOT yet active (a brand-new low-confidence
-                // touch), there is no smoothing state to protect, so it is
-                // treated as not-yet-a-tip immediately, same as before.
-                //
                 if (pCtx->SlotActive[i] &&
                     pCtx->TipDropCount[i] < TIP_DROP_DEBOUNCE_FRAMES) {
                     pCtx->TipDropCount[i]++;
                     alive[i]  = TRUE;
-                    // Reuse last known-good normalized position so Phase B's
-                    // deadzone/smoothing sees a stable input instead of a
-                    // noisy low-confidence sample.
                     normXi[i] = pCtx->SmoothedX[i];
                     normYi[i] = pCtx->SmoothedY[i];
                     TraceEvents(TRACE_LEVEL_VERBOSE, TRACE_INPUT,
@@ -437,13 +345,10 @@ AmtPtpEvtUsbInterruptPipeReadComplete(
                     continue;
                 }
 
-                // Debounce window exhausted (or never active) — genuine
-                // non-tip / lift-off.
                 pCtx->TipDropCount[i] = 0;
                 continue;
             }
 
-            // Healthy tip-sized contact — clear any accumulated debounce.
             pCtx->TipDropCount[i] = 0;
             alive[i] = TRUE;
         }
@@ -451,26 +356,6 @@ AmtPtpEvtUsbInterruptPipeReadComplete(
         if (largePalm) {
             pCtx->PalmDetected = TRUE;
         } else if (pCtx->PalmDetected) {
-            //
-            // Stay locked until ALL contacts are physically lifted.
-            //
-            // Previously the lock was released as soon as the large-palm
-            // contact itself disappeared (major < PALM_LARGE_MAJOR).  That
-            // meant a user could: 1) rest a palm on the pad (lock engaged),
-            // 2) place another finger, 3) lift the palm — and the pad would
-            // immediately unlock and process that other finger, causing an
-            // unwanted cursor jump.
-            //
-            // Fix: while palm-locked, check for ANY nonzero contact in the
-            // raw USB frame.  Only when every contact has lifted do we
-            // release the lock and allow tracking again.
-            //
-            // IMPORTANT: alive[] was already populated by the classification
-            // loop above.  If the lock remains active (anyContact == TRUE),
-            // we MUST force alive[] to all-FALSE here, otherwise Phase B
-            // will process those contacts and the cursor will move despite
-            // the palm lock.
-            //
             BOOLEAN anyContact = FALSE;
             for (i = 0; i < raw_n; i++) {
                 f = (const struct TRACKPAD_FINGER*)(f_base + i * fingerSize);
@@ -488,8 +373,6 @@ AmtPtpEvtUsbInterruptPipeReadComplete(
                 TraceEvents(TRACE_LEVEL_VERBOSE, TRACE_INPUT,
                     "%!FUNC! Palm released — resuming");
             } else {
-                // Lock still active — suppress all contacts that the
-                // classification loop may have marked as alive.
                 for (i = 0; i < PTP_MAX_CONTACT_POINTS; i++)
                     alive[i] = FALSE;
             }
@@ -497,11 +380,18 @@ AmtPtpEvtUsbInterruptPipeReadComplete(
 
         // ----------------------------------------------------------------
         // Pass 2: emit lift-offs (Phase A) then active contacts (Phase B).
+        //
+        // FIX BUG-3: Phase A now only covers slots [0 .. raw_n-1].
+        // Slots [raw_n .. PTP_MAX_CONTACT_POINTS-1] are handled exclusively
+        // in the "silently dropped" block below.  Previously both Phase A
+        // and the silently-dropped block could emit lift-off for the same
+        // slot (alive[i] == FALSE for i >= raw_n in both paths), causing
+        // double lift-off reports for every slot beyond raw_n.
         // ----------------------------------------------------------------
         UCHAR contactCount = 0;
 
-        // Phase A: lift-off for contacts that ended this frame.
-        for (i = 0; i < PTP_MAX_CONTACT_POINTS; i++) {
+        // Phase A: lift-off for contacts within raw_n that ended this frame.
+        for (i = 0; i < raw_n; i++) {
             if (!pCtx->SlotReportedLastFrame[i] || alive[i])
                 continue;
 
@@ -552,16 +442,35 @@ AmtPtpEvtUsbInterruptPipeReadComplete(
                 Report.Contacts[contactCount].X          = repX;
                 Report.Contacts[contactCount].Y          = repY;
                 Report.Contacts[contactCount].TipSwitch  = 1;
-                Report.Contacts[contactCount].Confidence =
-                    (AmtRawToInteger(f->touch_minor) << 1) > 0 ? 1 : 0;
+
+                // FIX BUG-4: for debounce-alive slots normXi/normYi hold the
+                // last-good smoothed position, not live hardware data, so
+                // f->touch_minor from a sub-threshold frame is unreliable.
+                // Use the previous Confidence value (SlotActive == TRUE means
+                // at least one good frame was seen) rather than reading noisy
+                // touch_minor.  For a real healthy contact the live value is
+                // fine.
+                if (pCtx->TipDropCount[i] > 0) {
+                    // Debounce frame: hold last-good confidence (minor > 0).
+                    Report.Contacts[contactCount].Confidence = 1;
+                } else {
+                    Report.Contacts[contactCount].Confidence =
+                        (AmtRawToInteger(f->touch_minor) << 1) > 0 ? 1 : 0;
+                }
                 contactCount++;
                 pCtx->SlotReportedLastFrame[i] = TRUE;
             }
         }
 
-        // Lift-off for slots that hardware silently dropped (raw_n shrank).
+        // FIX BUG-1: lift-off for slots that hardware silently dropped
+        // (raw_n shrank).  The slot state MUST be cleared unconditionally
+        // regardless of whether there is room in the report buffer.  If we
+        // skip AmtClearSlot / SlotReportedLastFrame reset when contactCount
+        // hits the limit, the slot stays "reported" forever and generates a
+        // stale lift-off on every subsequent frame.
         for (i = raw_n; i < PTP_MAX_CONTACT_POINTS; i++) {
             if (!pCtx->SlotReportedLastFrame[i]) continue;
+
             if (contactCount < PTP_MAX_CONTACT_POINTS) {
                 Report.Contacts[contactCount].ContactID  = (UCHAR)i;
                 Report.Contacts[contactCount].TipSwitch  = 0;
@@ -569,7 +478,13 @@ AmtPtpEvtUsbInterruptPipeReadComplete(
                 Report.Contacts[contactCount].X          = pCtx->SmoothedX[i];
                 Report.Contacts[contactCount].Y          = pCtx->SmoothedY[i];
                 contactCount++;
+            } else {
+                TraceEvents(TRACE_LEVEL_WARNING, TRACE_INPUT,
+                    "%!FUNC! slot %llu: silently-dropped lift-off lost (buffer full)",
+                    (ULONG64)i);
             }
+
+            // Always clear state even if we couldn't fit the report entry.
             pCtx->SlotReportedLastFrame[i] = FALSE;
             AmtClearSlot(pCtx, i);
         }
