@@ -18,6 +18,24 @@
 //
 #define TIP_DROP_DEBOUNCE_FRAMES 2
 
+//
+// FIX (cursor-jump on rapid re-tap near a previous gesture):
+// The debounce window above is only allowed to bridge a sub-threshold frame
+// when the new low-confidence sample is still close to the slot's last known
+// position. If the new sample lands far from where the slot was last seen,
+// it is a genuinely new contact that happens to land on the same raw sensor
+// slot index right after the previous one lifted (the T2 sensor's raw slot
+// numbering is reused, not a stable logical ContactID) -- not a momentary
+// dip in contact area of the SAME finger. In that case the debounce must NOT
+// fire, or SlotActive stays artificially TRUE across the lift, and the next
+// real touch-down frame is treated as a continuation of the OLD contact:
+// AmtSmoothCoord then blends the new position against the stale SmoothedX/Y
+// from the previous gesture, producing a visible cursor jump through the
+// intermediate blended points for a couple of frames.
+//
+// Units are raw device coordinate units (same space as SmoothedX/Y).
+#define TIP_DROP_MAX_REPOSITION_DELTA 300
+
 static inline INT
 AmtRawToInteger(_In_ USHORT x)
 {
@@ -333,7 +351,26 @@ AmtPtpEvtUsbInterruptPipeReadComplete(
             BOOLEAN tip = (major << 1) >= 200 || (minor << 1) >= 150;
 
             if (!tip) {
-                if (pCtx->SlotActive[i] &&
+                //
+                // FIX (cursor-jump on rapid re-tap): only treat this as a
+                // momentary dip of the SAME finger if the slot was already
+                // active AND the new (still noisy) coordinate is close to
+                // where that contact was last seen. A new contact landing
+                // on a reused raw slot index right after the previous one
+                // lifted will have abs_x/abs_y far from the stale
+                // SmoothedX/Y of the old gesture -- that case must fall
+                // through to full lift/clear, not be bridged by debounce.
+                //
+                INT dxAbs = nx - (INT)pCtx->SmoothedX[i];
+                if (dxAbs < 0) dxAbs = -dxAbs;
+                INT dyAbs = ny - (INT)pCtx->SmoothedY[i];
+                if (dyAbs < 0) dyAbs = -dyAbs;
+
+                BOOLEAN samePositionAsBefore =
+                    (dxAbs <= TIP_DROP_MAX_REPOSITION_DELTA) &&
+                    (dyAbs <= TIP_DROP_MAX_REPOSITION_DELTA);
+
+                if (pCtx->SlotActive[i] && samePositionAsBefore &&
                     pCtx->TipDropCount[i] < TIP_DROP_DEBOUNCE_FRAMES) {
                     pCtx->TipDropCount[i]++;
                     alive[i]  = TRUE;
@@ -343,6 +380,13 @@ AmtPtpEvtUsbInterruptPipeReadComplete(
                         "%!FUNC! slot %llu: tip below threshold, debounced (%u/%u)",
                         (ULONG64)i, pCtx->TipDropCount[i], TIP_DROP_DEBOUNCE_FRAMES);
                     continue;
+                }
+
+                if (pCtx->SlotActive[i] && !samePositionAsBefore) {
+                    TraceEvents(TRACE_LEVEL_VERBOSE, TRACE_INPUT,
+                        "%!FUNC! slot %llu: sub-threshold frame far from last "
+                        "position (dx=%d dy=%d) — treating as real lift, not debounce",
+                        (ULONG64)i, dxAbs, dyAbs);
                 }
 
                 pCtx->TipDropCount[i] = 0;
