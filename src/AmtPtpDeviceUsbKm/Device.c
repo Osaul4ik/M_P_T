@@ -418,6 +418,32 @@ cleanup:
 // FIX BUG-7: suppress duration now uses TYPING_SUPPRESS_DURATION_100NS from
 // Device.h instead of the inline magic number, so a single change to the
 // header updates both the callback and any future callers.
+//
+// FIX BUG-8 (reference leak on multi-device open):
+// ExCreateCallback ALWAYS returns a new object reference in *CallbackObject,
+// regardless of whether Create is TRUE or FALSE -- "open without create"
+// still adds a reference to the existing object, it doesn't just hand back
+// a borrowed pointer. The original code called ExCreateCallback for every
+// registration (the first one with Create=TRUE, every subsequent one with
+// Create=FALSE to "open" the already-existing object), but only ever
+// dereferenced the object ONCE, when the ref-count reaches zero on the
+// final unregister.
+//
+// Net effect: with N devices registering against the shared callback object
+// (e.g. AmtPtpDeviceUsbKm + AmtPtpDeviceSpiKm both bound, or repeated
+// suspend/resume D0Exit->D0Entry cycles racing a second device's add), each
+// "open" call leaks one object reference that is never released -- the
+// callback object's internal ref-count grows without bound and the object
+// is never freed even after every device unregisters and the driver
+// unloads. Over enough sleep/wake cycles this is a slow, unbounded kernel
+// object leak.
+//
+// Fix: immediately drop the reference ExCreateCallback just handed us once
+// we're done using the (already-known-valid) pointer for ExRegisterCallback.
+// We only need ONE "owning" reference on g_KbdCallbackObject for as long as
+// g_KbdCallbackRefCount > 0; that owning reference is the one taken by the
+// very first (Create=TRUE) call. Every subsequent open call's reference is
+// surplus and must be dereferenced right away.
 // ---------------------------------------------------------------------------
 
 #define CALLBACK_OBJECT_NAME L"\\Callback\\AmtPtpKbdActivity"
@@ -480,6 +506,7 @@ AmtPtpRegisterKeyboardNotification(_In_ PDEVICE_CONTEXT DeviceContext)
     OBJECT_ATTRIBUTES oa;
     UNICODE_STRING    callbackName;
     KIRQL             oldIrql;
+    PCALLBACK_OBJECT  openedObject;
 
     if (DeviceContext->KbdNotifyHandle != NULL)
         return;
@@ -510,10 +537,19 @@ AmtPtpRegisterKeyboardNotification(_In_ PDEVICE_CONTEXT DeviceContext)
             KeReleaseSpinLock(&g_KbdCallbackLock, oldIrql);
             return;
         }
+        // This is the single owning reference for g_KbdCallbackObject; it is
+        // released when the ref-count drops back to zero in Unregister.
     } else {
-        // Object was already created; open without creating.
+        // FIX BUG-8: object was already created; this call opens it and
+        // returns a NEW reference in openedObject (NOT a borrowed pointer to
+        // g_KbdCallbackObject — it is a distinct, independently-refcounted
+        // handle to the same underlying object). We only want one long-lived
+        // owning reference total, so drop this surplus reference immediately
+        // after confirming the open succeeded; g_KbdCallbackObject already
+        // points at the live object from the Create=TRUE call above.
+        openedObject = NULL;
         status = ExCreateCallback(
-            &g_KbdCallbackObject, &oa,
+            &openedObject, &oa,
             FALSE,  // do not create — must already exist
             TRUE);
         if (!NT_SUCCESS(status)) {
@@ -523,6 +559,9 @@ AmtPtpRegisterKeyboardNotification(_In_ PDEVICE_CONTEXT DeviceContext)
             KeReleaseSpinLock(&g_KbdCallbackLock, oldIrql);
             return;
         }
+        // Drop the surplus reference now; g_KbdCallbackObject (from the
+        // original Create=TRUE call) remains valid because refCount > 0.
+        ObDereferenceObject(openedObject);
     }
 
     KeReleaseSpinLock(&g_KbdCallbackLock, oldIrql);

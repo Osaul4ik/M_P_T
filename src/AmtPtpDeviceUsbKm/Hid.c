@@ -385,7 +385,31 @@ AmtPtpReportFeatures(
 			}
 
 			PPTP_DEVICE_HQA_CERTIFICATION_REPORT certReport = (PPTP_DEVICE_HQA_CERTIFICATION_REPORT)pHidPacket->reportBuffer;
-			*certReport->CertificationBlob = DEFAULT_PTP_HQA_BLOB;
+
+			//
+			// FIX (HQA blob corruption): `*certReport->CertificationBlob =
+			// DEFAULT_PTP_HQA_BLOB;` only ever wrote ONE byte.
+			// DEFAULT_PTP_HQA_BLOB expands to a comma-separated list of 256
+			// byte literals; as the right-hand side of a plain assignment
+			// that list is parsed as a comma EXPRESSION, which evaluates
+			// every operand left-to-right and discards all but the last.
+			// So the assignment silently degraded to:
+			//
+			//     certReport->CertificationBlob[0] = 0xc2;  // last byte only
+			//
+			// leaving CertificationBlob[1..255] as whatever happened to be
+			// in the IOCTL output buffer (not guaranteed to be zeroed).
+			// Windows validates this blob as the PTP HQA certification
+			// payload, so only 1/256 correct bytes reaching Windows means
+			// certification (and thus "Precision Touchpad" status) reliably
+			// fails. Fix: materialize the macro as a real byte array once
+			// and memcpy the whole thing in.
+			//
+			{
+				static const UCHAR HqaBlob[256] = { DEFAULT_PTP_HQA_BLOB };
+				C_ASSERT(sizeof(HqaBlob) == sizeof(certReport->CertificationBlob));
+				RtlCopyMemory(certReport->CertificationBlob, HqaBlob, sizeof(HqaBlob));
+			}
 			certReport->ReportID = REPORTID_PTPHQA;
 
 			TraceEvents(
