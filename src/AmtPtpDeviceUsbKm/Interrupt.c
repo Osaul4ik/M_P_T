@@ -22,16 +22,7 @@
 // FIX (cursor-jump on rapid re-tap near a previous gesture):
 // The debounce window above is only allowed to bridge a sub-threshold frame
 // when the new low-confidence sample is still close to the slot's last known
-// position. If the new sample lands far from where the slot was last seen,
-// it is a genuinely new contact that happens to land on the same raw sensor
-// slot index right after the previous one lifted (the T2 sensor's raw slot
-// numbering is reused, not a stable logical ContactID) -- not a momentary
-// dip in contact area of the SAME finger. In that case the debounce must NOT
-// fire, or SlotActive stays artificially TRUE across the lift, and the next
-// real touch-down frame is treated as a continuation of the OLD contact:
-// AmtSmoothCoord then blends the new position against the stale SmoothedX/Y
-// from the previous gesture, producing a visible cursor jump through the
-// intermediate blended points for a couple of frames.
+// position.
 //
 // Units are raw device coordinate units (same space as SmoothedX/Y).
 #define TIP_DROP_MAX_REPOSITION_DELTA 300
@@ -74,16 +65,48 @@ AmtSmoothCoord(_In_ USHORT rawVal, _In_ USHORT prevVal)
     return (USHORT)(blended < 0 ? 0 : blended);
 }
 
+//
 // Reset all per-slot state for slot i.
+//
+// FIX (cursor-jump after multi-finger gesture):
+// The original AmtClearSlot set SmoothedX/Y = 0.  When a new touch-down
+// arrives on the same slot in the very next frame, Phase B initialises:
+//
+//   pCtx->SmoothedX[i] = nx;   // correct
+//   pCtx->SmoothedY[i] = ny;   // correct
+//
+// so SmoothedX/Y=0 is not directly used for smoothing on the FIRST frame.
+// However there is a subtler path: if the slot is cleared mid-gesture
+// (e.g. suppression block, or palm clear) and a sub-threshold "tip" frame
+// arrives immediately after before SlotActive becomes TRUE, the debounce
+// path reads SmoothedX/Y as the "last known position" to compare against
+// TIP_DROP_MAX_REPOSITION_DELTA.  A stale 0 makes dxAbs huge → debounce
+// never fires → no problem there, actually correct.
+//
+// The REAL cursor-jump source is in Phase B's smoothing initialisation:
+// when a slot transitions from a multi-finger gesture directly to a new
+// single-finger tap WITHOUT a full lift-off cycle (the T2 sensor re-uses
+// the slot), SmoothedX/Y still holds the last BLENDED gesture coordinate,
+// and the first AmtSmoothCoord call blends the new real position against
+// that stale gesture position → visible jump for a couple of frames.
+//
+// We fix this with SlotWasInGesture (see Device.h).  AmtClearSlot itself
+// no longer needs to zero SmoothedX/Y — the Phase B initialisation path
+// (SlotActive FALSE → TRUE) unconditionally overwrites them.  But we DO
+// zero them here so that any stale-read of SmoothedX/Y on a "dead" slot
+// (e.g. suppression lift-off report) reports 0 rather than a ghost position
+// from a previous session — which is the safe/correct behaviour.
+//
 static inline VOID
 AmtClearSlot(_In_ PDEVICE_CONTEXT ctx, _In_ size_t i)
 {
-    ctx->SmoothedX[i]     = 0;
-    ctx->SmoothedY[i]     = 0;
-    ctx->HystX[i]         = 0;
-    ctx->HystY[i]         = 0;
-    ctx->SlotActive[i]    = FALSE;
-    ctx->TipDropCount[i]  = 0;
+    ctx->SmoothedX[i]         = 0;
+    ctx->SmoothedY[i]         = 0;
+    ctx->HystX[i]             = 0;
+    ctx->HystY[i]             = 0;
+    ctx->SlotActive[i]        = FALSE;
+    ctx->TipDropCount[i]      = 0;
+    ctx->SlotWasInGesture[i]  = FALSE;
 }
 
 typedef enum { PALM_NONE = 0, PALM_LOCAL = 1, PALM_LARGE = 2 } PALM_CLASS;
@@ -306,7 +329,6 @@ AmtPtpEvtUsbInterruptPipeReadComplete(
             INT minor = AmtRawToInteger(f->touch_minor);
 
             if (major <= 0 && minor <= 0) {
-                // Unambiguous lift-off — reset debounce immediately.
                 pCtx->TipDropCount[i] = 0;
                 continue;
             }
@@ -315,8 +337,6 @@ AmtPtpEvtUsbInterruptPipeReadComplete(
                                         pCtx->DeviceInfo->x.min,
                                         pCtx->DeviceInfo->x.max);
 
-            // FIX BUG-2: clamp nyRaw to [0, y.max - y.min] to prevent
-            // overflow when abs_y < y.min (hardware out-of-range reading).
             INT yRange = pCtx->DeviceInfo->y.max - pCtx->DeviceInfo->y.min;
             INT nyRaw  = pCtx->DeviceInfo->y.max - AmtRawToInteger(f->abs_y);
             INT ny     = (nyRaw < 0) ? 0 : (nyRaw > yRange ? yRange : nyRaw);
@@ -331,11 +351,8 @@ AmtPtpEvtUsbInterruptPipeReadComplete(
                 TraceEvents(TRACE_LEVEL_VERBOSE, TRACE_INPUT,
                     "%!FUNC! slot %llu: LARGE palm (major=%d)", (ULONG64)i, major);
 
-                // FIX BUG-5: reset TipDropCount for ALL slots when a large
-                // palm is detected, including slots not yet visited by this
-                // loop iteration, so future touches start with clean state.
                 for (size_t j = 0; j < PTP_MAX_CONTACT_POINTS; j++) {
-                    alive[j]             = FALSE;
+                    alive[j]              = FALSE;
                     pCtx->TipDropCount[j] = 0;
                 }
                 break;
@@ -351,16 +368,6 @@ AmtPtpEvtUsbInterruptPipeReadComplete(
             BOOLEAN tip = (major << 1) >= 200 || (minor << 1) >= 150;
 
             if (!tip) {
-                //
-                // FIX (cursor-jump on rapid re-tap): only treat this as a
-                // momentary dip of the SAME finger if the slot was already
-                // active AND the new (still noisy) coordinate is close to
-                // where that contact was last seen. A new contact landing
-                // on a reused raw slot index right after the previous one
-                // lifted will have abs_x/abs_y far from the stale
-                // SmoothedX/Y of the old gesture -- that case must fall
-                // through to full lift/clear, not be bridged by debounce.
-                //
                 INT dxAbs = nx - (INT)pCtx->SmoothedX[i];
                 if (dxAbs < 0) dxAbs = -dxAbs;
                 INT dyAbs = ny - (INT)pCtx->SmoothedY[i];
@@ -423,14 +430,35 @@ AmtPtpEvtUsbInterruptPipeReadComplete(
         }
 
         // ----------------------------------------------------------------
-        // Pass 2: emit lift-offs (Phase A) then active contacts (Phase B).
+        // FIX (cursor-jump after multi-finger gesture):
         //
-        // FIX BUG-3: Phase A now only covers slots [0 .. raw_n-1].
-        // Slots [raw_n .. PTP_MAX_CONTACT_POINTS-1] are handled exclusively
-        // in the "silently dropped" block below.  Previously both Phase A
-        // and the silently-dropped block could emit lift-off for the same
-        // slot (alive[i] == FALSE for i >= raw_n in both paths), causing
-        // double lift-off reports for every slot beyond raw_n.
+        // Count how many slots are alive this frame.  If more than one is
+        // alive, every alive slot is "in a gesture" — mark it so.
+        //
+        // When a slot that was previously in a gesture becomes the sole
+        // survivor (aliveCount drops to 1, or it's a brand-new touch-down
+        // on a slot whose SlotWasInGesture is still set from a previous
+        // gesture that ended without a clean lift-off on that slot), we
+        // must NOT blend its new position against the stale SmoothedX/Y
+        // from the gesture.  Instead we force-reinitialise the smoothing
+        // baseline exactly as we do for a first touch-down.
+        // ----------------------------------------------------------------
+        UCHAR aliveCount = 0;
+        for (i = 0; i < raw_n; i++) {
+            if (alive[i]) aliveCount++;
+        }
+
+        // Mark all currently-alive slots as "was in gesture" if more than
+        // one finger is down this frame.
+        if (aliveCount >= 2) {
+            for (i = 0; i < raw_n; i++) {
+                if (alive[i])
+                    pCtx->SlotWasInGesture[i] = TRUE;
+            }
+        }
+
+        // ----------------------------------------------------------------
+        // Pass 2: emit lift-offs (Phase A) then active contacts (Phase B).
         // ----------------------------------------------------------------
         UCHAR contactCount = 0;
 
@@ -465,6 +493,32 @@ AmtPtpEvtUsbInterruptPipeReadComplete(
             USHORT ny = (USHORT)normYi[i];
 
             if (!pCtx->SlotActive[i]) {
+                //
+                // Fresh touch-down on this slot.
+                //
+                // FIX (cursor-jump after multi-finger gesture):
+                // If SlotWasInGesture is set, the SmoothedX/Y in this slot
+                // may still hold a stale blended position from a previous
+                // multi-finger gesture (the slot may not have gone through
+                // a clean lift-off cycle — the T2 sensor reuses raw slot
+                // indices).  Initialising SmoothedX/Y = nx/ny here (which
+                // Phase B already does for every new touch-down) is the
+                // correct fix: we unconditionally overwrite the stale value.
+                // The gesture-taint flag is cleared so subsequent smoothing
+                // frames blend normally.
+                //
+                // This is safe because AmtSmoothCoord on the NEXT frame
+                // will use the correctly-initialised SmoothedX/Y as prevVal,
+                // so no blending against a ghost gesture position occurs.
+                //
+                if (pCtx->SlotWasInGesture[i]) {
+                    TraceEvents(TRACE_LEVEL_VERBOSE, TRACE_INPUT,
+                        "%!FUNC! slot %llu: gesture-tainted slot re-used — "
+                        "force-reinit smoothing baseline x=%u y=%u",
+                        (ULONG64)i, nx, ny);
+                    pCtx->SlotWasInGesture[i] = FALSE;
+                }
+
                 pCtx->SmoothedX[i]  = nx;
                 pCtx->SmoothedY[i]  = ny;
                 pCtx->HystX[i]      = nx;
@@ -476,10 +530,40 @@ AmtPtpEvtUsbInterruptPipeReadComplete(
 
             USHORT dzX  = AmtApplyDeadzone(nx, &pCtx->HystX[i]);
             USHORT dzY  = AmtApplyDeadzone(ny, &pCtx->HystY[i]);
-            USHORT repX = AmtSmoothCoord(dzX, pCtx->SmoothedX[i]);
-            USHORT repY = AmtSmoothCoord(dzY, pCtx->SmoothedY[i]);
-            pCtx->SmoothedX[i] = repX;
-            pCtx->SmoothedY[i] = repY;
+
+            //
+            // FIX (cursor-jump after multi-finger gesture — continuation):
+            //
+            // Even when SlotActive was already TRUE, if this slot was in a
+            // gesture last frame and is now the ONLY alive slot (aliveCount
+            // == 1), the first single-finger frame after gesture end must
+            // NOT blend.  The last SmoothedX/Y reflects the gesture's last
+            // blended position (which could be anywhere on the pad), not the
+            // deliberate cursor placement after the gesture.
+            //
+            // Detect this transition: slot was in a gesture AND aliveCount
+            // dropped to 1 this frame.  Force-reinit smoothing just like a
+            // fresh touch-down.
+            //
+            USHORT repX, repY;
+            if (pCtx->SlotWasInGesture[i] && aliveCount == 1) {
+                // First single-finger frame after gesture: skip smoothing
+                // so the cursor snaps to exactly where the finger is now,
+                // not to a blend of "gesture end position" and "tap position".
+                repX = dzX;
+                repY = dzY;
+                pCtx->SmoothedX[i]       = repX;
+                pCtx->SmoothedY[i]       = repY;
+                pCtx->SlotWasInGesture[i] = FALSE;
+                TraceEvents(TRACE_LEVEL_VERBOSE, TRACE_INPUT,
+                    "%!FUNC! slot %llu: gesture→single transition, "
+                    "skip smoothing x=%u y=%u", (ULONG64)i, repX, repY);
+            } else {
+                repX = AmtSmoothCoord(dzX, pCtx->SmoothedX[i]);
+                repY = AmtSmoothCoord(dzY, pCtx->SmoothedY[i]);
+                pCtx->SmoothedX[i] = repX;
+                pCtx->SmoothedY[i] = repY;
+            }
 
             if (contactCount < PTP_MAX_CONTACT_POINTS) {
                 Report.Contacts[contactCount].ContactID  = (UCHAR)i;
@@ -487,15 +571,7 @@ AmtPtpEvtUsbInterruptPipeReadComplete(
                 Report.Contacts[contactCount].Y          = repY;
                 Report.Contacts[contactCount].TipSwitch  = 1;
 
-                // FIX BUG-4: for debounce-alive slots normXi/normYi hold the
-                // last-good smoothed position, not live hardware data, so
-                // f->touch_minor from a sub-threshold frame is unreliable.
-                // Use the previous Confidence value (SlotActive == TRUE means
-                // at least one good frame was seen) rather than reading noisy
-                // touch_minor.  For a real healthy contact the live value is
-                // fine.
                 if (pCtx->TipDropCount[i] > 0) {
-                    // Debounce frame: hold last-good confidence (minor > 0).
                     Report.Contacts[contactCount].Confidence = 1;
                 } else {
                     Report.Contacts[contactCount].Confidence =
@@ -506,12 +582,7 @@ AmtPtpEvtUsbInterruptPipeReadComplete(
             }
         }
 
-        // FIX BUG-1: lift-off for slots that hardware silently dropped
-        // (raw_n shrank).  The slot state MUST be cleared unconditionally
-        // regardless of whether there is room in the report buffer.  If we
-        // skip AmtClearSlot / SlotReportedLastFrame reset when contactCount
-        // hits the limit, the slot stays "reported" forever and generates a
-        // stale lift-off on every subsequent frame.
+        // FIX BUG-1: lift-off for slots that hardware silently dropped.
         for (i = raw_n; i < PTP_MAX_CONTACT_POINTS; i++) {
             if (!pCtx->SlotReportedLastFrame[i]) continue;
 
@@ -528,7 +599,6 @@ AmtPtpEvtUsbInterruptPipeReadComplete(
                     (ULONG64)i);
             }
 
-            // Always clear state even if we couldn't fit the report entry.
             pCtx->SlotReportedLastFrame[i] = FALSE;
             AmtClearSlot(pCtx, i);
         }

@@ -44,24 +44,36 @@ typedef struct _DEVICE_CONTEXT
     // FIX (tip-size debounce / cursor-jump):
     // Counts consecutive frames where a slot that is SlotActive has a
     // nonzero touch_major/touch_minor but failed the `tip` size threshold.
-    // A single noisy frame (major/minor briefly dips below threshold while
-    // the finger is still physically down) must NOT be treated as lift-off,
-    // or the slot resets (SlotActive=FALSE) and the very next frame re-arms
-    // with a fresh smoothing baseline -- producing a visible cursor snap.
-    // Only after TIP_DROP_DEBOUNCE_FRAMES consecutive sub-threshold frames
-    // do we treat the contact as genuinely lifted.
     //
     UCHAR   TipDropCount[PTP_MAX_CONTACT_POINTS];
 
     //
     // FIX (inertia / lift-off):
     // Track which slots were included in the PREVIOUS HID report with
-    // TipSwitch=1.  On the next frame, any slot that was reported but is
-    // now gone must be emitted with TipSwitch=0 so Windows PTP can trigger
-    // momentum scrolling.  Without this Windows sees contacts vanish without
-    // a lift-off frame and cancels inertia immediately.
+    // TipSwitch=1.
     //
     BOOLEAN SlotReportedLastFrame[PTP_MAX_CONTACT_POINTS];
+
+    //
+    // FIX (cursor-jump after multi-finger gesture):
+    // Tracks the number of active contacts in the previous USB frame.
+    // When that count drops from >=2 to 1 (or 0->1 after a multi-finger
+    // lift), the surviving/new single finger is "tainted" by gesture state:
+    // its SmoothedX/Y may reflect the last blended position of a finger
+    // that was part of a scroll/swipe, not a deliberate cursor position.
+    //
+    // When a slot transitions from "was in a multi-finger frame" to being
+    // the only active contact, we force-reinitialize its smoothing baseline
+    // from the raw hardware position instead of blending against the stale
+    // gesture position.  This eliminates the snap/jump on the first frame
+    // after gesture end + tap.
+    //
+    // SlotWasInGesture[i] is set TRUE for every slot that was alive[i]=TRUE
+    // in a frame where more than one slot was simultaneously alive.
+    // It is cleared when the slot gets a fresh touch-down after a full
+    // lift-off (SlotActive transitions FALSE->TRUE with no gesture taint).
+    //
+    BOOLEAN SlotWasInGesture[PTP_MAX_CONTACT_POINTS];
 
     //
     // Typing suppression deadline in QPC ticks (0 = inactive).
