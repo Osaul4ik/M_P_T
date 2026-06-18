@@ -1,7 +1,4 @@
-/*
- * Device.c - Device handling events.
- * Kernel-mode Driver Framework
- */
+// Device.c - Device handling events. Kernel-mode Driver Framework
 
 #include "driver.h"
 #include "device.tmh"
@@ -11,9 +8,7 @@
 #pragma alloc_text (PAGE, AmtPtpDeviceUsbKmEvtDevicePrepareHardware)
 #endif
 
-// ---------------------------------------------------------------------------
 // Forward declarations
-// ---------------------------------------------------------------------------
 static VOID
 AmtPtpKeyboardNotifyCallback(
     _In_ PVOID CallbackContext,
@@ -21,9 +16,7 @@ AmtPtpKeyboardNotifyCallback(
     _In_ PVOID Argument2
 );
 
-// ---------------------------------------------------------------------------
 // AmtPtpGetDeviceConfig
-// ---------------------------------------------------------------------------
 
 _IRQL_requires_(PASSIVE_LEVEL)
 static const struct BCM5974_CONFIG*
@@ -42,9 +35,7 @@ AmtPtpGetDeviceConfig(_In_ USB_DEVICE_DESCRIPTOR deviceInfo)
     return &Bcm5974ConfigTable[0];
 }
 
-// ---------------------------------------------------------------------------
 // AmtPtpDeviceUsbKmCreateDevice
-// ---------------------------------------------------------------------------
 
 NTSTATUS
 AmtPtpDeviceUsbKmCreateDevice(_Inout_ PWDFDEVICE_INIT DeviceInit)
@@ -84,9 +75,7 @@ AmtPtpDeviceUsbKmCreateDevice(_Inout_ PWDFDEVICE_INIT DeviceInit)
     return status;
 }
 
-// ---------------------------------------------------------------------------
 // AmtPtpDeviceUsbKmEvtDevicePrepareHardware
-// ---------------------------------------------------------------------------
 
 NTSTATUS
 AmtPtpDeviceUsbKmEvtDevicePrepareHardware(
@@ -164,9 +153,7 @@ AmtPtpDeviceUsbKmEvtDevicePrepareHardware(
     return status;
 }
 
-// ---------------------------------------------------------------------------
 // AmtPtpEvtDeviceD0Entry
-// ---------------------------------------------------------------------------
 
 NTSTATUS
 AmtPtpEvtDeviceD0Entry(
@@ -187,12 +174,9 @@ AmtPtpEvtDeviceD0Entry(
         KeQueryPerformanceCounter(&pDeviceContext->PerfFrequency);
 
     // FIX (cursor-jump after gesture + re-tap):
-    // Initialise ContactID rotation table so each slot starts with a
-    // distinct ID. AmtClearSlot rotates each slot's ID by
-    // +PTP_MAX_CONTACT_POINTS on every lift-off, ensuring a re-used slot
-    // never presents the same ContactID to Windows that it had during a
-    // previous gesture — which was causing Windows PTP to "correct" the
-    // cursor back to the gesture's last known position on the next tap.
+    // Initialise ContactID rotation table. AmtClearSlot rotates each slot's ID
+    // via +PTP_MAX_CONTACT_POINTS on lift-off so a re-used slot never presents
+    // the same ContactID that Windows saw at a previous position.
     for (ULONG s = 0; s < PTP_MAX_CONTACT_POINTS; s++) {
         pDeviceContext->ContactIdForSlot[s] = (UCHAR)s;
     }
@@ -226,9 +210,7 @@ end:
     return status;
 }
 
-// ---------------------------------------------------------------------------
 // AmtPtpEvtDeviceD0Exit
-// ---------------------------------------------------------------------------
 
 NTSTATUS
 AmtPtpEvtDeviceD0Exit(
@@ -261,9 +243,7 @@ AmtPtpEvtDeviceD0Exit(
     return STATUS_SUCCESS;
 }
 
-// ---------------------------------------------------------------------------
 // SelectInterruptInterface
-// ---------------------------------------------------------------------------
 
 _IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
@@ -315,9 +295,7 @@ SelectInterruptInterface(_In_ WDFDEVICE Device)
     return STATUS_SUCCESS;
 }
 
-// ---------------------------------------------------------------------------
 // AmtPtpSetWellspringMode
-// ---------------------------------------------------------------------------
 
 _IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
@@ -407,9 +385,7 @@ cleanup:
     return status;
 }
 
-// ---------------------------------------------------------------------------
 // Keyboard notification / typing suppression
-// ---------------------------------------------------------------------------
 
 #define CALLBACK_OBJECT_NAME L"\\Callback\\AmtPtpKbdActivity"
 

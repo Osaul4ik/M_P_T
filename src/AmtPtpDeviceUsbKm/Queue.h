@@ -1,25 +1,8 @@
-/*++
-
-Module Name:
-
-    queue.h
-
-Abstract:
-
-    This file contains the queue definitions.
-
-Environment:
-
-    Kernel-mode Driver Framework
-
---*/
+// Queue definitions. Kernel-mode Driver Framework
 
 EXTERN_C_START
 
-//
-// This is the context that can be placed per queue
-// and would contain per queue information.
-//
+// Per-queue context.
 typedef struct _QUEUE_CONTEXT {
 
     ULONG PrivateDeviceData;  // just a placeholder
@@ -33,9 +16,7 @@ AmtPtpDeviceUsbKmQueueInitialize(
     _In_ WDFDEVICE Device
     );
 
-//
-// Events from the IoQueue object
-//
+// IoQueue events
 EVT_WDF_IO_QUEUE_IO_DEVICE_CONTROL AmtPtpDeviceUsbKmEvtIoDeviceControl;
 EVT_WDF_IO_QUEUE_IO_STOP AmtPtpDeviceUsbKmEvtIoStop;
 

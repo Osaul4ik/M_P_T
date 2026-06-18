@@ -1,18 +1,4 @@
-/*++
-
-Module Name:
-
-    queue.c
-
-Abstract:
-
-    This file contains the queue entry points and callbacks.
-
-Environment:
-
-    Kernel-mode Driver Framework
-
---*/
+// Queue entry points and callbacks. Kernel-mode Driver Framework
 
 #include "driver.h"
 #include "queue.tmh"
@@ -25,27 +11,8 @@ NTSTATUS
 AmtPtpDeviceUsbKmQueueInitialize(
     _In_ WDFDEVICE Device
     )
-/*++
-
-Routine Description:
-
-
-     The I/O dispatch callbacks for the frameworks device object
-     are configured in this function.
-
-     A single default I/O Queue is configured for parallel request
-     processing, and a driver context memory allocation is created
-     to hold our structure QUEUE_CONTEXT.
-
-Arguments:
-
-    Device - Handle to a framework device object.
-
-Return Value:
-
-    VOID
-
---*/
+// Configures I/O dispatch callbacks and creates a default parallel queue
+// plus a manual queue for touch read requests.
 {
     WDFQUEUE queue;
     NTSTATUS status;
@@ -56,11 +23,7 @@ Return Value:
 
 	pDeviceContext = DeviceGetContext(Device);
     
-    //
-    // Configure a default queue so that requests that are not
-    // configure-fowarded using WdfDeviceConfigureRequestDispatching to goto
-    // other queues get dispatched here.
-    //
+    // Configure a default queue for non-forwarded requests.
     WDF_IO_QUEUE_CONFIG_INIT_DEFAULT_QUEUE(&queueConfig, WdfIoQueueDispatchParallel);
 
     queueConfig.EvtIoInternalDeviceControl = AmtPtpDeviceUsbKmEvtIoDeviceControl;
@@ -78,9 +41,7 @@ Return Value:
         return status;
     }
 
-	//
-	// Create secondary queues for touch read requests.
-	//
+	// Create secondary manual queue for touch read requests.
 	WDF_IO_QUEUE_CONFIG_INIT(&queueConfig, WdfIoQueueDispatchManual);
 	queueConfig.PowerManaged = WdfFalse;
 
@@ -110,30 +71,7 @@ AmtPtpDeviceUsbKmEvtIoDeviceControl(
     _In_ size_t InputBufferLength,
     _In_ ULONG IoControlCode
     )
-/*++
-
-Routine Description:
-
-    This event is invoked when the framework receives IRP_MJ_DEVICE_CONTROL request.
-
-Arguments:
-
-    Queue -  Handle to the framework queue object that is associated with the
-             I/O request.
-
-    Request - Handle to a framework request object.
-
-    OutputBufferLength - Size of the output buffer in bytes
-
-    InputBufferLength - Size of the input buffer in bytes
-
-    IoControlCode - I/O control code.
-
-Return Value:
-
-    VOID
-
---*/
+// Called on IRP_MJ_DEVICE_CONTROL. Dispatches HID IOCTLs to handler functions.
 {
 	NTSTATUS status;
 	WDFDEVICE device = WdfIoQueueGetDevice(Queue);
@@ -187,8 +125,8 @@ AmtPtpDispatchReadReportRequests(
 	_In_ WDFREQUEST Request,
 	_Out_ BOOLEAN* Pending
 )
+// Forwards HID read requests to the manual input queue.
 {
-
 	NTSTATUS status;
 	PDEVICE_CONTEXT pDevContext;
 
@@ -224,57 +162,13 @@ AmtPtpDeviceUsbKmEvtIoStop(
     _In_ WDFREQUEST Request,
     _In_ ULONG ActionFlags
 )
-/*++
-
-Routine Description:
-
-    This event is invoked for a power-managed queue before the device leaves the working state (D0).
-
-Arguments:
-
-    Queue -  Handle to the framework queue object that is associated with the
-             I/O request.
-
-    Request - Handle to a framework request object.
-
-    ActionFlags - A bitwise OR of one or more WDF_REQUEST_STOP_ACTION_FLAGS-typed flags
-                  that identify the reason that the callback function is being called
-                  and whether the request is cancelable.
-
-Return Value:
-
-    VOID
-
---*/
+// Called before device leaves D0 for power-managed queues.
+// Completes, cancels, or postpones the I/O request as appropriate.
 {
     TraceEvents(TRACE_LEVEL_INFORMATION, 
                 TRACE_QUEUE, 
                 "%!FUNC! Queue 0x%p, Request 0x%p ActionFlags %d", 
                 Queue, Request, ActionFlags);
-
-    //
-    // In most cases, the EvtIoStop callback function completes, cancels, or postpones
-    // further processing of the I/O request.
-    //
-    // Typically, the driver uses the following rules:
-    //
-    // - If the driver owns the I/O request, it either postpones further processing
-    //   of the request and calls WdfRequestStopAcknowledge, or it calls WdfRequestComplete
-    //   with a completion status value of STATUS_SUCCESS or STATUS_CANCELLED.
-    //  
-    //   The driver must call WdfRequestComplete only once, to either complete or cancel
-    //   the request. To ensure that another thread does not call WdfRequestComplete
-    //   for the same request, the EvtIoStop callback must synchronize with the driver's
-    //   other event callback functions, for instance by using interlocked operations.
-    //
-    // - If the driver has forwarded the I/O request to an I/O target, it either calls
-    //   WdfRequestCancelSentRequest to attempt to cancel the request, or it postpones
-    //   further processing of the request and calls WdfRequestStopAcknowledge.
-    //
-    // A driver might choose to take no action in EvtIoStop for requests that are
-    // guaranteed to complete in a small amount of time. For example, the driver might
-    // take no action for requests that are completed in one of the driver’s request handlers.
-    //
 
     return;
 }

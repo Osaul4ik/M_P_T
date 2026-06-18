@@ -1,3 +1,5 @@
+// HID descriptor and report handling. Kernel-mode Driver Framework
+
 #include "Driver.h"
 #include "hid.tmh"
 
@@ -332,7 +334,7 @@ AmtPtpReportFeatures(
 				"%!FUNC! Report REPORTID_DEVICE_CAPS is requested"
 			);
 
-			// Size sanity check
+			// Check buffer size
 			ReportSize = sizeof(PTP_DEVICE_CAPS_FEATURE_REPORT);
 			if (pHidPacket->reportBufferLen < ReportSize) {
 				status = STATUS_INVALID_BUFFER_SIZE;
@@ -372,7 +374,7 @@ AmtPtpReportFeatures(
 				"%!FUNC! Report REPORTID_PTPHQA is requested"
 			);
 
-			// Size sanity check
+			// Check buffer size
 			ReportSize = sizeof(PTP_DEVICE_HQA_CERTIFICATION_REPORT);
 			if (pHidPacket->reportBufferLen < ReportSize)
 			{
@@ -386,25 +388,9 @@ AmtPtpReportFeatures(
 
 			PPTP_DEVICE_HQA_CERTIFICATION_REPORT certReport = (PPTP_DEVICE_HQA_CERTIFICATION_REPORT)pHidPacket->reportBuffer;
 
-			//
 			// FIX (HQA blob corruption): `*certReport->CertificationBlob =
-			// DEFAULT_PTP_HQA_BLOB;` only ever wrote ONE byte.
-			// DEFAULT_PTP_HQA_BLOB expands to a comma-separated list of 256
-			// byte literals; as the right-hand side of a plain assignment
-			// that list is parsed as a comma EXPRESSION, which evaluates
-			// every operand left-to-right and discards all but the last.
-			// So the assignment silently degraded to:
-			//
-			//     certReport->CertificationBlob[0] = 0xc2;  // last byte only
-			//
-			// leaving CertificationBlob[1..255] as whatever happened to be
-			// in the IOCTL output buffer (not guaranteed to be zeroed).
-			// Windows validates this blob as the PTP HQA certification
-			// payload, so only 1/256 correct bytes reaching Windows means
-			// certification (and thus "Precision Touchpad" status) reliably
-			// fails. Fix: materialize the macro as a real byte array once
-			// and memcpy the whole thing in.
-			//
+			// DEFAULT_PTP_HQA_BLOB;` evaluated as comma expression and only
+			// wrote the last byte (0xc2). Use memcpy instead.
 			{
 				static const UCHAR HqaBlob[256] = { DEFAULT_PTP_HQA_BLOB };
 				C_ASSERT(sizeof(HqaBlob) == sizeof(certReport->CertificationBlob));

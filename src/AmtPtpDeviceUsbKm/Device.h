@@ -1,7 +1,4 @@
-/*
- * Device.h - Device definitions.
- * Kernel-mode Driver Framework
- */
+// Device.h - Device definitions. Kernel-mode Driver Framework
 
 #include "public.h"
 #include <Hid.h>
@@ -49,36 +46,16 @@ typedef struct _DEVICE_CONTEXT
     // Gesture taint tracking
     BOOLEAN SlotWasInGesture[PTP_MAX_CONTACT_POINTS];
 
-    //
     // FIX (cursor-jump after gesture + re-tap):
-    //
-    // Root cause: Windows PTP tracks contacts by ContactID across reports.
-    // When a finger lifts and a new finger lands on the same raw hardware
-    // slot, the driver was assigning ContactID = slot_index — so the new
-    // tap got the same ContactID as the previous gesture contact.  Windows
-    // interpreted this as the SAME physical finger reappearing and
-    // "corrected" the cursor back to where that ContactID was last seen
-    // (the gesture start/end position), producing the jump.
-    //
-    // Fix: maintain a logical ContactID per slot that is rotated (incremented
-    // mod PTP_MAX_CONTACT_POINTS) every time a slot goes through a full
-    // lift-off and is re-used for a new touch-down.  This guarantees that
-    // a fresh finger always gets a ContactID that Windows has never seen
-    // active at a different position, so no "correction" occurs.
-    //
-    // ContactIdForSlot[i] holds the ContactID currently assigned to raw
-    // slot i.  It is bumped (mod PTP_MAX_CONTACT_POINTS*2 to stay in a
-    // reasonable range and avoid wrapping to an ID that is currently live
-    // on another slot) in AmtClearSlot, which is called on every genuine
-    // lift-off.  The lift-off report itself still uses the OLD ContactID
-    // (so Windows can close the contact cleanly); the NEW value takes
-    // effect on the next touch-down.
-    //
+    // Windows PTP tracks contacts by ContactID. A re-used slot with the same
+    // ContactID caused cursor correction. Fix: rotate ContactID per slot on
+    // lift-off so a fresh finger gets an ID Windows has never seen before.
+    // ContactIdForSlot[i] is bumped (mod CONTACT_ID_POOL) in AmtClearSlot.
+    // The lift-off report uses the old ID; the new one takes effect on next
+    // touch-down.
     UCHAR   ContactIdForSlot[PTP_MAX_CONTACT_POINTS];
 
-    //
     // Typing suppression deadline in QPC ticks (0 = inactive).
-    //
     volatile LONGLONG TypingSuppressUntil;
 
     // Keyboard callback handle
@@ -96,12 +73,8 @@ WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(DEVICE_CONTEXT, DeviceGetContext)
 
 #define TYPING_SUPPRESS_DURATION_100NS  (500LL * 10000LL)
 
-//
-// ContactID rotation pool size.  Must be > PTP_MAX_CONTACT_POINTS so that
-// the rotated ID for one slot never collides with an ID currently live on
-// another slot.  Using PTP_MAX_CONTACT_POINTS * 2 gives IDs 0..9 for 5
-// max contacts.
-//
+// ContactID rotation pool size (> PTP_MAX_CONTACT_POINTS to avoid collisions).
+// PTP_MAX_CONTACT_POINTS * 2 = 10 IDs for 5 max contacts.
 #define CONTACT_ID_POOL  (PTP_MAX_CONTACT_POINTS * 2)
 
 NTSTATUS

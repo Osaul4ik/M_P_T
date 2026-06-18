@@ -2,11 +2,11 @@
  * AmtPtpKbdHook.c
  *
  * Keyboard upper-filter driver. Fires \Callback\AmtPtpKbdActivity only on
- * key-down events so AmtPtpDeviceUsbKm can suppress touchpad input for 500 ms.
+ * key-down events so AmtPtpDeviceUsbKm suppresses touchpad input for 500 ms.
  *
  * Build: separate KMDF project, DriverType=KMDF, Universal.
- * Link:  ntstrsafe.lib only.
- * INF:   UpperFilters = AmtPtpKbdHook under [DDInstall.HW] for Class=Keyboard.
+ * Link: ntstrsafe.lib only.
+ * INF: UpperFilters = AmtPtpKbdHook under [DDInstall.HW] for Class=Keyboard.
  */
 
 #include <ntddk.h>
@@ -27,9 +27,7 @@ EVT_WDF_IO_QUEUE_IO_READ            KbdHookEvtIoRead;
 EVT_WDF_REQUEST_COMPLETION_ROUTINE  KbdHookReadCompletion;
 EVT_WDF_OBJECT_CONTEXT_CLEANUP      KbdHookEvtDeviceContextCleanup;
 
-// ---------------------------------------------------------------------------
 // DriverEntry
-// ---------------------------------------------------------------------------
 
 NTSTATUS
 DriverEntry(
@@ -42,9 +40,7 @@ DriverEntry(
                            WDF_NO_OBJECT_ATTRIBUTES, &config, WDF_NO_HANDLE);
 }
 
-// ---------------------------------------------------------------------------
-// KbdHookEvtDeviceContextCleanup — releases the callback object reference.
-// ---------------------------------------------------------------------------
+// KbdHookEvtDeviceContextCleanup — releases the callback object.
 
 VOID
 KbdHookEvtDeviceContextCleanup(_In_ WDFOBJECT Device)
@@ -56,9 +52,7 @@ KbdHookEvtDeviceContextCleanup(_In_ WDFOBJECT Device)
     }
 }
 
-// ---------------------------------------------------------------------------
 // KbdHookEvtDeviceAdd
-// ---------------------------------------------------------------------------
 
 NTSTATUS
 KbdHookEvtDeviceAdd(
@@ -109,9 +103,7 @@ KbdHookEvtDeviceAdd(
     return status;
 }
 
-// ---------------------------------------------------------------------------
-// KbdHookEvtIoRead — forward read IRP to lower driver with completion routine.
-// ---------------------------------------------------------------------------
+// KbdHookEvtIoRead — forward read IRP to lower driver.
 
 VOID
 KbdHookEvtIoRead(
@@ -129,11 +121,7 @@ KbdHookEvtIoRead(
 
     sent = WdfRequestSend(Request, WdfDeviceGetIoTarget(device), WDF_NO_SEND_OPTIONS);
 
-    //
-    // FIX: WdfRequestSend can return FALSE if the I/O target is stopped or the
-    // request is malformed.  Without this check the request is neither forwarded
-    // nor completed, permanently stalling the keyboard read queue.
-    //
+    // FIX: handle WdfRequestSend failure to avoid stalling the keyboard queue.
     if (!sent) {
         NTSTATUS status = WdfRequestGetStatus(Request);
         TraceEvents(TRACE_LEVEL_ERROR, TRACE_DRIVER,
@@ -142,23 +130,13 @@ KbdHookEvtIoRead(
     }
 }
 
-// ---------------------------------------------------------------------------
-// KbdHookReadCompletion — inspect KEYBOARD_INPUT_DATA, fire only on key-down.
+// KbdHookReadCompletion — fire callback only on key-down events.
 //
-// FIX: original code fired ExNotifyCallback on every read completion,
-// including key-up (KEY_BREAK) events and the completion of "empty" reads
-// that the class driver issues to keep the pipe primed.  This caused the
-// suppression timer to reset on key-release, effectively doubling the
-// suppression window and making it feel like the touchpad stayed off for ~1 s
-// after the last keystroke instead of 500 ms.
-//
-// The keyboard class driver fills the output buffer with an array of
-// KEYBOARD_INPUT_DATA structs.  Each struct has a Flags field; KEY_BREAK
-// (0x01) means the key was released.  We skip those and fire only for
-// make (key-down) events.
+// FIX: original code fired on every read completion including KEY_BREAK and
+// empty reads, doubling the suppression window (~1s instead of 500ms).
+// We iterate the KEYBOARD_INPUT_DATA array and skip KEY_BREAK (0x01) flags.
 //
 // Called at DISPATCH_LEVEL.
-// ---------------------------------------------------------------------------
 
 VOID
 KbdHookReadCompletion(
@@ -174,11 +152,7 @@ KbdHookReadCompletion(
 
     if (NT_SUCCESS(status) && pCtx->CallbackObject != NULL)
     {
-        //
-        // Walk the KEYBOARD_INPUT_DATA array returned by the class driver.
-        // Fire the callback once per key-down event found in this batch.
-        // A single read can return multiple records (e.g. fast typist).
-        //
+        // Iterate KEYBOARD_INPUT_DATA; fire callback once per key-down batch.
         ULONG_PTR bytesTransferred =
             Params->Parameters.Read.Length;  // actual bytes returned
 
@@ -193,15 +167,11 @@ KbdHookReadCompletion(
 
             for (ULONG k = 0; k < recordCount; k++)
             {
-                // KEY_BREAK set → key-up; skip so we don't extend suppression
-                // on release.  E0 / E1 prefix records have no key-break meaning
-                // but are also not standalone keystrokes — skip those too.
+                // KEY_BREAK → key-up; skip to avoid extending suppression.
                 if (kbdData[k].Flags & KEY_BREAK)
                     continue;
 
-                // At least one key-down in this batch: fire and stop scanning.
-                // One callback per read completion is sufficient — the 500 ms
-                // timer will be extended by subsequent completions anyway.
+                // At least one key-down: fire. One callback per read suffices.
                 ExNotifyCallback(pCtx->CallbackObject, NULL, NULL);
                 break;
             }

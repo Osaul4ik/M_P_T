@@ -1,4 +1,4 @@
-// Interrupt.c: Handles device input event
+// Interrupt.c: Handles device input event. Kernel-mode Driver Framework
 
 #include "Driver.h"
 #include "Interrupt.tmh"
@@ -49,15 +49,9 @@ AmtSmoothCoord(_In_ USHORT rawVal, _In_ USHORT prevVal)
     return (USHORT)(blended < 0 ? 0 : blended);
 }
 
-//
-// AmtClearSlot — reset all per-slot state on lift-off.
-//
-// FIX (cursor-jump after gesture + re-tap):
-// Rotate ContactIdForSlot BEFORE clearing so the lift-off report (emitted
-// by the caller just before AmtClearSlot) still carries the OLD ContactID,
-// and the NEXT touch-down on this slot gets a fresh ID that Windows has
-// never seen at a different position.
-//
+// AmtClearSlot — resets all per-slot state on lift-off.
+// Rotates ContactIdForSlot BEFORE clearing so the lift-off report still
+// carries the OLD ContactID, and the next touch-down gets a fresh ID.
 static inline VOID
 AmtClearSlot(_In_ PDEVICE_CONTEXT ctx, _In_ size_t i)
 {
@@ -228,7 +222,7 @@ AmtPtpEvtUsbInterruptPipeReadComplete(
     Report.ScanTime = (USHORT)PerfDelta;
     pCtx->LastReportTime = Now;
 
-    // Typing suppression.
+    // Typing suppression
     {
         LONGLONG suppressUntil = InterlockedCompareExchange64(
             &pCtx->TypingSuppressUntil, 0, 0);
