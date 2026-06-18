@@ -27,7 +27,6 @@
     </ProjectConfiguration>
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="AmtPtpKbdHook.c" />
     <ClCompile Include="DebugUtils.c" />
     <ClCompile Include="Device.c" />
     <ClCompile Include="Driver.c" />
