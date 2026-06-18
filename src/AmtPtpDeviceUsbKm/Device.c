@@ -186,6 +186,17 @@ AmtPtpEvtDeviceD0Entry(
     pDeviceContext->LastReportTime =
         KeQueryPerformanceCounter(&pDeviceContext->PerfFrequency);
 
+    // FIX (cursor-jump after gesture + re-tap):
+    // Initialise ContactID rotation table so each slot starts with a
+    // distinct ID. AmtClearSlot rotates each slot's ID by
+    // +PTP_MAX_CONTACT_POINTS on every lift-off, ensuring a re-used slot
+    // never presents the same ContactID to Windows that it had during a
+    // previous gesture — which was causing Windows PTP to "correct" the
+    // cursor back to the gesture's last known position on the next tap.
+    for (ULONG s = 0; s < PTP_MAX_CONTACT_POINTS; s++) {
+        pDeviceContext->ContactIdForSlot[s] = (UCHAR)s;
+    }
+
     status = AmtPtpSetWellspringMode(pDeviceContext, TRUE);
     if (!NT_SUCCESS(status)) {
         TraceEvents(TRACE_LEVEL_WARNING, TRACE_DRIVER,
@@ -288,9 +299,6 @@ SelectInterruptInterface(_In_ WDFDEVICE Device)
             pDeviceContext->UsbInterface, index, &pipeInfo);
 
         WdfUsbTargetPipeSetNoMaximumPacketSizeCheck(pipe);
-
-        TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DEVICE,
-            "%!FUNC! Found USB pipe type %d", pipeInfo.PipeType);
 
         if (WdfUsbPipeTypeInterrupt == pipeInfo.PipeType) {
             pDeviceContext->InterruptPipe = pipe;
@@ -401,49 +409,6 @@ cleanup:
 
 // ---------------------------------------------------------------------------
 // Keyboard notification / typing suppression
-//
-// FIX BUG-6: g_KbdCallbackObject initialization had a TOCTOU race between
-// InterlockedIncrement and ExCreateCallback.  A second device could enter
-// the `else` (open-without-create) branch before the first device wrote
-// g_KbdCallbackObject, receiving STATUS_OBJECT_NAME_NOT_FOUND and
-// decrementing the counter, leaving it at 1 while only one registration
-// actually succeeded.  On unregister the last device would then double-
-// decrement to -1 and never release the object.
-//
-// Fix: protect the create/open sequence with a KSPIN_LOCK so only one device
-// at a time touches g_KbdCallbackObject and g_KbdCallbackRefCount.  The lock
-// is held only around the fast ExCreateCallback call (PASSIVE_LEVEL allowed
-// since we use KeAcquireSpinLock at PASSIVE and immediately release).
-//
-// FIX BUG-7: suppress duration now uses TYPING_SUPPRESS_DURATION_100NS from
-// Device.h instead of the inline magic number, so a single change to the
-// header updates both the callback and any future callers.
-//
-// FIX BUG-8 (reference leak on multi-device open):
-// ExCreateCallback ALWAYS returns a new object reference in *CallbackObject,
-// regardless of whether Create is TRUE or FALSE -- "open without create"
-// still adds a reference to the existing object, it doesn't just hand back
-// a borrowed pointer. The original code called ExCreateCallback for every
-// registration (the first one with Create=TRUE, every subsequent one with
-// Create=FALSE to "open" the already-existing object), but only ever
-// dereferenced the object ONCE, when the ref-count reaches zero on the
-// final unregister.
-//
-// Net effect: with N devices registering against the shared callback object
-// (e.g. AmtPtpDeviceUsbKm + AmtPtpDeviceSpiKm both bound, or repeated
-// suspend/resume D0Exit->D0Entry cycles racing a second device's add), each
-// "open" call leaks one object reference that is never released -- the
-// callback object's internal ref-count grows without bound and the object
-// is never freed even after every device unregisters and the driver
-// unloads. Over enough sleep/wake cycles this is a slow, unbounded kernel
-// object leak.
-//
-// Fix: immediately drop the reference ExCreateCallback just handed us once
-// we're done using the (already-known-valid) pointer for ExRegisterCallback.
-// We only need ONE "owning" reference on g_KbdCallbackObject for as long as
-// g_KbdCallbackRefCount > 0; that owning reference is the one taken by the
-// very first (Create=TRUE) call. Every subsequent open call's reference is
-// surplus and must be dereferenced right away.
 // ---------------------------------------------------------------------------
 
 #define CALLBACK_OBJECT_NAME L"\\Callback\\AmtPtpKbdActivity"
@@ -453,12 +418,6 @@ static LONG             g_KbdCallbackRefCount = 0;
 static KSPIN_LOCK       g_KbdCallbackLock;
 static BOOLEAN          g_KbdCallbackLockInit = FALSE;
 
-//
-// Called once from DriverEntry (or equivalent) to initialise the spinlock.
-// If multi-device add races DriverEntry we rely on the fact that KMDF
-// serialises EvtDeviceAdd calls on a single thread; if you ever call
-// Register from a different context, move this into a once-init guard.
-//
 VOID
 AmtPtpInitKeyboardNotificationLock(VOID)
 {
@@ -485,11 +444,8 @@ AmtPtpKeyboardNotifyCallback(
     if (pCtx->PerfFrequency.QuadPart == 0)
         return;
 
-    // FIX BUG-7: derive suppress window from the named constant so it stays
-    // consistent with Device.h.  TYPING_SUPPRESS_DURATION_100NS is in
-    // 100-ns units; convert to QPC ticks.
     LONGLONG ticksPer100ns = pCtx->PerfFrequency.QuadPart / 10000000LL;
-    if (ticksPer100ns == 0) ticksPer100ns = 1;  // guard against very slow QPC
+    if (ticksPer100ns == 0) ticksPer100ns = 1;
     LONGLONG suppressUntil = now.QuadPart +
         ticksPer100ns * TYPING_SUPPRESS_DURATION_100NS;
 
@@ -511,24 +467,19 @@ AmtPtpRegisterKeyboardNotification(_In_ PDEVICE_CONTEXT DeviceContext)
     if (DeviceContext->KbdNotifyHandle != NULL)
         return;
 
-    // Ensure the spinlock is initialised (idempotent).
     AmtPtpInitKeyboardNotificationLock();
 
     RtlInitUnicodeString(&callbackName, CALLBACK_OBJECT_NAME);
     InitializeObjectAttributes(&oa, &callbackName,
                                OBJ_CASE_INSENSITIVE | OBJ_PERMANENT, NULL, NULL);
 
-    // FIX BUG-6: hold the spinlock across the increment + ExCreateCallback so
-    // concurrent EvtDeviceAdd calls cannot see a stale NULL g_KbdCallbackObject.
     KeAcquireSpinLock(&g_KbdCallbackLock, &oldIrql);
 
     LONG newCount = InterlockedIncrement(&g_KbdCallbackRefCount);
 
     if (newCount == 1) {
         status = ExCreateCallback(
-            &g_KbdCallbackObject, &oa,
-            TRUE,   // create if absent
-            TRUE);  // allow multiple registrations
+            &g_KbdCallbackObject, &oa, TRUE, TRUE);
         if (!NT_SUCCESS(status)) {
             TraceEvents(TRACE_LEVEL_WARNING, TRACE_DRIVER,
                 "%!FUNC! ExCreateCallback failed %!STATUS! — typing suppression inactive",
@@ -537,21 +488,9 @@ AmtPtpRegisterKeyboardNotification(_In_ PDEVICE_CONTEXT DeviceContext)
             KeReleaseSpinLock(&g_KbdCallbackLock, oldIrql);
             return;
         }
-        // This is the single owning reference for g_KbdCallbackObject; it is
-        // released when the ref-count drops back to zero in Unregister.
     } else {
-        // FIX BUG-8: object was already created; this call opens it and
-        // returns a NEW reference in openedObject (NOT a borrowed pointer to
-        // g_KbdCallbackObject — it is a distinct, independently-refcounted
-        // handle to the same underlying object). We only want one long-lived
-        // owning reference total, so drop this surplus reference immediately
-        // after confirming the open succeeded; g_KbdCallbackObject already
-        // points at the live object from the Create=TRUE call above.
         openedObject = NULL;
-        status = ExCreateCallback(
-            &openedObject, &oa,
-            FALSE,  // do not create — must already exist
-            TRUE);
+        status = ExCreateCallback(&openedObject, &oa, FALSE, TRUE);
         if (!NT_SUCCESS(status)) {
             TraceEvents(TRACE_LEVEL_WARNING, TRACE_DRIVER,
                 "%!FUNC! ExCreateCallback (open) failed %!STATUS!", status);
@@ -559,8 +498,6 @@ AmtPtpRegisterKeyboardNotification(_In_ PDEVICE_CONTEXT DeviceContext)
             KeReleaseSpinLock(&g_KbdCallbackLock, oldIrql);
             return;
         }
-        // Drop the surplus reference now; g_KbdCallbackObject (from the
-        // original Create=TRUE call) remains valid because refCount > 0.
         ObDereferenceObject(openedObject);
     }
 

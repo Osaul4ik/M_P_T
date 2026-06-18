@@ -40,44 +40,44 @@ typedef struct _DEVICE_CONTEXT
     USHORT  HystY[PTP_MAX_CONTACT_POINTS];
     BOOLEAN SlotActive[PTP_MAX_CONTACT_POINTS];
 
-    //
-    // FIX (tip-size debounce / cursor-jump):
-    // Counts consecutive frames where a slot that is SlotActive has a
-    // nonzero touch_major/touch_minor but failed the `tip` size threshold.
-    //
+    // Tip-size debounce
     UCHAR   TipDropCount[PTP_MAX_CONTACT_POINTS];
 
-    //
-    // FIX (inertia / lift-off):
-    // Track which slots were included in the PREVIOUS HID report with
-    // TipSwitch=1.
-    //
+    // Lift-off tracking
     BOOLEAN SlotReportedLastFrame[PTP_MAX_CONTACT_POINTS];
 
-    //
-    // FIX (cursor-jump after multi-finger gesture):
-    // Tracks the number of active contacts in the previous USB frame.
-    // When that count drops from >=2 to 1 (or 0->1 after a multi-finger
-    // lift), the surviving/new single finger is "tainted" by gesture state:
-    // its SmoothedX/Y may reflect the last blended position of a finger
-    // that was part of a scroll/swipe, not a deliberate cursor position.
-    //
-    // When a slot transitions from "was in a multi-finger frame" to being
-    // the only active contact, we force-reinitialize its smoothing baseline
-    // from the raw hardware position instead of blending against the stale
-    // gesture position.  This eliminates the snap/jump on the first frame
-    // after gesture end + tap.
-    //
-    // SlotWasInGesture[i] is set TRUE for every slot that was alive[i]=TRUE
-    // in a frame where more than one slot was simultaneously alive.
-    // It is cleared when the slot gets a fresh touch-down after a full
-    // lift-off (SlotActive transitions FALSE->TRUE with no gesture taint).
-    //
+    // Gesture taint tracking
     BOOLEAN SlotWasInGesture[PTP_MAX_CONTACT_POINTS];
 
     //
+    // FIX (cursor-jump after gesture + re-tap):
+    //
+    // Root cause: Windows PTP tracks contacts by ContactID across reports.
+    // When a finger lifts and a new finger lands on the same raw hardware
+    // slot, the driver was assigning ContactID = slot_index — so the new
+    // tap got the same ContactID as the previous gesture contact.  Windows
+    // interpreted this as the SAME physical finger reappearing and
+    // "corrected" the cursor back to where that ContactID was last seen
+    // (the gesture start/end position), producing the jump.
+    //
+    // Fix: maintain a logical ContactID per slot that is rotated (incremented
+    // mod PTP_MAX_CONTACT_POINTS) every time a slot goes through a full
+    // lift-off and is re-used for a new touch-down.  This guarantees that
+    // a fresh finger always gets a ContactID that Windows has never seen
+    // active at a different position, so no "correction" occurs.
+    //
+    // ContactIdForSlot[i] holds the ContactID currently assigned to raw
+    // slot i.  It is bumped (mod PTP_MAX_CONTACT_POINTS*2 to stay in a
+    // reasonable range and avoid wrapping to an ID that is currently live
+    // on another slot) in AmtClearSlot, which is called on every genuine
+    // lift-off.  The lift-off report itself still uses the OLD ContactID
+    // (so Windows can close the contact cleanly); the NEW value takes
+    // effect on the next touch-down.
+    //
+    UCHAR   ContactIdForSlot[PTP_MAX_CONTACT_POINTS];
+
+    //
     // Typing suppression deadline in QPC ticks (0 = inactive).
-    // Written by keyboard callback, read in interrupt completion.
     //
     volatile LONGLONG TypingSuppressUntil;
 
@@ -95,6 +95,14 @@ WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(DEVICE_CONTEXT, DeviceGetContext)
 #define POOL_TAG_KBD_NOTIFY     'KBDN'
 
 #define TYPING_SUPPRESS_DURATION_100NS  (500LL * 10000LL)
+
+//
+// ContactID rotation pool size.  Must be > PTP_MAX_CONTACT_POINTS so that
+// the rotated ID for one slot never collides with an ID currently live on
+// another slot.  Using PTP_MAX_CONTACT_POINTS * 2 gives IDs 0..9 for 5
+// max contacts.
+//
+#define CONTACT_ID_POOL  (PTP_MAX_CONTACT_POINTS * 2)
 
 NTSTATUS
 AmtPtpDeviceUsbKmCreateDevice(
