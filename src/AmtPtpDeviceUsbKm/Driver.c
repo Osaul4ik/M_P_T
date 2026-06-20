@@ -1,5 +1,7 @@
 // Driver entry points and callbacks. Kernel-mode Driver Framework
 
+#define INITGUID
+#include <initguid.h>
 #include "driver.h"
 #include "driver.tmh"
 
