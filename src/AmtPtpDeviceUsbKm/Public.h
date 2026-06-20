@@ -1,5 +1,7 @@
 // Public.h - Common declarations shared by driver and user applications.
 
+#pragma once
+
 // Device interface GUID for app communication.
 
 DEFINE_GUID (GUID_DEVINTERFACE_AmtPtpDeviceUsbKm,
