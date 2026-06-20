@@ -173,12 +173,21 @@ AmtPtpEvtDeviceD0Entry(
     pDeviceContext->LastReportTime =
         KeQueryPerformanceCounter(&pDeviceContext->PerfFrequency);
 
-    // FIX (cursor-jump after gesture + re-tap):
-    // Initialise ContactID rotation table. AmtClearSlot rotates each slot's ID
-    // via +PTP_MAX_CONTACT_POINTS on lift-off so a re-used slot never presents
-    // the same ContactID that Windows saw at a previous position.
+    // FIX (cursor-jump after gesture + re-tap), revised — see the long
+    // comment on ContactIdForSlot/NextContactId in Device.h and on
+    // AmtClearSlot() in Interrupt.c for the full story.
+    //
+    // Reseed the monotonic ContactID counter on every D0Entry (cold boot
+    // AND resume-from-sleep) so a slot can never replay a ContactID value
+    // Windows might still consider "warm" from before a sleep/wake cycle.
+    // Each slot starts at a distinct value (1..PTP_MAX_CONTACT_POINTS) —
+    // NextContactId is left sitting on the last value handed out, so the
+    // very first AmtClearSlot() call after this point continues cleanly
+    // from PTP_MAX_CONTACT_POINTS+1 instead of colliding with one of the
+    // initial per-slot values below.
+    pDeviceContext->NextContactId = 0;
     for (ULONG s = 0; s < PTP_MAX_CONTACT_POINTS; s++) {
-        pDeviceContext->ContactIdForSlot[s] = (UCHAR)s;
+        pDeviceContext->ContactIdForSlot[s] = ++pDeviceContext->NextContactId;
     }
 
     status = AmtPtpSetWellspringMode(pDeviceContext, TRUE);
