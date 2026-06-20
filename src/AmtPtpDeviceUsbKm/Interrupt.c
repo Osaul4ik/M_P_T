@@ -350,10 +350,26 @@ AmtPtpEvtUsbInterruptPipeReadComplete(
 
                 if (pCtx->SlotActive[i] && samePositionAsBefore &&
                     pCtx->TipDropCount[i] < TIP_DROP_DEBOUNCE_FRAMES) {
+                    // FIX (jump on fast double-tap with small move):
+                    // Previously this froze normXi/normYi to the OLD
+                    // SmoothedX/Y instead of the just-computed nx/ny.
+                    // That's correct for suppressing a spurious lift+
+                    // touchdown caused by signal noise during a momentary
+                    // weak-contact dip — but nx/ny here are the REAL
+                    // current measurement, and during a fast tap-move-tap
+                    // sequence the finger has often already moved to its
+                    // new position WHILE still in this weak-contact dip
+                    // (the dip spans the move because it all happens in a
+                    // couple of frames). Freezing to the old position
+                    // discarded that real motion; once a strong-contact
+                    // frame resumed, it reported the true, already-moved
+                    // position and the cursor visibly snapped from the
+                    // frozen spot to it. Letting nx/ny (already set above)
+                    // flow through here keeps tracking continuous even
+                    // when the dip happens to coincide with real movement,
+                    // while still suppressing the lift-off itself.
                     pCtx->TipDropCount[i]++;
                     alive[i]  = TRUE;
-                    normXi[i] = pCtx->SmoothedX[i];
-                    normYi[i] = pCtx->SmoothedY[i];
                     continue;
                 }
                 pCtx->TipDropCount[i] = 0;
