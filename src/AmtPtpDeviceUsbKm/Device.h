@@ -2,6 +2,7 @@
 
 #include "public.h"
 #include <Hid.h>
+#include "Track.h"
 
 EXTERN_C_START
 
@@ -30,24 +31,18 @@ typedef struct _DEVICE_CONTEXT
     // Palm rejection
     BOOLEAN PalmDetected;
 
-    // Per-slot smoothing (indexed by raw slot 0..PTP_MAX_CONTACT_POINTS-1)
-    USHORT  SmoothedX[PTP_MAX_CONTACT_POINTS];
-    USHORT  SmoothedY[PTP_MAX_CONTACT_POINTS];
-    USHORT  HystX[PTP_MAX_CONTACT_POINTS];
-    USHORT  HystY[PTP_MAX_CONTACT_POINTS];
-    BOOLEAN SlotActive[PTP_MAX_CONTACT_POINTS];
-
-    // Tip-size debounce
-    UCHAR   TipDropCount[PTP_MAX_CONTACT_POINTS];
-
-    // Lift-off tracking
-    BOOLEAN SlotReportedLastFrame[PTP_MAX_CONTACT_POINTS];
-
-    // Gesture taint tracking
-    BOOLEAN SlotWasInGesture[PTP_MAX_CONTACT_POINTS];
+    // ---------------------------------------------------------------
+    // Track pool — replaces the previous 8 parallel arrays
+    // (SmoothedX/Y, HystX/Y, SlotActive, TipDropCount,
+    //  SlotReportedLastFrame, SlotWasInGesture, ContactIdForSlot) with
+    // one struct per logical contact, indexed by raw hardware slot
+    // index. See Track.h for the full state-machine writeup and the
+    // frame-determinism rule governing how Interrupt.c may mutate these.
+    // ---------------------------------------------------------------
+    TRACK Tracks[PTP_MAX_CONTACT_POINTS];
 
     // FIX (cursor-jump after gesture + re-tap), revised — see the long
-    // comment on AmtClearSlot() in Interrupt.c for the full story.
+    // comment on AmtTrackAssignContactId() in Track.c for the full story.
     //
     // Windows PTP tracks contacts by ContactID. A re-used slot that
     // presents the same ContactID it used at a previous, different
@@ -56,22 +51,36 @@ typedef struct _DEVICE_CONTEXT
     // new position instead of treating it as a fresh press — visible as a
     // jump.
     //
-    // The original fix rotated each slot's ID through a 2-value cycle
-    // (id <-> id + PTP_MAX_CONTACT_POINTS). That only ever produces TWO
-    // distinct IDs per slot, so the same numeric ID can resurface while
-    // Windows still has it "warm" internally after a few touch/lift
-    // cycles — defeating the point of rotating at all.
-    //
-    // ContactIdForSlot[] now holds a value handed out by the single
-    // monotonic NextContactId counter below: every lift-off advances the
-    // counter and gives the slot an ID that has never been used by ANY
-    // slot for the lifetime of the device session (reseeded at D0Entry —
-    // see AmtPtpEvtDeviceD0Entry in Device.c). Both fields must stay ULONG
-    // to match PTP_CONTACT.ContactID (include/Hid.h) — truncating to a
-    // smaller type would silently wrap the counter and reopen the same
+    // NextContactId is a single monotonic counter shared by every track:
+    // every lift-off (AmtTrackKill/AmtTrackRecycle) advances it and hands
+    // the track an ID that has never been used by ANY track for the
+    // lifetime of the device session (reseeded at D0Entry — see
+    // AmtPtpEvtDeviceD0Entry in Device.c). Must stay ULONG to match
+    // PTP_CONTACT.ContactID (include/Hid.h) — truncating to a smaller
+    // type would silently wrap the counter and reopen the same
     // "still warm" collision this fix exists to prevent.
-    ULONG   ContactIdForSlot[PTP_MAX_CONTACT_POINTS];
     ULONG   NextContactId;
+
+    // ---------------------------------------------------------------
+    // Session-level gesture flag — DISTINCT from TRACK.WasInGesture.
+    //
+    // FIX (WasInGesture session vs per-track split): the previous design
+    // had exactly one "was this a gesture" bit per slot
+    // (SlotWasInGesture[i]), used for two different questions:
+    //   (1) "should THIS finger skip EMA blending on its next solo
+    //        update" — genuinely per-track, persists across exactly one
+    //        ACTIVE lifetime.
+    //   (2) implicitly, "is a multi-finger gesture in progress on the pad
+    //        right now" — a SESSION-level fact about the current frame,
+    //        previously re-derived every frame from aliveCount>=2 rather
+    //        than being tracked as its own piece of state.
+    // Conflating these made the gesture-quarantine logic harder to
+    // reason about, since "was in a gesture" had to be inferred per-slot
+    // instead of asked once per frame. GestureSessionActive answers (2)
+    // directly; TRACK.WasInGesture continues to answer (1) and is SET
+    // FROM GestureSessionActive transitions in Interrupt.c, never the
+    // other way around.
+    BOOLEAN GestureSessionActive;
 
     // Typing suppression deadline in QPC ticks (0 = inactive).
     volatile LONGLONG TypingSuppressUntil;
@@ -81,6 +90,35 @@ typedef struct _DEVICE_CONTEXT
 
     // QPC frequency cached at D0Entry
     LARGE_INTEGER PerfFrequency;
+
+    // Rate limiting for TraceEvents in the hot (per-frame) interrupt
+    // path — see TRACE_HOT_PATH_MIN_INTERVAL_100NS in Interrupt.c. Holds
+    // the QPC value of the last hot-path verbose trace emission; frames
+    // arriving before the interval elapses skip the TraceEvents call
+    // entirely rather than relying on the WPP session-level filter,
+    // since argument marshalling/formatting cost is paid before that
+    // filter is consulted.
+    LONGLONG LastHotPathTraceQpc;
+
+    // ---------------------------------------------------------------
+    // FIX (starvation case): a PTP_REPORT carries at most
+    // PTP_MAX_CONTACT_POINTS contacts. Phase A can in principle produce
+    // more lift-off events in a single frame than remaining report
+    // capacity (defensive handling for a future revision that changes
+    // raw_n's bound without a matching report-capacity change — cannot
+    // currently happen since raw_n is clamped to PTP_MAX_CONTACT_POINTS
+    // before Phase A runs, but the fallback is real rather than a stub).
+    // Rather than silently dropping a lift-off in that scenario — which
+    // would leave Windows believing a contact is still down — overflow
+    // lift-offs are queued here and drained into the FRONT of the next
+    // frame's report, ahead of that frame's own contacts, guaranteeing
+    // bounded (one extra frame) delivery latency instead of permanent
+    // loss. See AmtEmitLift / AmtDrainOverflow in Interrupt.c.
+    // ---------------------------------------------------------------
+    ULONG  OverflowContactID[PTP_MAX_CONTACT_POINTS];
+    USHORT OverflowX[PTP_MAX_CONTACT_POINTS];
+    USHORT OverflowY[PTP_MAX_CONTACT_POINTS];
+    UCHAR  OverflowCount;
 
 } DEVICE_CONTEXT, *PDEVICE_CONTEXT;
 

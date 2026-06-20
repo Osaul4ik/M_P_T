@@ -37,6 +37,12 @@
     <ClInclude Include="resource.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="Track.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="Match.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="Device.c">
@@ -55,6 +61,12 @@
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="Hid.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="Track.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="Match.c">
       <Filter>Source Files</Filter>
     </ClCompile>
   </ItemGroup>

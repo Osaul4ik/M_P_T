@@ -174,21 +174,21 @@ AmtPtpEvtDeviceD0Entry(
         KeQueryPerformanceCounter(&pDeviceContext->PerfFrequency);
 
     // FIX (cursor-jump after gesture + re-tap), revised — see the long
-    // comment on ContactIdForSlot/NextContactId in Device.h and on
-    // AmtClearSlot() in Interrupt.c for the full story.
+    // comment on AmtTrackAssignContactId() in Track.c for the full story.
     //
-    // Reseed the monotonic ContactID counter on every D0Entry (cold boot
-    // AND resume-from-sleep) so a slot can never replay a ContactID value
-    // Windows might still consider "warm" from before a sleep/wake cycle.
-    // Each slot starts at a distinct value (1..PTP_MAX_CONTACT_POINTS) —
-    // NextContactId is left sitting on the last value handed out, so the
-    // very first AmtClearSlot() call after this point continues cleanly
-    // from PTP_MAX_CONTACT_POINTS+1 instead of colliding with one of the
-    // initial per-slot values below.
-    pDeviceContext->NextContactId = 0;
-    for (ULONG s = 0; s < PTP_MAX_CONTACT_POINTS; s++) {
-        pDeviceContext->ContactIdForSlot[s] = ++pDeviceContext->NextContactId;
-    }
+    // Reseed the monotonic ContactID counter AND reset every track to
+    // TRACK_DEAD on every D0Entry (cold boot AND resume-from-sleep) so a
+    // track can never replay a ContactID value Windows might still
+    // consider "warm" from before a sleep/wake cycle, and so no track
+    // carries over stale ACTIVE/GRACE state across a power transition.
+    // NextContactId starts at 0; AmtTrackBirth's first call pre-increments
+    // it to 1, so 0 stays permanently reserved/unassigned (see the
+    // invariant check in Track.c).
+    pDeviceContext->NextContactId        = 0;
+    pDeviceContext->GestureSessionActive = FALSE;
+    pDeviceContext->LastHotPathTraceQpc  = 0;
+    pDeviceContext->OverflowCount        = 0;
+    AmtTrackPoolInit(pDeviceContext->Tracks);
 
     status = AmtPtpSetWellspringMode(pDeviceContext, TRUE);
     if (!NT_SUCCESS(status)) {

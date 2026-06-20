@@ -32,14 +32,18 @@
     <ClCompile Include="Driver.c" />
     <ClCompile Include="Hid.c" />
     <ClCompile Include="Interrupt.c" />
+    <ClCompile Include="Match.c" />
     <ClCompile Include="Queue.c" />
+    <ClCompile Include="Track.c" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="Device.h" />
     <ClInclude Include="Driver.h" />
+    <ClInclude Include="Match.h" />
     <ClInclude Include="Public.h" />
     <ClInclude Include="Queue.h" />
     <ClInclude Include="resource.h" />
+    <ClInclude Include="Track.h" />
     <ClInclude Include="Trace.h" />
   </ItemGroup>
   <PropertyGroup Label="Globals">
