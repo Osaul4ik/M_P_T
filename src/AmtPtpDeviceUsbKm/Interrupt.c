@@ -50,15 +50,30 @@ AmtSmoothCoord(_In_ USHORT rawVal, _In_ USHORT prevVal)
 }
 
 // AmtClearSlot — resets all per-slot state on lift-off.
-// Rotates ContactIdForSlot BEFORE clearing so the lift-off report still
-// carries the OLD ContactID, and the next touch-down gets a fresh ID.
+//
+// FIX (cursor-jump after gesture + re-tap), revised:
+// ContactID is a full ULONG in this driver's PTP_CONTACT (include/Hid.h),
+// not a 3-bit packed field like the SPI driver's. The earlier scheme —
+// "(id + PTP_MAX_CONTACT_POINTS) % (PTP_MAX_CONTACT_POINTS * 2)" — only
+// ever produced TWO distinct IDs per slot, alternating forever:
+//     slot0: 0 <-> 5
+//     slot1: 1 <-> 6
+//     slot2: 2 <-> 7
+//     slot3: 3 <-> 8
+//     slot4: 4 <-> 9
+// After a few touch/lift cycles on the same slot, the SAME numeric ID
+// could resurface while still "warm" in Windows' internal contact
+// tracking — defeating the whole point of rotating the ID on lift-off.
+//
+// Replaced with a single 32-bit monotonic counter (NextContactId) shared
+// across all slots: every lift-off hands the slot a brand-new ID that has
+// never been used before by ANY slot, for the entire lifetime of the
+// device (reseeded at D0Entry — see Device.c). With 2^32 values, this
+// will not realistically wrap during normal use.
 static inline VOID
 AmtClearSlot(_In_ PDEVICE_CONTEXT ctx, _In_ size_t i)
 {
-    // Rotate ContactID so next touch-down on this slot gets a new ID.
-    // (CONTACT_ID_POOL is PTP_MAX_CONTACT_POINTS*2 = 10, giving IDs 0-9)
-    ctx->ContactIdForSlot[i] = (UCHAR)((ctx->ContactIdForSlot[i] + PTP_MAX_CONTACT_POINTS)
-                                        % CONTACT_ID_POOL);
+    ctx->ContactIdForSlot[i] = ++ctx->NextContactId;
 
     ctx->SmoothedX[i]        = 0;
     ctx->SmoothedY[i]        = 0;
@@ -277,20 +292,11 @@ AmtPtpEvtUsbInterruptPipeReadComplete(
         BOOLEAN alive[PTP_MAX_CONTACT_POINTS];
         INT     normXi[PTP_MAX_CONTACT_POINTS];
         INT     normYi[PTP_MAX_CONTACT_POINTS];
-        // FIX (jump on gesture + small-distance re-tap):
-        // Firmware sets origin==0 on a raw slot index when, on this frame,
-        // that index now holds a DIFFERENT physical finger than it held
-        // last frame (array compaction after another finger lifted off
-        // elsewhere). Track that per-index so Phase B can tell "same
-        // finger continuing to move" apart from "this index was just
-        // handed a different finger" — see isReindex below.
-        BOOLEAN reindexedAtRaw[PTP_MAX_CONTACT_POINTS];
 
         for (i = 0; i < PTP_MAX_CONTACT_POINTS; i++) {
-            alive[i]          = FALSE;
-            normXi[i]         = 0;
-            normYi[i]         = 0;
-            reindexedAtRaw[i] = FALSE;
+            alive[i]  = FALSE;
+            normXi[i] = 0;
+            normYi[i] = 0;
         }
 
         for (i = 0; i < raw_n; i++) {
@@ -298,14 +304,6 @@ AmtPtpEvtUsbInterruptPipeReadComplete(
 
             INT major = AmtRawToInteger(f->touch_major);
             INT minor = AmtRawToInteger(f->touch_minor);
-
-            // origin==0: firmware is telling us this raw index is now a
-            // different physical finger than last frame. Remember it
-            // regardless of whether this frame's contact ends up "alive"
-            // (palm/tip filtering happens below) since the slot's stored
-            // smoothing state is stale either way.
-            if (f->origin == 0)
-                reindexedAtRaw[i] = TRUE;
 
             if (major <= 0 && minor <= 0) {
                 pCtx->TipDropCount[i] = 0;
@@ -350,26 +348,10 @@ AmtPtpEvtUsbInterruptPipeReadComplete(
 
                 if (pCtx->SlotActive[i] && samePositionAsBefore &&
                     pCtx->TipDropCount[i] < TIP_DROP_DEBOUNCE_FRAMES) {
-                    // FIX (jump on fast double-tap with small move):
-                    // Previously this froze normXi/normYi to the OLD
-                    // SmoothedX/Y instead of the just-computed nx/ny.
-                    // That's correct for suppressing a spurious lift+
-                    // touchdown caused by signal noise during a momentary
-                    // weak-contact dip — but nx/ny here are the REAL
-                    // current measurement, and during a fast tap-move-tap
-                    // sequence the finger has often already moved to its
-                    // new position WHILE still in this weak-contact dip
-                    // (the dip spans the move because it all happens in a
-                    // couple of frames). Freezing to the old position
-                    // discarded that real motion; once a strong-contact
-                    // frame resumed, it reported the true, already-moved
-                    // position and the cursor visibly snapped from the
-                    // frozen spot to it. Letting nx/ny (already set above)
-                    // flow through here keeps tracking continuous even
-                    // when the dip happens to coincide with real movement,
-                    // while still suppressing the lift-off itself.
                     pCtx->TipDropCount[i]++;
                     alive[i]  = TRUE;
+                    normXi[i] = pCtx->SmoothedX[i];
+                    normYi[i] = pCtx->SmoothedY[i];
                     continue;
                 }
                 pCtx->TipDropCount[i] = 0;
@@ -433,7 +415,7 @@ AmtPtpEvtUsbInterruptPipeReadComplete(
             contactCount++;
 
             pCtx->SlotReportedLastFrame[i] = FALSE;
-            AmtClearSlot(pCtx, i);  // rotates ContactIdForSlot[i]
+            AmtClearSlot(pCtx, i);  // hands out a fresh, never-used ContactID
 
             TraceEvents(TRACE_LEVEL_VERBOSE, TRACE_INPUT,
                 "%!FUNC! slot %llu: lift-off", (ULONG64)i);
@@ -448,44 +430,49 @@ AmtPtpEvtUsbInterruptPipeReadComplete(
             USHORT nx = (USHORT)normXi[i];
             USHORT ny = (USHORT)normYi[i];
 
-            // FIX (jump on gesture + small-distance re-tap):
-            // A raw slot can have SlotActive[i]==TRUE (no explicit
-            // lift-off was ever seen on this index) while firmware
-            // origin==0 tells us it now holds a DIFFERENT physical
-            // finger than the one whose position is cached in
-            // SmoothedX/Y[i]. The old code only re-initialised the
-            // smoothing baseline when !SlotActive[i] (a "fresh" slot),
-            // so in the reindex case it fell through to
-            // AmtSmoothCoord(newFingerPos, oldFingerPos) — blending the
-            // new finger's position against the stale old finger's
-            // cached position. That blend IS the jump: for a frame or
-            // two the reported point sits between the old and new
-            // physical contact, snapping to the new one once the IIR
-            // catches up. Treat origin==0 the same as a fresh
-            // touch-down: reset the baseline instead of blending, and
-            // rotate the ContactID since this is — as far as Windows'
-            // per-ID tracking is concerned — a new contact, not a
-            // continuation of whatever was previously at this index.
-            BOOLEAN isReindex = reindexedAtRaw[i] && pCtx->SlotActive[i];
+            // FIX (cursor jump: gesture -> drop to fewer fingers, or
+            // gesture -> lift -> quick re-tap):
+            // f->origin is set to 0 by firmware whenever this raw array
+            // slot now represents a DIFFERENT physical finger than it did
+            // last frame — e.g. a sibling finger lifted and the firmware
+            // compacted the array, shifting a still-down finger into a
+            // lower index. Raw array index is NOT a stable finger identity
+            // across frames: SlotActive[i]/SmoothedX[i]/HystX[i] all
+            // belong to whichever finger occupied index i LAST frame,
+            // which may be a different finger than the one whose data is
+            // in *f* THIS frame.
+            //
+            // Without this check, a still-down finger that got reindexed
+            // into a slot that was already "active" (because some OTHER
+            // finger used to occupy it) has its real new position blended
+            // via AmtSmoothCoord() against that OTHER finger's stale
+            // smoothing baseline -> a visible jump toward/through the
+            // previous finger's last position. This is exactly the
+            // gesture -> fewer-fingers / gesture -> tap transition.
+            BOOLEAN identityChanged = pCtx->SlotActive[i] && (f->origin == 0);
 
-            if (!pCtx->SlotActive[i] || isReindex) {
-                if (isReindex) {
-                    pCtx->ContactIdForSlot[i] =
-                        (UCHAR)((pCtx->ContactIdForSlot[i] + PTP_MAX_CONTACT_POINTS)
-                                 % CONTACT_ID_POOL);
-                    // Reindexed contact is not a continuation of whatever
-                    // gesture the previous occupant of this index was in.
-                    pCtx->SlotWasInGesture[i] = FALSE;
-                    TraceEvents(TRACE_LEVEL_VERBOSE, TRACE_INPUT,
-                        "%!FUNC! slot %llu: reindexed (origin=0), "
-                        "new ContactID=%u x=%u y=%u",
-                        (ULONG64)i, pCtx->ContactIdForSlot[i], nx, ny);
-                } else if (pCtx->SlotWasInGesture[i]) {
-                    // Fresh touch-down: initialise smoothing baseline.
-                    // ContactIdForSlot[i] was already rotated by
-                    // AmtClearSlot on the preceding lift-off, so this new
-                    // contact gets a fresh ID that Windows has never seen
-                    // at another position.
+            if (identityChanged) {
+                TraceEvents(TRACE_LEVEL_VERBOSE, TRACE_INPUT,
+                    "%!FUNC! slot %llu: origin==0, different finger reindexed "
+                    "into this slot -> forcing fresh baseline "
+                    "(stale x=%u y=%u, new raw x=%u y=%u)",
+                    (ULONG64)i, pCtx->SmoothedX[i], pCtx->SmoothedY[i], nx, ny);
+
+                // Treat exactly like a brand-new touch-down: none of this
+                // slot's prior smoothing/hysteresis/gesture-taint/debounce
+                // state belongs to the finger now occupying it.
+                pCtx->SlotWasInGesture[i] = FALSE;
+                pCtx->TipDropCount[i]     = 0;
+                pCtx->SlotActive[i]       = FALSE;
+            }
+
+            if (!pCtx->SlotActive[i]) {
+                // Fresh touch-down (or forced-fresh via identityChanged
+                // above): initialise smoothing baseline.
+                // ContactIdForSlot[i] was already rotated by AmtClearSlot
+                // on the preceding lift-off, so this new contact gets a
+                // fresh ID that Windows has never seen at another position.
+                if (pCtx->SlotWasInGesture[i]) {
                     pCtx->SlotWasInGesture[i] = FALSE;
                     TraceEvents(TRACE_LEVEL_VERBOSE, TRACE_INPUT,
                         "%!FUNC! slot %llu: gesture-tainted re-use, "
@@ -502,11 +489,10 @@ AmtPtpEvtUsbInterruptPipeReadComplete(
             USHORT dzX = AmtApplyDeadzone(nx, &pCtx->HystX[i]);
             USHORT dzY = AmtApplyDeadzone(ny, &pCtx->HystY[i]);
 
-            // First single-finger frame after a gesture (or a reindex):
-            // skip smoothing to avoid blending against the stale prior
-            // position.
+            // First single-finger frame after a gesture: skip smoothing to
+            // avoid blending against the stale gesture position.
             USHORT repX, repY;
-            if (isReindex || (pCtx->SlotWasInGesture[i] && aliveCount == 1)) {
+            if (pCtx->SlotWasInGesture[i] && aliveCount == 1) {
                 repX = dzX;
                 repY = dzY;
                 pCtx->SmoothedX[i]        = repX;
