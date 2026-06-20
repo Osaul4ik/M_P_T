@@ -19,6 +19,14 @@ See also [here](https://magicutilities.net/magic-trackpad/help/mac-precision-tou
 3. Right click "remove the device" and also check "uninstall driver"
 4. Rescan devices
 
+## Roadmap
+
+- [x] Add palm detection for MBP2019
+- [x] Fix scroll for MBP2019
+- [ ] Fix cursor jump after gestures
+- [ ] Add palm detection for MBA 2015
+- [ ] Fix ghost tap for MBA 2015
+- [ ] Adjust palm detection & scroll sensivity
 
 ## Main Project
 [mac-precision-touchpad](https://github.com/imbushuo/mac-precision-touchpad)
