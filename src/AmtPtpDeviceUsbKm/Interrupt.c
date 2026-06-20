@@ -571,8 +571,21 @@ AmtPtpEvtUsbInterruptPipeReadComplete(
                 Report.Contacts[contactCount].X          = repX;
                 Report.Contacts[contactCount].Y          = repY;
                 Report.Contacts[contactCount].TipSwitch  = 1;
+                // FIX (dead/no-op ternary): the previous expression
+                // `(samples[i].TipDropApplied > 0) ? 1 : 1` evaluated to
+                // 1 on BOTH branches — the TipDropApplied check had no
+                // effect whatsoever, silently. Per the PTP digitizer
+                // usage (Confidence: "this is a real, intended contact"
+                // vs noise), a tip-drop-substituted sample is exactly
+                // the case Confidence exists to flag: its position was
+                // NOT measured this frame, it was carried over from the
+                // track's last good position because the raw contact
+                // was too small/borderline to trust (see
+                // AmtMatchParseFrame's tip-drop debounce in Match.c).
+                // Report it with reduced confidence (0) instead of a
+                // value indistinguishable from a fully-measured sample.
                 Report.Contacts[contactCount].Confidence =
-                    (samples[i].TipDropApplied > 0) ? 1 : 1;
+                    (samples[i].TipDropApplied > 0) ? 0 : 1;
                 contactCount++;
                 pCtx->Tracks[i].ReportedLastFrame = TRUE;
             }
