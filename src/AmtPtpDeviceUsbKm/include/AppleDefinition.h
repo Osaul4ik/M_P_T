@@ -7,6 +7,16 @@
 #define USB_DEVICE_ID_APPLE_T2_7B 0x027b
 #define USB_DEVICE_ID_APPLE_T2_7C 0x027c
 #define USB_DEVICE_ID_APPLE_T2_7D 0x027d
+
+// Apple T2 USB trackpad — MacBookPro16,1 (16-inch, 2019).
+// Confirmed via `system_profiler SPUSBDataType` AND `ioreg -lw0 -r -c
+// AppleMultitouchDevice` on the actual device (idProduct = 832 decimal
+// = 0x0340), independently, on 2026-06-20. This product ID is NOT the
+// same as the 13"/15" T2 IDs above (0x027a-0x027d) and was previously
+// unmatched in Bcm5974ConfigTable, silently falling through to the
+// generic USB_DEVICE_ID_DEFAULT_FALLBACK entry.
+#define USB_DEVICE_ID_APPLE_T2_16 0x0340
+
 #define USB_DEVICE_ID_DEFAULT_FALLBACK 0xffff
 
 /* button data structure */
@@ -146,6 +156,51 @@ struct BCM5974_CONFIG {
 #define PRESSURE_MU_QUALIFICATION_THRESHOLD_TOTAL 15
 #define SIZE_MU_QUALIFICATION_THRESHOLD_TOTAL 25
 
+// ============================================================================
+// NOTE on the (x, y) ranges below for the *_16 entry and the generic
+// fallback entry:
+//
+// The values are NOT raw sensor units read off real 16" hardware — we
+// tried (ioreg, hidutil, IOHIDManager, and finally the private
+// MultitouchSupport.framework on the actual MacBookPro16,1) and macOS does
+// not expose raw absolute touch coordinates through any of those paths;
+// MultitouchSupport only gives normalized [0.0, 1.0] positions, which
+// carries no information about the sensor's native integer coordinate
+// space used internally here.
+//
+// What WAS confirmed directly from the real device on 2026-06-20:
+//   - idProduct = 0x0340 (832 decimal), via both `system_profiler
+//     SPUSBDataType` and `ioreg -lw0 -r -c AppleMultitouchDevice`.
+//   - Physical sensor surface = 157.8mm x 97.8mm, via
+//     `ioreg -lw0 -r -c IOHIDEventDriver` ("Sensor Surface Width/Height"),
+//     consistent with the known ~16" Force Touch trackpad proportions.
+//
+// AmtPtpDeviceUsbKmCreateDevice() -> Interrupt.c only ever uses x.min/
+// x.max/y.min/y.max to normalize raw sensor units into a LOCAL coordinate
+// space (AmtClamp), which is then reported to Windows through the FIXED
+// LOGICAL_MAXIMUM values baked into the HID report descriptor in
+// WellspringT2.h (X: 20000, Y: 12000). Those two must agree: the
+// normalized range produced here (x.max - x.min, y.max - y.min) must equal
+// the descriptor's LOGICAL_MAXIMUM, or the reported coordinates either
+// don't reach the descriptor's edges (dead zone at the pad's border) or
+// exceed it (clamped/distorted positions at the border) — a real source of
+// border "jump" artifacts independent of the L2 identity-tracking fixes in
+// Interrupt.c.
+//
+// The existing USB_DEVICE_ID_DEFAULT_FALLBACK entry below was already
+// deliberately built so that its range matches the descriptor exactly:
+//   x: -10000..10000 -> range 20000 == LOGICAL_MAXIMUM X
+//   y:  -2000..10000 -> range 12000 == LOGICAL_MAXIMUM Y
+// Reusing that SAME, descriptor-consistent range for the confirmed
+// 0x0340 product ID is the correct choice here: it guarantees full,
+// undistorted coverage of the reported coordinate space without
+// introducing an unverified, possibly-wrong native-unit guess. If real
+// raw sensor min/max for this product ID are obtained later (e.g. by
+// instrumenting AmtPtpEvtUsbInterruptPipeReadComplete itself to log
+// observed abs_x/abs_y extrema while sweeping the pad), replace ONLY the
+// x/y fields below — everything else in this entry is already correct.
+// ============================================================================
+
 static const struct BCM5974_CONFIG Bcm5974ConfigTable[] = {
 	/* New device? */
 	{
@@ -204,6 +259,21 @@ static const struct BCM5974_CONFIG Bcm5974ConfigTable[] = {
 		{ SN_PRESSURE, 0, 300 },
 		{ SN_WIDTH, 0, 2048 },
 		// Oversampled - this is fine for a trackpad
+		{ SN_COORD, -10000, 10000 },
+		{ SN_COORD, -2000, 10000 },
+		{ SN_ORIENT, -MAX_FINGER_ORIENTATION, MAX_FINGER_ORIENTATION }
+	},
+	/* 16 inch — MacBookPro16,1 (2019). Product ID 0x0340 confirmed live
+	   from the actual device via system_profiler + ioreg. See the long
+	   comment above this table for why the x/y range matches the generic
+	   fallback rather than a guessed native-unit pair. */
+	{
+		USB_DEVICE_ID_APPLE_T2_16,
+		HAS_INTEGRATED_BUTTON,
+		0, sizeof(struct TRACKPAD_BUTTON_DATA),
+		0x83, DATAFORMAT(TYPE4),
+		{ SN_PRESSURE, 0, 300 },
+		{ SN_WIDTH, 0, 2048 },
 		{ SN_COORD, -10000, 10000 },
 		{ SN_COORD, -2000, 10000 },
 		{ SN_ORIENT, -MAX_FINGER_ORIENTATION, MAX_FINGER_ORIENTATION }

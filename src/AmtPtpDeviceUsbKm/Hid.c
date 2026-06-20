@@ -61,6 +61,16 @@ AmtPtpGetHidDescriptor(
 		case USB_DEVICE_ID_APPLE_T2_7B:
 		case USB_DEVICE_ID_APPLE_T2_7C:
 		case USB_DEVICE_ID_APPLE_T2_7D:
+		// FIX: MacBookPro16,1 (2019) reports product ID 0x0340 — confirmed
+		// live from the device via system_profiler/ioreg — which is NOT
+		// one of the 13"/15" IDs above. Without this case, a 16" T2
+		// trackpad fell through to the "registry is not found" default
+		// branch below. That branch happens to install the SAME
+		// AmtPtpT2DefaultHidDescriptor anyway, so this was not silently
+		// broken, but the device-specific case is the correct, explicit
+		// path going forward (and a TRACE_LEVEL_WARNING was being logged
+		// every time for a perfectly normal, supported device).
+		case USB_DEVICE_ID_APPLE_T2_16:
 		{
 			szCopy = AmtPtpT2DefaultHidDescriptor.bLength;
 			status = WdfMemoryCopyFromBuffer(
@@ -204,6 +214,8 @@ AmtPtpGetReportDescriptor(
 		case USB_DEVICE_ID_APPLE_T2_7B:
 		case USB_DEVICE_ID_APPLE_T2_7C:
 		case USB_DEVICE_ID_APPLE_T2_7D:
+		// See matching comment in AmtPtpGetHidDescriptor above.
+		case USB_DEVICE_ID_APPLE_T2_16:
 		{
 
 			szCopy = AmtPtpT2DefaultHidDescriptor.DescriptorList[0].wReportLength;
