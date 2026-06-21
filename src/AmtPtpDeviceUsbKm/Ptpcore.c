@@ -182,11 +182,7 @@ PTPCore_ProcessFrame(
         pCtx->PalmDetected = TRUE;
         OutResult->LargePalmBlanked = TRUE;
     } else if (pCtx->PalmDetected) {
-        BOOLEAN anyContact = FALSE;
-        for (UCHAR i = 0; i < candidates.Count; i++) {
-            anyContact = TRUE; // any surviving candidate at all
-            break;
-        }
+        BOOLEAN anyContact = (candidates.Count > 0);
         if (!anyContact) {
             pCtx->PalmDetected = FALSE;
             // Pad cleared after palm - Phase A below lifts all contacts.
