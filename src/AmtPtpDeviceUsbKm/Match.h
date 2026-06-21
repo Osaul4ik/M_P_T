@@ -22,8 +22,16 @@ typedef struct _MATCH_CANDIDATE
     USHORT  Y;
     BOOLEAN PalmLocal;       // excluded from matching/reporting
     BOOLEAN IdentityBreak;   // firmware origin==0 signal
-    UCHAR   TipDropApplied;  // non-zero if position substituted by debounce,
-                              // or first-touch passed at low confidence
+    UCHAR   TipDropApplied;  // non-zero ONLY when X/Y was substituted with
+                              // a stale anchor position by tip-size
+                              // debounce (PTPCore.c reports Confidence=0
+                              // in that case). Zero for a genuine new
+                              // touch-down with no anchor (X/Y is real,
+                              // just-sampled data - reported with
+                              // Confidence=1). Mirrored every frame into
+                              // ActiveContacts[p].TipDropCount by
+                              // PTPCore.c so AmtMatchBuildCandidates' own
+                              // debounce-exhausted check is meaningful.
 } MATCH_CANDIDATE;
 
 typedef struct _MATCH_CANDIDATE_SET
@@ -57,8 +65,10 @@ typedef struct _MATCH_RESULT
 // Sets *LargePalmDetected for full-pad blanking.
 //
 // FIX (soft-tap-loss): below-tip-size candidate with no debounce anchor
-// is a first touch-down, not noise - passed through as low-confidence
-// birth candidate instead of silently dropped.
+// is a first touch-down, not noise - passed through as a full-confidence
+// birth candidate (TipDropApplied=0) instead of silently dropped or
+// (the bug this header previously documented as intentional) marked
+// low-confidence. See the long comment at the call site in Match.c.
 VOID
 AmtMatchBuildCandidates(
     _In_  const RAW_FRAME*                        RawFrame,

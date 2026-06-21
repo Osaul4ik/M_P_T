@@ -89,12 +89,28 @@ AmtMatchBuildCandidates(
         }
 
         if (bestPoolIdx == MAX_CONTACTS) {
-            // FIX (soft-tap-loss): no anchor means brand-new contact, not
-            // noise. Let through as low-confidence birth candidate instead
-            // of silently dropping first touch-down.
+            // FIX (soft-tap-loss + soft-tap-confidence): no anchor means
+            // brand-new contact, not noise. Let through as a birth
+            // candidate. IMPORTANT: this is genuine, just-sampled position
+            // data (rc->X/rc->Y), not a substituted/stale one -
+            // TipDropApplied stays 0 so PTPCore.c reports this contact
+            // with Confidence=1.
+            //
+            // BUG FIX: this previously set TipDropApplied=1, which made
+            // every soft (below tip-size threshold) tap's very first
+            // (DOWN) report go out with Confidence=0. Windows' PTP stack
+            // treats Confidence=0 as "not a real/trustworthy touch" and
+            // routinely fails to recognize the tap for click/gesture
+            // purposes - it only worked when ambient pressure noise
+            // happened to push the very first sample above the tip
+            // threshold (AmtMatchCandidateTip), which is rare and random,
+            // matching the observed "soft tap maybe works 1-in-10" symptom.
+            // Hard taps bypass this whole branch entirely (handled above
+            // by AmtMatchCandidateTip) and were never affected - matching
+            // "hard tap always works".
             cand.X              = rc->X;
             cand.Y              = rc->Y;
-            cand.TipDropApplied = 1;
+            cand.TipDropApplied = 0;
             OutCandidates->Candidates[OutCandidates->Count++] = cand;
             continue;
         }
@@ -106,6 +122,17 @@ AmtMatchBuildCandidates(
             OutCandidates->Candidates[OutCandidates->Count++] = cand;
         }
         // else: debounce exhausted with anchor - drop candidate (noise).
+        //
+        // BUG FIX: this branch was previously unreachable in practice -
+        // ACTIVE_CONTACT.TipDropCount was set to 0 at birth and never
+        // incremented anywhere in the codebase, so the condition above
+        // was always "0 < 2" = true. A contact whose pressure sagged
+        // below the tip threshold would bridge to its last good position
+        // (with Confidence=0) forever, instead of eventually either
+        // recovering or being dropped as noise after
+        // TIP_DROP_DEBOUNCE_FRAMES. PTPCore.c (Phase C) now writes
+        // cand->TipDropApplied back into ActiveContacts[p].TipDropCount
+        // every frame, so this debounce counter is real again.
     }
 }
 

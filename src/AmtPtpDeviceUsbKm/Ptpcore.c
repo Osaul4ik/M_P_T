@@ -317,6 +317,19 @@ PTPCore_ProcessFrame(
             pCtx->ActiveContacts[p].WasInGesture = TRUE;
         }
 
+        // BUG FIX: Match.c's tip-size debounce reads
+        // ActiveContacts[p].TipDropCount to decide when to give up
+        // bridging a weakening contact and drop it as noise, but nothing
+        // in the codebase ever WROTE to TipDropCount after birth (it was
+        // always 0, frozen from AmtContactBirth) - the debounce-exhausted
+        // path in AmtMatchBuildCandidates was unreachable dead code, and
+        // a sagging-pressure contact would bridge to its last good
+        // position (Confidence=0) forever instead of recovering or being
+        // dropped after TIP_DROP_DEBOUNCE_FRAMES. Mirror Match.c's
+        // per-candidate verdict back into the pool entry every frame so
+        // the counter is real again.
+        pCtx->ActiveContacts[p].TipDropCount = cand->TipDropApplied;
+
         USHORT repX, repY;
         AmtContactUpdate(&pCtx->ActiveContacts[p], cand->X, cand->Y,
                          cand->SlotIndex, NowQpc,
