@@ -1,60 +1,98 @@
-// Match.h - L1 frame parsing and raw-slot -> Track matching.
+// Match.h - PTPCore / ContactMatcher.
 //
-// Owns L1 (parsing into MATCH_SAMPLE) and binding decisions
-// (AmtMatchFrame). Gesture-session bookkeeping stays in Interrupt.c.
+// CORRECTED scope (see audit/04_correction_plan.md): this is now a real
+// cost-based matcher between RawFrame contacts and the ACTIVE_CONTACT
+// pool. Hardware slot index is used ONLY as one term in the matching
+// cost (cheap, usually-correct hint - slot indices are typically
+// stable frame-to-frame) - it is never used to index into the contact
+// pool directly. A contact that moves to a different hardware slot
+// between frames is still correctly matched by position + recency,
+// just with a slightly higher cost than a slot-stable match.
+//
+// This replaces the earlier (incorrect) version of this file, which
+// matched MATCH_SAMPLE[SlotIndex] directly against Tracks[SlotIndex] -
+// that made slot index the identity key, which is exactly what this
+// refactor exists to remove.
 
 #pragma once
 
-#include "Track.h"
+#include "PTPCore.h"
+#include "ActiveContact.h"
 
 EXTERN_C_START
 
-// One decoded, normalized sample from a raw USB frame slot (L1).
-typedef struct _MATCH_SAMPLE
+// One decoded, palm/tip-debounce-classified candidate contact for this
+// frame. Array is sized PTP_MAX_CONTACT_POINTS but is a dense list of
+// candidates, NOT slot-indexed - SlotIndex is carried as a field, not
+// implied by array position.
+typedef struct _MATCH_CANDIDATE
 {
-    BOOLEAN Present;       // FALSE if this raw slot reported no contact
-                           // (touch_major <= 0 && touch_minor <= 0) and
-                           // was not kept alive by tip-drop debounce.
-    BOOLEAN PalmLocal;     // Locally palm-classified; excluded from
-                           // matching/reporting but does not blank the pad.
-    BOOLEAN IdentityBreak; // TRUE if firmware signalled (origin == 0) that
-                           // this raw slot index now represents a
-                           // DIFFERENT physical finger than last frame.
+    USHORT  SlotIndex;      // hw slot this candidate came from - HINT only
     USHORT  X;
     USHORT  Y;
-    UCHAR   TipDropApplied; // Non-zero if this sample's position was
-                            // substituted from the previous good position
-                            // by tip-size debounce rather than measured
-                            // fresh this frame (feeds Confidence).
-} MATCH_SAMPLE;
+    BOOLEAN PalmLocal;       // excluded from matching/reporting, doesn't blank pad
+    BOOLEAN IdentityBreak;   // firmware origin==0 signal for this slot
+    UCHAR   TipDropApplied;  // non-zero if position substituted by debounce
+} MATCH_CANDIDATE;
 
-// L1: Decodes raw TRACKPAD_FINGER records into MATCH_SAMPLE[].
-// Performs palm classification and tip-size debounce (read-only Track
-// access). Sets *LargePalmDetected for full-pad palm blanking.
+typedef struct _MATCH_CANDIDATE_SET
+{
+    UCHAR           Count;
+    MATCH_CANDIDATE Candidates[PTP_MAX_CONTACT_POINTS];
+} MATCH_CANDIDATE_SET;
+
+// Correspondence result: for each candidate, either a matched pool
+// index (existing ACTIVE_CONTACT to update) or "no match" (new birth).
+#define MATCH_NO_CORRESPONDENCE  ((size_t)-1)
+
+typedef struct _MATCH_RESULT
+{
+    // Parallel to MATCH_CANDIDATE_SET.Candidates[]. Value is the pool
+    // index in ActiveContacts[] this candidate corresponds to, or
+    // MATCH_NO_CORRESPONDENCE if this candidate should birth a new contact.
+    size_t  CorrespondingPoolIndex[PTP_MAX_CONTACT_POINTS];
+
+    // TRUE if the matched pool entry's identity should be considered
+    // broken (i.e. treat as lift-of-old + birth-of-new rather than
+    // continue) even though a correspondence was found - e.g. firmware
+    // origin==0 signal fired, or the matched candidate is implausibly
+    // far from the pool entry's last known position.
+    BOOLEAN NewIdentity[PTP_MAX_CONTACT_POINTS];
+
+    // Pool indices that have NO corresponding candidate this frame
+    // (i.e. should lift). Terminated by MAX_CONTACTS sentinel value if
+    // fewer than MAX_CONTACTS entries are unmatched.
+    size_t  UnmatchedPoolIndices[MAX_CONTACTS];
+    UCHAR   UnmatchedCount;
+} MATCH_RESULT;
+
+// L1.5a: Builds the candidate set from a RawFrame - decodes palm
+// classification (delegated to Palm.c) and tip-size debounce (reads
+// the ActiveContact pool by LastSlotHint, not by direct index - this is
+// the stateful step that cannot live in InputAdapter; see PTPCore.h #2).
+// Sets *LargePalmDetected for full-pad blanking.
 VOID
-AmtMatchParseFrame(
-    _In_  const UCHAR*                    FrameBase,
-    _In_  size_t                          fingerSize,
-    _In_  size_t                          raw_n,
-    _In_  const struct BCM5974_CONFIG*    DevInfo,
-    _In_reads_(PTP_MAX_CONTACT_POINTS) const TRACK* Tracks,
-    _Out_writes_(PTP_MAX_CONTACT_POINTS) MATCH_SAMPLE* Samples,
-    _Out_ BOOLEAN* LargePalmDetected
+AmtMatchBuildCandidates(
+    _In_  const RAW_FRAME*                        RawFrame,
+    _In_  const struct BCM5974_CONFIG*             DevInfo,
+    _In_reads_(MAX_CONTACTS) const ACTIVE_CONTACT* Pool,
+    _Out_ MATCH_CANDIDATE_SET*                     OutCandidates,
+    _Out_ BOOLEAN*                                 LargePalmDetected
 );
 
-// Decides CONTINUES vs NEW_IDENTITY for each Present slot.
-// Two signals: (1) firmware origin==0 (IdentityBreak), (2) spatial
-// sanity check — a position jump beyond MATCH_MAX_CONTINUATION_DELTA
-// from last ReportX/Y is implausible in one USB polling interval.
-// O(N) single-pass, N <= PTP_MAX_CONTACT_POINTS.
-typedef enum { MATCH_CONTINUES = 0, MATCH_NEW_IDENTITY = 1 } MATCH_VERDICT;
-
+// L1.5b: Cost-based correspondence between Candidates and the ACTIVE
+// pool. Cost = spatial distance (primary) with a bonus (cost reduction)
+// for SlotIndex == Pool[i].LastSlotHint (cheap common-case win, not a
+// requirement). Greedy minimum-cost assignment, O(N*M) for N,M <= 5 -
+// a full Hungarian/optimal assignment is unnecessary at this scale.
+// A candidate's correspondence is rejected (-> NewIdentity / new birth)
+// if firmware signalled IdentityBreak, OR if the best-cost match still
+// exceeds MATCH_MAX_CONTINUATION_DELTA (implausible jump).
 VOID
-AmtMatchFrame(
-    _In_reads_(PTP_MAX_CONTACT_POINTS) const MATCH_SAMPLE* Samples,
-    _In_  size_t                                            raw_n,
-    _In_reads_(PTP_MAX_CONTACT_POINTS) const TRACK*         Tracks,
-    _Out_writes_(PTP_MAX_CONTACT_POINTS) MATCH_VERDICT*      Verdicts
+AmtMatchCorrespond(
+    _In_  const MATCH_CANDIDATE_SET*               Candidates,
+    _In_reads_(MAX_CONTACTS) const ACTIVE_CONTACT*  Pool,
+    _Out_ MATCH_RESULT*                             OutResult
 );
 
 EXTERN_C_END

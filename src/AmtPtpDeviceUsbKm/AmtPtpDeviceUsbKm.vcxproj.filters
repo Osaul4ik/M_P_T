@@ -17,6 +17,9 @@
       <UniqueIdentifier>{8E41214B-6785-4CFE-B992-037D68949A14}</UniqueIdentifier>
       <Extensions>inf;inv;inx;mof;mc;</Extensions>
     </Filter>
+    <Filter Include="PTPCore">
+      <UniqueIdentifier>{B1A2C3D4-1111-4f5e-9a8b-2c3d4e5f6a7b}</UniqueIdentifier>
+    </Filter>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="Device.h">
@@ -37,11 +40,23 @@
     <ClInclude Include="resource.h">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="Track.h">
-      <Filter>Header Files</Filter>
+    <ClInclude Include="PTPCore.h">
+      <Filter>PTPCore</Filter>
+    </ClInclude>
+    <ClInclude Include="Input.h">
+      <Filter>PTPCore</Filter>
+    </ClInclude>
+    <ClInclude Include="ActiveContact.h">
+      <Filter>PTPCore</Filter>
     </ClInclude>
     <ClInclude Include="Match.h">
-      <Filter>Header Files</Filter>
+      <Filter>PTPCore</Filter>
+    </ClInclude>
+    <ClInclude Include="Palm.h">
+      <Filter>PTPCore</Filter>
+    </ClInclude>
+    <ClInclude Include="Gesture.h">
+      <Filter>PTPCore</Filter>
     </ClInclude>
   </ItemGroup>
   <ItemGroup>
@@ -63,11 +78,23 @@
     <ClCompile Include="Hid.c">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="Track.c">
-      <Filter>Source Files</Filter>
+    <ClCompile Include="Input.c">
+      <Filter>PTPCore</Filter>
+    </ClCompile>
+    <ClCompile Include="PTPCore.c">
+      <Filter>PTPCore</Filter>
+    </ClCompile>
+    <ClCompile Include="ActiveContact.c">
+      <Filter>PTPCore</Filter>
     </ClCompile>
     <ClCompile Include="Match.c">
-      <Filter>Source Files</Filter>
+      <Filter>PTPCore</Filter>
+    </ClCompile>
+    <ClCompile Include="Palm.c">
+      <Filter>PTPCore</Filter>
+    </ClCompile>
+    <ClCompile Include="Gesture.c">
+      <Filter>PTPCore</Filter>
     </ClCompile>
   </ItemGroup>
   <ItemGroup>

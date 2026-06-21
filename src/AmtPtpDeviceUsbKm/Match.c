@@ -1,204 +1,247 @@
-// Match.c - L1 frame parsing and raw-slot -> Track matching.
+// Match.c - PTPCore / ContactMatcher. See Match.h for scope notes and
+// audit/04_correction_plan.md for why this replaced the slot-indexed
+// version.
 
 #include "Driver.h"
 #include "Match.h"
+#include "Palm.h"
 
-#define PALM_LARGE_MAJOR    380
-#define PALM_SCORE_THRESH   45
-#define TIP_DROP_DEBOUNCE_FRAMES 2
-#define TIP_DROP_MAX_REPOSITION_DELTA 300
+#define TIP_DROP_DEBOUNCE_FRAMES        2
+#define TIP_DROP_MAX_REPOSITION_DELTA   300
 
 // Spatial sanity threshold: ~20% of pad width (~20000 units). No real
-// finger teleports this far in one USB polling interval. Deliberately
-// generous to avoid misfiring on legitimate fast motion.
+// finger teleports this far in one USB polling interval.
 #define MATCH_MAX_CONTINUATION_DELTA 4000
 
-static inline INT
-AmtRawToInteger(_In_ USHORT x)
+// Matching-cost tuning. Cost is dominated by spatial distance. The
+// slot-hint match is used ONLY to break near-ties (see the epsilon
+// comparison in AmtMatchCorrespond) - it must never be able to flip a
+// genuinely-closer candidate at a different slot into losing, or this
+// silently reintroduces slot-as-identity behavior through the back
+// door. An earlier version of this file used a fixed cost subtraction
+// for slot-hint matches, which was provably wrong: at typical
+// frame-to-frame finger movement (a few units, squared distance in the
+// low hundreds), a fixed subtraction of a few thousand could override a
+// genuinely closer candidate at a different slot. Fixed by replacing it
+// with a same-magnitude-only epsilon tie-break instead - see below.
+#define MATCH_TIE_EPSILON_SQ 4  // ~2 units of linear distance, squared
+
+static UCHAR
+AmtMatchCandidateTip(_In_ USHORT major, _In_ USHORT minor)
 {
-    return (signed short)x;
-}
-
-static inline USHORT
-AmtClampCoord(_In_ INT raw, _In_ INT minVal, _In_ INT maxVal)
-{
-    INT shifted = raw - minVal;
-    if (shifted < 0)               shifted = 0;
-    if (shifted > maxVal - minVal) shifted = maxVal - minVal;
-    return (USHORT)shifted;
-}
-
-typedef enum { PALM_NONE = 0, PALM_LOCAL = 1, PALM_LARGE = 2 } PALM_CLASS;
-
-static PALM_CLASS
-AmtClassifyPalm(
-    _In_ const struct TRACKPAD_FINGER* f,
-    _In_ const struct BCM5974_CONFIG*  devInfo,
-    _In_ INT normX,
-    _In_ INT normY)
-{
-    INT major = AmtRawToInteger(f->touch_major);
-    INT minor = AmtRawToInteger(f->touch_minor);
-    INT score = 0;
-
-    if (major <= 0 && minor <= 0)
-        return PALM_NONE;
-
-    if (major >= PALM_LARGE_MAJOR)
-        return PALM_LARGE;
-
-    if      (major > 260) score += 35;
-    else if (major > 190) score += 15;
-    else if (major > 130) score +=  8;
-
-    if (minor > 0 && major > 120) {
-        INT ratio = major * 100 / minor;
-        if      (ratio > 1200) score += 30;
-        else if (ratio >  900) score += 20;
-        else if (ratio >  600) score += 10;
-    }
-
-    if (major > 130) {
-        INT xRange   = devInfo->x.max - devInfo->x.min;
-        INT yRange   = devInfo->y.max - devInfo->y.min;
-        INT edgePctX = xRange / 28;
-        INT edgePctY = yRange / 28;
-
-        if (normX < edgePctX || normX > (xRange - edgePctX) ||
-            normY < edgePctY || normY > (yRange - edgePctY))
-            score += 10;
-    }
-
-    return (score >= PALM_SCORE_THRESH) ? PALM_LOCAL : PALM_NONE;
+    return (UCHAR)(((INT)major << 1) >= 200 || ((INT)minor << 1) >= 150);
 }
 
 VOID
-AmtMatchParseFrame(
-    _In_  const UCHAR*                    FrameBase,
-    _In_  size_t                          fingerSize,
-    _In_  size_t                          raw_n,
-    _In_  const struct BCM5974_CONFIG*    DevInfo,
-    _In_reads_(PTP_MAX_CONTACT_POINTS) const TRACK* Tracks,
-    _Out_writes_(PTP_MAX_CONTACT_POINTS) MATCH_SAMPLE* Samples,
-    _Out_ BOOLEAN* LargePalmDetected)
+AmtMatchBuildCandidates(
+    _In_  const RAW_FRAME*                        RawFrame,
+    _In_  const struct BCM5974_CONFIG*             DevInfo,
+    _In_reads_(MAX_CONTACTS) const ACTIVE_CONTACT* Pool,
+    _Out_ MATCH_CANDIDATE_SET*                     OutCandidates,
+    _Out_ BOOLEAN*                                 LargePalmDetected
+)
 {
     *LargePalmDetected = FALSE;
+    RtlZeroMemory(OutCandidates, sizeof(MATCH_CANDIDATE_SET));
 
-    for (size_t i = 0; i < PTP_MAX_CONTACT_POINTS; i++) {
-        RtlZeroMemory(&Samples[i], sizeof(MATCH_SAMPLE));
-    }
+    for (UCHAR i = 0; i < RawFrame->ContactCount; i++) {
+        const RAW_CONTACT* rc = &RawFrame->Contacts[i];
 
-    for (size_t i = 0; i < raw_n; i++) {
-        const struct TRACKPAD_FINGER* f =
-            (const struct TRACKPAD_FINGER*)(FrameBase + i * fingerSize);
-
-        INT major = AmtRawToInteger(f->touch_major);
-        INT minor = AmtRawToInteger(f->touch_minor);
-
-        Samples[i].IdentityBreak = (f->origin == 0);
-
-        if (major <= 0 && minor <= 0) {
-            // No contact — tip-drop debounce doesn't apply.
-            continue;
-        }
-
-        INT nx = (INT)AmtClampCoord(AmtRawToInteger(f->abs_x),
-                                    DevInfo->x.min, DevInfo->x.max);
-        INT yRange = DevInfo->y.max - DevInfo->y.min;
-        INT nyRaw  = DevInfo->y.max - AmtRawToInteger(f->abs_y);
-        INT ny     = (nyRaw < 0) ? 0 : (nyRaw > yRange ? yRange : nyRaw);
-
-        PALM_CLASS palm = AmtClassifyPalm(f, DevInfo, nx, ny);
+        PALM_CLASS palm = AmtPalmClassify(rc->Major, rc->Minor, DevInfo,
+                                          (INT)rc->X, (INT)rc->Y);
 
         if (palm == PALM_LARGE) {
             *LargePalmDetected = TRUE;
-            // Large palm — caller blanks the whole pad.
-            for (size_t j = 0; j < PTP_MAX_CONTACT_POINTS; j++) {
-                RtlZeroMemory(&Samples[j], sizeof(MATCH_SAMPLE));
-            }
+            OutCandidates->Count = 0; // caller blanks the whole pad
             return;
         }
 
+        MATCH_CANDIDATE cand;
+        RtlZeroMemory(&cand, sizeof(cand));
+        cand.SlotIndex     = rc->SlotIndex;
+        cand.IdentityBreak = (rc->Origin == 0);
+
         if (palm == PALM_LOCAL) {
-            Samples[i].PalmLocal = TRUE;
+            cand.PalmLocal = TRUE;
+            cand.X = rc->X;
+            cand.Y = rc->Y;
+            OutCandidates->Candidates[OutCandidates->Count++] = cand;
             continue;
         }
 
-        BOOLEAN tip = (major << 1) >= 200 || (minor << 1) >= 150;
+        if (AmtMatchCandidateTip(rc->Major, rc->Minor)) {
+            cand.X = rc->X;
+            cand.Y = rc->Y;
+            OutCandidates->Candidates[OutCandidates->Count++] = cand;
+            continue;
+        }
 
-        if (!tip) {
-            // Tip-drop debounce: keep ACTIVE track alive on last known
-            // position for a few frames if the new sample is borderline.
-            const TRACK* t = &Tracks[i];
+        // Below tip-size threshold - tip-size debounce. Find the pool
+        // entry most recently associated with this hardware slot (by
+        // LastSlotHint - a hint, used here only to find a debounce
+        // anchor, never as a direct index) and bridge to its last good
+        // position if it's plausibly the same physical contact.
+        size_t bestPoolIdx = MAX_CONTACTS;
+        for (size_t p = 0; p < MAX_CONTACTS; p++) {
+            if (Pool[p].State != CONTACT_ACTIVE)
+                continue;
+            if (Pool[p].LastSlotHint != rc->SlotIndex)
+                continue;
 
-            if (t->State == TRACK_ACTIVE) {
-                INT dxAbs = nx - (INT)t->ReportX;
-                if (dxAbs < 0) dxAbs = -dxAbs;
-                INT dyAbs = ny - (INT)t->ReportY;
-                if (dyAbs < 0) dyAbs = -dyAbs;
+            INT dxAbs = (INT)rc->X - (INT)Pool[p].ReportX;
+            if (dxAbs < 0) dxAbs = -dxAbs;
+            INT dyAbs = (INT)rc->Y - (INT)Pool[p].ReportY;
+            if (dyAbs < 0) dyAbs = -dyAbs;
 
-                BOOLEAN samePositionAsBefore =
-                    (dxAbs <= TIP_DROP_MAX_REPOSITION_DELTA) &&
-                    (dyAbs <= TIP_DROP_MAX_REPOSITION_DELTA);
-
-                if (samePositionAsBefore &&
-                    t->TipDropCount < TIP_DROP_DEBOUNCE_FRAMES) {
-                    Samples[i].Present        = TRUE;
-                    Samples[i].X              = t->ReportX;
-                    Samples[i].Y              = t->ReportY;
-                    Samples[i].TipDropApplied = (UCHAR)(t->TipDropCount + 1);
-                    continue;
-                }
+            if (dxAbs <= TIP_DROP_MAX_REPOSITION_DELTA &&
+                dyAbs <= TIP_DROP_MAX_REPOSITION_DELTA) {
+                bestPoolIdx = p;
+                break;
             }
-            // Debounce exhausted or track inactive — treat as absent.
-            continue;
         }
 
-        Samples[i].Present = TRUE;
-        Samples[i].X       = (USHORT)nx;
-        Samples[i].Y       = (USHORT)ny;
+        if (bestPoolIdx != MAX_CONTACTS &&
+            Pool[bestPoolIdx].TipDropCount < TIP_DROP_DEBOUNCE_FRAMES) {
+            cand.X              = Pool[bestPoolIdx].ReportX;
+            cand.Y              = Pool[bestPoolIdx].ReportY;
+            cand.TipDropApplied = (UCHAR)(Pool[bestPoolIdx].TipDropCount + 1);
+            OutCandidates->Candidates[OutCandidates->Count++] = cand;
+        }
+        // else: debounce exhausted or no anchor found - drop this
+        // candidate (treat as absent), matching old behavior.
     }
 }
 
 VOID
-AmtMatchFrame(
-    _In_reads_(PTP_MAX_CONTACT_POINTS) const MATCH_SAMPLE* Samples,
-    _In_  size_t                                            raw_n,
-    _In_reads_(PTP_MAX_CONTACT_POINTS) const TRACK*         Tracks,
-    _Out_writes_(PTP_MAX_CONTACT_POINTS) MATCH_VERDICT*      Verdicts)
+AmtMatchCorrespond(
+    _In_  const MATCH_CANDIDATE_SET*               Candidates,
+    _In_reads_(MAX_CONTACTS) const ACTIVE_CONTACT*  Pool,
+    _Out_ MATCH_RESULT*                             OutResult
+)
 {
-    // O(N) single pass by raw slot index. Firmware guarantees index
-    // stability except where origin==0 or spatial sanity check fires.
-    for (size_t i = 0; i < PTP_MAX_CONTACT_POINTS; i++) {
-        Verdicts[i] = MATCH_CONTINUES;
+    RtlZeroMemory(OutResult, sizeof(MATCH_RESULT));
+
+    BOOLEAN poolClaimed[MAX_CONTACTS];
+    RtlZeroMemory(poolClaimed, sizeof(poolClaimed));
+
+    // Greedy minimum-cost assignment. For N,M <= PTP_MAX_CONTACT_POINTS
+    // (5), this is well within the regime where greedy-by-ascending-cost
+    // gives the same practical result as an optimal assignment, at a
+    // fraction of the complexity - see Match.h doc comment.
+    //
+    // Build all (candidate, pool) cost pairs, then repeatedly take the
+    // globally cheapest unclaimed pair until either side is exhausted.
+    typedef struct { UCHAR candIdx; size_t poolIdx; LONG cost; BOOLEAN slotHintMatch; } PAIR;
+    PAIR pairs[PTP_MAX_CONTACT_POINTS * MAX_CONTACTS];
+    UCHAR pairCount = 0;
+
+    for (UCHAR ci = 0; ci < Candidates->Count; ci++) {
+        const MATCH_CANDIDATE* cand = &Candidates->Candidates[ci];
+
+        OutResult->CorrespondingPoolIndex[ci] = MATCH_NO_CORRESPONDENCE;
+
+        if (cand->PalmLocal)
+            continue; // palm candidates never match/birth via this path
+
+        for (size_t p = 0; p < MAX_CONTACTS; p++) {
+            if (Pool[p].State != CONTACT_ACTIVE)
+                continue;
+
+            INT dx = (INT)cand->X - (INT)Pool[p].ReportX;
+            INT dy = (INT)cand->Y - (INT)Pool[p].ReportY;
+            LONG dist = (LONG)dx * dx + (LONG)dy * dy; // squared distance,
+                                                        // the ONLY cost term
+
+            pairs[pairCount].candIdx       = ci;
+            pairs[pairCount].poolIdx       = p;
+            pairs[pairCount].cost          = dist;
+            pairs[pairCount].slotHintMatch = (cand->SlotIndex == Pool[p].LastSlotHint);
+            pairCount++;
+        }
     }
 
-    for (size_t i = 0; i < raw_n; i++) {
-        if (!Samples[i].Present || Samples[i].PalmLocal)
-            continue;
+    // Selection sort by ascending cost, claiming greedily. pairCount is
+    // bounded by PTP_MAX_CONTACT_POINTS * MAX_CONTACTS == 25, so an
+    // O(n^2) selection pass is negligible on this hot path.
+    //
+    // Slot-hint is used ONLY as a tie-breaker: when two candidate pairs
+    // are within MATCH_TIE_EPSILON_SQ of each other in cost, prefer the
+    // one whose SlotIndex matches Pool[p].LastSlotHint. This can never
+    // override a genuinely cheaper match outside the epsilon band - see
+    // the file-header comment on why a fixed cost bonus was wrong.
+    BOOLEAN pairUsed[PTP_MAX_CONTACT_POINTS * MAX_CONTACTS];
+    RtlZeroMemory(pairUsed, sizeof(pairUsed));
 
-        if (Tracks[i].State != TRACK_ACTIVE) {
-            Verdicts[i] = MATCH_CONTINUES; // no existing identity to break
-            continue;
+    BOOLEAN candClaimed[PTP_MAX_CONTACT_POINTS];
+    RtlZeroMemory(candClaimed, sizeof(candClaimed));
+
+    for (UCHAR pick = 0; pick < pairCount; pick++) {
+        LONG    bestCost          = -1;
+        UCHAR   bestIdx           = 0;
+        BOOLEAN bestSlotHintMatch = FALSE;
+        BOOLEAN found             = FALSE;
+
+        for (UCHAR k = 0; k < pairCount; k++) {
+            if (pairUsed[k]) continue;
+            if (candClaimed[pairs[k].candIdx]) continue;
+            if (poolClaimed[pairs[k].poolIdx]) continue;
+
+            if (!found) {
+                bestCost          = pairs[k].cost;
+                bestIdx           = k;
+                bestSlotHintMatch = pairs[k].slotHintMatch;
+                found             = TRUE;
+                continue;
+            }
+
+            LONG delta = pairs[k].cost - bestCost;
+            BOOLEAN withinEpsilon = (delta > -MATCH_TIE_EPSILON_SQ) &&
+                                    (delta < MATCH_TIE_EPSILON_SQ);
+
+            if (pairs[k].cost < bestCost && !withinEpsilon) {
+                // Strictly cheaper outside the tie band - always wins,
+                // regardless of slot hint.
+                bestCost          = pairs[k].cost;
+                bestIdx           = k;
+                bestSlotHintMatch = pairs[k].slotHintMatch;
+            } else if (withinEpsilon && pairs[k].slotHintMatch && !bestSlotHintMatch) {
+                // Near-tie: prefer the slot-hint match.
+                bestCost          = pairs[k].cost;
+                bestIdx           = k;
+                bestSlotHintMatch = TRUE;
+            }
         }
 
-        BOOLEAN identityChanged;
+        if (!found)
+            break; // every remaining candidate or pool entry is claimed
 
-        if (Samples[i].IdentityBreak) {
-            // Firmware says this index now belongs to a different finger.
-            identityChanged = TRUE;
-        } else {
-            // Spatial sanity: verify continuity is physically plausible
-            // against last ReportX/Y (post-EMA, what Windows last saw).
-            INT dx = (INT)Samples[i].X - (INT)Tracks[i].ReportX;
-            if (dx < 0) dx = -dx;
-            INT dy = (INT)Samples[i].Y - (INT)Tracks[i].ReportY;
-            if (dy < 0) dy = -dy;
+        pairUsed[bestIdx]                 = TRUE;
+        UCHAR  ci = pairs[bestIdx].candIdx;
+        size_t p  = pairs[bestIdx].poolIdx;
 
-            identityChanged = (dx > MATCH_MAX_CONTINUATION_DELTA) ||
-                               (dy > MATCH_MAX_CONTINUATION_DELTA);
+        // Reject implausible matches outright - this candidate gets no
+        // correspondence (-> new birth) rather than a bogus continuation.
+        if (pairs[bestIdx].cost >
+            (LONG)MATCH_MAX_CONTINUATION_DELTA * MATCH_MAX_CONTINUATION_DELTA) {
+            candClaimed[ci] = TRUE; // don't reconsider this candidate
+            continue;               // leave pool entry p available
         }
 
-        Verdicts[i] = identityChanged ? MATCH_NEW_IDENTITY : MATCH_CONTINUES;
+        candClaimed[ci] = TRUE;
+        poolClaimed[p]  = TRUE;
+
+        OutResult->CorrespondingPoolIndex[ci] = p;
+        OutResult->NewIdentity[ci] =
+            Candidates->Candidates[ci].IdentityBreak ? TRUE : FALSE;
+    }
+
+    // Any pool entry never claimed has no corresponding candidate this
+    // frame -> lift.
+    for (size_t p = 0; p < MAX_CONTACTS; p++) {
+        if (Pool[p].State != CONTACT_ACTIVE)
+            continue;
+        if (!poolClaimed[p]) {
+            OutResult->UnmatchedPoolIndices[OutResult->UnmatchedCount++] = p;
+        }
     }
 }

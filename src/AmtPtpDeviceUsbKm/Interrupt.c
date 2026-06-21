@@ -1,23 +1,25 @@
-// Interrupt.c: Handles device input event. Kernel-mode Driver Framework
+// Interrupt.c: USB completion handling.
 //
-// Phase sequence (frame determinism — see Track.h):
-//   L0 Button snapshot -> L1 Parse -> L1.5 Match -> Session Gesture FSM
-//   -> Overflow drain -> Phase A Lift -> Phase B Birth -> Phase C Report
+// CORRECTED scope (see audit/04_correction_plan.md): this file now owns
+// exactly four things, in order:
+//   1. USB read completion mechanics (buffer validation, request plumbing)
+//   2. RawFrame construction (delegated to Input.c - no decisions here)
+//   3. ONE call to PTPCore_ProcessFrame (all matching, lifecycle FSM,
+//      palm/gesture session bookkeeping lives there - see PTPCore.c)
+//   4. Serializing PTP_CORE_FRAME into the wire-format PTP_REPORT
 //
-// Session owns: GestureSessionActive, alive-count, SlotLastLift*.
-// Track owns: ReportX/Y, HystX/Y, ContactID, WasInGesture.
-// Data flow: Session -> per-track WasInGesture (one-directional).
-//
-// FIX: GestureSessionActive is now a two-edge FSM (was write-only latch).
-// FALSE on aliveCount==0, TRUE on >=2, unchanged on ==1.
+// It does NOT decide grace-vs-kill, retap-vs-raw, or any other
+// lifecycle routing - those decisions are not visible in this file at
+// all anymore. The previous version of this refactor still had that
+// orchestration inline here; that was wrong and has been moved into
+// PTPCore_ProcessFrame.
 
 #include "Driver.h"
-#include "Track.h"
-#include "Match.h"
+#include "PTPCore.h"
+#include "Input.h"
 #include "Interrupt.tmh"
 
-// Hot-path trace rate limiting — max 1 verbose/info trace per interval.
-// Error/warning paths never rate limited.
+// Hot-path trace rate limiting - max 1 verbose/info trace per interval.
 #define TRACE_HOT_PATH_MIN_INTERVAL_100NS  (50LL * 10000LL)  // 50 ms
 
 static inline BOOLEAN
@@ -29,14 +31,10 @@ AmtHotPathTraceGate(_Inout_ PDEVICE_CONTEXT pCtx, _In_ LONGLONG NowQpc100ns)
     return TRUE;
 }
 
-// Debug-only PTP_REPORT invariant check — ContactID uniqueness,
-// valid TipSwitch, ContactCount <= PTP_MAX_CONTACT_POINTS.
 #if DBG
 static VOID
 AmtReportCheckInvariants(_In_ const PTP_REPORT* Report)
 {
-    // Assert ContactCount <= PTP_MAX_CONTACT_POINTS — guards against
-    // future increment sites missing the bounds check.
     NT_ASSERT(Report->ContactCount <= PTP_MAX_CONTACT_POINTS);
 
     for (UCHAR a = 0; a < Report->ContactCount; a++) {
@@ -50,72 +48,29 @@ AmtReportCheckInvariants(_In_ const PTP_REPORT* Report)
 #define AmtReportCheckInvariants(Report) ((VOID)0)
 #endif
 
-// Captures lift position/time into session-scoped recent-lift memory.
-// Called from all Phase A lift paths. Position-only, never feeds ContactID.
-static inline VOID
-AmtRecordSlotLift(
-    _Inout_ PDEVICE_CONTEXT pCtx,
-    _In_    size_t          index,
-    _In_    LONGLONG        NowQpc,
-    _In_    USHORT          X,
-    _In_    USHORT          Y)
-{
-    pCtx->SlotLastLiftQpc[index] = NowQpc;
-    pCtx->SlotLastLiftX[index]   = X;
-    pCtx->SlotLastLiftY[index]   = Y;
-}
-
-// Drains deferred lift-offs from previous frame into the current report.
-// Clears OverflowCount. Max 1 frame extra latency.
+// Serializes a PTP_CORE_FRAME (PTPCore's layer-1 output) into the
+// wire-format PTP_REPORT. Pure formatting - no decisions about what is
+// reported or why; that was already decided by PTPCore_ProcessFrame.
 static VOID
-AmtDrainOverflow(
-    _Inout_ PDEVICE_CONTEXT pCtx,
-    _Inout_ PTP_REPORT*     Report,
-    _Inout_ UCHAR*          ContactCount)
+AmtSerializeCoreFrameToReport(
+    _In_  const PTP_CORE_FRAME* CoreFrame,
+    _Out_ PTP_REPORT*           Report
+)
 {
-    for (UCHAR k = 0; k < pCtx->OverflowCount && *ContactCount < PTP_MAX_CONTACT_POINTS; k++) {
-        Report->Contacts[*ContactCount].ContactID  = pCtx->OverflowContactID[k];
-        Report->Contacts[*ContactCount].TipSwitch  = 0;
-        Report->Contacts[*ContactCount].Confidence = 1;
-        Report->Contacts[*ContactCount].X          = pCtx->OverflowX[k];
-        Report->Contacts[*ContactCount].Y          = pCtx->OverflowY[k];
-        (*ContactCount)++;
-    }
-    pCtx->OverflowCount = 0;
-}
+    UCHAR n = CoreFrame->ContactCount;
+    if (n > PTP_MAX_CONTACT_POINTS) n = PTP_MAX_CONTACT_POINTS; // defensive
 
-// Writes one lift-off PTP_CONTACT. If report full, defers to Overflow*
-// for next frame — never silently drops a lift-off.
-static VOID
-AmtEmitLift(
-    _Inout_ PDEVICE_CONTEXT pCtx,
-    _Inout_ PTP_REPORT*     Report,
-    _Inout_ UCHAR*          ContactCount,
-    _In_    ULONG           ContactID,
-    _In_    USHORT          X,
-    _In_    USHORT          Y)
-{
-    if (*ContactCount < PTP_MAX_CONTACT_POINTS) {
-        Report->Contacts[*ContactCount].ContactID  = ContactID;
-        Report->Contacts[*ContactCount].TipSwitch  = 0;
-        Report->Contacts[*ContactCount].Confidence = 1;
-        Report->Contacts[*ContactCount].X          = X;
-        Report->Contacts[*ContactCount].Y          = Y;
-        (*ContactCount)++;
-        return;
+    for (UCHAR i = 0; i < n; i++) {
+        const PTP_CORE_CONTACT* c = &CoreFrame->Contacts[i];
+
+        Report->Contacts[i].ContactID  = c->ContactID;
+        Report->Contacts[i].X          = c->X;
+        Report->Contacts[i].Y          = c->Y;
+        Report->Contacts[i].TipSwitch  = (c->Phase == CONTACT_PHASE_UP) ? 0 : 1;
+        Report->Contacts[i].Confidence = c->Confident ? 1 : 0;
     }
 
-    // Overflow capacity = PTP_MAX_CONTACT_POINTS — defensive bound.
-    if (pCtx->OverflowCount < PTP_MAX_CONTACT_POINTS) {
-        pCtx->OverflowContactID[pCtx->OverflowCount] = ContactID;
-        pCtx->OverflowX[pCtx->OverflowCount]         = X;
-        pCtx->OverflowY[pCtx->OverflowCount]         = Y;
-        pCtx->OverflowCount++;
-    } else {
-        TraceEvents(TRACE_LEVEL_ERROR, TRACE_INPUT,
-            "%!FUNC! lift-off overflow queue saturated — ContactID=%u lost",
-            ContactID);
-    }
+    Report->ContactCount = n;
 }
 
 _IRQL_requires_(PASSIVE_LEVEL)
@@ -178,7 +133,7 @@ AmtPtpEvtUsbInterruptPipeReadComplete(
     PDEVICE_CONTEXT pCtx       = Context;
     size_t          headerSize = (unsigned int)pCtx->DeviceInfo->tp_header;
     size_t          fingerSize = (unsigned int)pCtx->DeviceInfo->tp_fsize;
-    size_t          raw_n, i;
+    size_t          raw_n;
     UCHAR*          TouchBuffer = NULL;
 
     LONGLONG      PerfDelta;
@@ -187,6 +142,8 @@ AmtPtpEvtUsbInterruptPipeReadComplete(
     PTP_REPORT    Report;
     WDFREQUEST    Request;
     WDFMEMORY     RequestMemory;
+
+    // ---- 1. USB read completion mechanics ----
 
     if (NumBytesTransferred < headerSize ||
         (NumBytesTransferred - headerSize) % fingerSize != 0) {
@@ -222,69 +179,47 @@ AmtPtpEvtUsbInterruptPipeReadComplete(
         PerfDelta = PerfDelta * 10000LL / pCtx->PerfFrequency.QuadPart;
     else
         PerfDelta /= 100LL;
-    // Clamp ScanTime to [0, 0xFFFF]. QPC may be non-monotonic on some
-    // platforms; negative delta would wrap to a huge value.
     if (PerfDelta > 0xFFFF) PerfDelta = 0xFFFF;
     if (PerfDelta < 0)      PerfDelta = 0;
     Report.ScanTime = (USHORT)PerfDelta;
     pCtx->LastReportTime = Now;
 
-    // L0 — Button snapshot. Read once at frame start to avoid race.
     BOOLEAN buttonSnapshot =
         pCtx->PtpReportButton && TouchBuffer[pCtx->DeviceInfo->tp_button];
 
-    // Typing suppression
+    // Typing suppression: this is a "should we process input at all"
+    // gate, not a PTPCore frame decision - it stays here. When active,
+    // the frame is treated as empty (no raw contacts), which drives
+    // PTPCore_ProcessFrame to lift every active contact through its
+    // normal Phase A path. This intentionally replaces the old
+    // Interrupt.c behavior of force-Kill'ing every track during
+    // suppression (bypassing the WasInGesture->EnterGrace check): Phase
+    // A's EnterGrace+ExpireGrace sequence zeroes the same struct fields
+    // and returns the same Old* (ContactID/X/Y) as a direct Kill within
+    // a single frame, so the externally observable result - which
+    // ContactIDs report TipSwitch=0 this frame, at what position - is
+    // identical either way. Reusing the one Phase A path here removes a
+    // second, parallel lift-off implementation instead of keeping it as
+    // a special case.
+    BOOLEAN suppressingTyping = FALSE;
     {
         LONGLONG suppressUntil = InterlockedCompareExchange64(
             &pCtx->TypingSuppressUntil, 0, 0);
+        suppressingTyping = (suppressUntil > Now.QuadPart);
 
-        if (suppressUntil > Now.QuadPart) {
-            if (AmtHotPathTraceGate(pCtx, Now.QuadPart)) {
-                TraceEvents(TRACE_LEVEL_VERBOSE, TRACE_INPUT,
-                    "%!FUNC! Typing suppression active");
-            }
-
-            if (buttonSnapshot)
-                Report.IsButtonClicked = TRUE;
-
-            UCHAR liftCount = 0;
-            AmtDrainOverflow(pCtx, &Report, &liftCount);
-
-            for (i = 0; i < PTP_MAX_CONTACT_POINTS; i++) {
-                if (pCtx->Tracks[i].State != TRACK_ACTIVE) continue;
-
-                ULONG  oldId; USHORT oldX, oldY;
-                AmtTrackKill(pCtx->Tracks, i, &oldId, &oldX, &oldY);
-                AmtRecordSlotLift(pCtx, i, Now.QuadPart, oldX, oldY);
-
-                AmtEmitLift(pCtx, &Report, &liftCount, oldId, oldX, oldY);
-            }
-            Report.ContactCount = liftCount;
-
-            // Pad empty during suppression — close gesture session.
-            pCtx->GestureSessionActive = FALSE;
-
-            AmtTrackCheckInvariants(pCtx->Tracks);
-            AmtReportCheckInvariants(&Report);
-
-            Status = WdfMemoryCopyFromBuffer(
-                RequestMemory, 0, (PVOID)&Report, sizeof(PTP_REPORT));
-            WdfRequestSetInformation(Request, sizeof(PTP_REPORT));
-            WdfRequestComplete(Request, NT_SUCCESS(Status) ? STATUS_SUCCESS : Status);
-            return;
+        if (suppressingTyping && AmtHotPathTraceGate(pCtx, Now.QuadPart)) {
+            TraceEvents(TRACE_LEVEL_VERBOSE, TRACE_INPUT,
+                "%!FUNC! Typing suppression active");
         }
     }
 
-    raw_n = (NumBytesTransferred - headerSize) / fingerSize;
-    UCHAR* f_base = TouchBuffer + headerSize + pCtx->DeviceInfo->tp_delta;
+    // ---- 2. RawFrame construction (InputAdapter - no decisions) ----
+    RAW_FRAME rawFrame;
+    RtlZeroMemory(&rawFrame, sizeof(rawFrame));
+    rawFrame.TimestampQpc = Now.QuadPart;
 
-    UCHAR contactCount = 0;
-
-    // Drain deferred lift-offs from previous frame.
-    AmtDrainOverflow(pCtx, &Report, &contactCount);
-
-    if (pCtx->PtpReportTouch)
-    {
+    if (pCtx->PtpReportTouch && !suppressingTyping) {
+        raw_n = (NumBytesTransferred - headerSize) / fingerSize;
         if (raw_n > PTP_MAX_CONTACT_POINTS) raw_n = PTP_MAX_CONTACT_POINTS;
 
         if (raw_n * fingerSize > (NumBytesTransferred - headerSize)) {
@@ -294,173 +229,19 @@ AmtPtpEvtUsbInterruptPipeReadComplete(
             return;
         }
 
-        // L1 — Parse. Pure decode, no mutation. Delegated to Match.c.
-        MATCH_SAMPLE samples[PTP_MAX_CONTACT_POINTS];
-        BOOLEAN      largePalm = FALSE;
-
-        AmtMatchParseFrame(f_base, fingerSize, raw_n, pCtx->DeviceInfo,
-                           pCtx->Tracks, samples, &largePalm);
-
-        BOOLEAN palmFullyCleared = FALSE;
-
-        if (largePalm) {
-            pCtx->PalmDetected = TRUE;
-        } else if (pCtx->PalmDetected) {
-            BOOLEAN anyContact = FALSE;
-            for (i = 0; i < raw_n; i++) {
-                if (samples[i].Present || samples[i].PalmLocal) {
-                    anyContact = TRUE;
-                    break;
-                }
-            }
-            if (!anyContact) {
-                pCtx->PalmDetected = FALSE;
-                palmFullyCleared   = TRUE;
-                // Pad cleared after palm — Phase A lifts all tracks.
-            } else {
-                // Still palm-adjacent — suppress all samples.
-                for (i = 0; i < PTP_MAX_CONTACT_POINTS; i++)
-                    samples[i].Present = FALSE;
-            }
-        }
-
-        // L1.5 — Match. CONTINUES vs NEW_IDENTITY. No mutation.
-        MATCH_VERDICT verdicts[PTP_MAX_CONTACT_POINTS];
-        AmtMatchFrame(samples, raw_n, pCtx->Tracks, verdicts);
-
-        // Session gesture FSM — no per-track mutation.
-        // aliveCount==0 -> FALSE, >=2 -> TRUE, ==1 -> unchanged.
-        // Computed from samples[] (same source Phase A uses), so never stale.
-        UCHAR aliveCount = 0;
-        for (i = 0; i < raw_n; i++) {
-            if (samples[i].Present && !samples[i].PalmLocal)
-                aliveCount++;
-        }
-
-        if (aliveCount == 0) {
-            pCtx->GestureSessionActive = FALSE;
-        } else if (aliveCount >= 2) {
-            pCtx->GestureSessionActive = TRUE;
-        }
-
-        BOOLEAN gestureThisFrame = (aliveCount >= 2);
-
-        // Phase A — Lift, no exceptions. Transition out tracks that
-        // should not remain ACTIVE before Phase B. Gesture-tainted
-        // routes through GRACE; others via Kill. Captures SlotLastLift*.
-        UNREFERENCED_PARAMETER(palmFullyCleared); // handled by Phase A
-        for (i = 0; i < PTP_MAX_CONTACT_POINTS; i++) {
-            if (pCtx->Tracks[i].State != TRACK_ACTIVE)
-                continue;
-
-            BOOLEAN slotHasFinger =
-                (i < raw_n) && samples[i].Present && !samples[i].PalmLocal;
-            BOOLEAN newIdentity =
-                (i < raw_n) && slotHasFinger && (verdicts[i] == MATCH_NEW_IDENTITY);
-
-            if (slotHasFinger && !newIdentity)
-                continue; // continues to Phase C
-
-            ULONG  oldId; USHORT oldX, oldY;
-
-            if (pCtx->Tracks[i].WasInGesture) {
-                AmtTrackEnterGrace(pCtx->Tracks, i, Now.QuadPart,
-                                  &oldId, &oldX, &oldY);
-                AmtTrackExpireGrace(pCtx->Tracks, i);
-            } else {
-                AmtTrackKill(pCtx->Tracks, i, &oldId, &oldX, &oldY);
-            }
-
-            AmtRecordSlotLift(pCtx, i, Now.QuadPart, oldX, oldY);
-            AmtEmitLift(pCtx, &Report, &contactCount, oldId, oldX, oldY);
-
-            if (AmtHotPathTraceGate(pCtx, Now.QuadPart)) {
-                TraceEvents(TRACE_LEVEL_VERBOSE, TRACE_INPUT,
-                    "%!FUNC! slot %llu: lift-off (newIdentity=%d)",
-                    (ULONG64)i, (int)newIdentity);
-            }
-        }
-
-        AmtTrackCheckInvariants(pCtx->Tracks);
-
-        // Phase B — Birth. Birth new tracks on slots with Present
-        // samples and no ACTIVE track. Uses retap smoothing when
-        // recent-lift memory indicates fast re-tap. Disables retap
-        // smoothing for same-frame NEW_IDENTITY (different finger).
-        for (i = 0; i < raw_n; i++) {
-            if (!samples[i].Present || samples[i].PalmLocal)
-                continue;
-            if (pCtx->Tracks[i].State == TRACK_ACTIVE)
-                continue; // handled in Phase C
-
-            BOOLEAN sameFrameNewIdentity =
-                (verdicts[i] == MATCH_NEW_IDENTITY);
-
-            BOOLEAN looksLikeRetap =
-                !sameFrameNewIdentity &&
-                AmtTrackIsRecentLiftNearby(
-                    pCtx->SlotLastLiftQpc[i], pCtx->SlotLastLiftX[i], pCtx->SlotLastLiftY[i],
-                    Now.QuadPart, pCtx->PerfFrequency.QuadPart, samples[i].X, samples[i].Y);
-
-            if (looksLikeRetap) {
-                AmtTrackBirthWithRetapSmoothing(
-                    pCtx->Tracks, i, &pCtx->NextContactId,
-                    pCtx->SlotLastLiftX[i], pCtx->SlotLastLiftY[i]);
-            } else {
-                AmtTrackBirth(pCtx->Tracks, i, &pCtx->NextContactId,
-                             samples[i].X, samples[i].Y);
-            }
-
-            if (gestureThisFrame) {
-                // Born into multi-finger frame — mark gesture-tainted.
-                pCtx->Tracks[i].WasInGesture = TRUE;
-            }
-
-            if (AmtHotPathTraceGate(pCtx, Now.QuadPart)) {
-                TraceEvents(TRACE_LEVEL_VERBOSE, TRACE_INPUT,
-                    "%!FUNC! slot %llu: birth, new ContactID=%u x=%u y=%u retapSmoothed=%d",
-                    (ULONG64)i, pCtx->Tracks[i].ContactID,
-                    samples[i].X, samples[i].Y, (int)looksLikeRetap);
-            }
-        }
-
-        AmtTrackCheckInvariants(pCtx->Tracks);
-
-        // Phase C — Update / Report. Update each ACTIVE track once.
-        for (i = 0; i < raw_n; i++) {
-            if (pCtx->Tracks[i].State != TRACK_ACTIVE)
-                continue;
-            if (!samples[i].Present || samples[i].PalmLocal)
-                continue; // unreachable post A/B
-
-            if (gestureThisFrame) {
-                pCtx->Tracks[i].WasInGesture = TRUE;
-            }
-
-            USHORT repX, repY;
-            AmtTrackUpdate(&pCtx->Tracks[i], samples[i].X, samples[i].Y,
-                          (BOOLEAN)(aliveCount == 1), &repX, &repY);
-
-            if (contactCount < PTP_MAX_CONTACT_POINTS) {
-                Report.Contacts[contactCount].ContactID  = pCtx->Tracks[i].ContactID;
-                Report.Contacts[contactCount].X          = repX;
-                Report.Contacts[contactCount].Y          = repY;
-                Report.Contacts[contactCount].TipSwitch  = 1;
-                // TipDropApplied -> Confidence=0 (position carried over
-                // from debounce, not measured this frame).
-                Report.Contacts[contactCount].Confidence =
-                    (samples[i].TipDropApplied > 0) ? 0 : 1;
-                contactCount++;
-                pCtx->Tracks[i].ReportedLastFrame = TRUE;
-            }
-        }
-
-        AmtTrackCheckInvariants(pCtx->Tracks);
-
-        Report.ContactCount = contactCount;
-    } else {
-        Report.ContactCount = contactCount;
+        UCHAR* f_base = TouchBuffer + headerSize + pCtx->DeviceInfo->tp_delta;
+        AmtInputParseFrame(f_base, fingerSize, raw_n, pCtx->DeviceInfo,
+                           Now.QuadPart, &rawFrame);
     }
+    // else: empty RawFrame (suppressingTyping, or touch reporting off) -
+    // PTPCore_ProcessFrame naturally lifts every active contact.
+
+    // ---- 3. PTPCore: the single orchestration entry point ----
+    PTP_CORE_FRAME coreFrame;
+    PTPCore_ProcessFrame(pCtx, &rawFrame, Now.QuadPart, &coreFrame);
+
+    // ---- 4. Serialize into PTP_REPORT ----
+    AmtSerializeCoreFrameToReport(&coreFrame, &Report);
 
     if (buttonSnapshot) {
         Report.IsButtonClicked = TRUE;

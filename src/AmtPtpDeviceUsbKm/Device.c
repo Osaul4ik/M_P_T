@@ -18,7 +18,7 @@ AmtPtpKeyboardNotifyCallback(
 
 // AmtPtpGetDeviceConfig
 //
-// AUDIT FIX (#7): takes the descriptor by pointer instead of by value —
+// AUDIT FIX (#7): takes the descriptor by pointer instead of by value -
 // avoids an unnecessary full-struct copy onto the stack on every call.
 
 _IRQL_requires_(PASSIVE_LEVEL)
@@ -176,21 +176,18 @@ AmtPtpEvtDeviceD0Entry(
     pDeviceContext->LastReportTime =
         KeQueryPerformanceCounter(&pDeviceContext->PerfFrequency);
 
-    // Reseed ContactID counter and reset all tracks to DEAD on D0Entry.
+    // Reseed ContactID counter and reset the contact pool on D0Entry.
     // Prevents stale ContactIDs from surviving sleep/wake cycles.
     // NextContactId=0 reserved; first birth pre-increments to 1.
     pDeviceContext->NextContactId        = 0;
-    pDeviceContext->GestureSessionActive = FALSE;
+    AmtGestureSessionInit(&pDeviceContext->GestureSession);
     pDeviceContext->LastHotPathTraceQpc  = 0;
     pDeviceContext->OverflowCount        = 0;
-    AmtTrackPoolInit(pDeviceContext->Tracks);
+    AmtContactPoolInit(pDeviceContext->ActiveContacts);
 
-    // Zero SlotLastLift* on D0Entry to prevent stale retap-smoothing
-    // hints from a previous power session. SlotLastLiftQpc==0 is the
-    // "no recent lift" sentinel.
-    RtlZeroMemory(pDeviceContext->SlotLastLiftQpc, sizeof(pDeviceContext->SlotLastLiftQpc));
-    RtlZeroMemory(pDeviceContext->SlotLastLiftX,   sizeof(pDeviceContext->SlotLastLiftX));
-    RtlZeroMemory(pDeviceContext->SlotLastLiftY,   sizeof(pDeviceContext->SlotLastLiftY));
+    // Zero RecentLifts on D0Entry to prevent stale retap-smoothing
+    // hints from a previous power session.
+    RtlZeroMemory(&pDeviceContext->RecentLifts, sizeof(pDeviceContext->RecentLifts));
 
     status = AmtPtpSetWellspringMode(pDeviceContext, TRUE);
     if (!NT_SUCCESS(status)) {
@@ -400,7 +397,7 @@ cleanup:
 // Keyboard notification / typing suppression
 //
 // AUDIT FIX (#1, CRITICAL): the original implementation called
-// ExCreateCallback()/ExRegisterCallback() — PASSIVE_LEVEL-only APIs —
+// ExCreateCallback()/ExRegisterCallback() - PASSIVE_LEVEL-only APIs -
 // while holding a KSPIN_LOCK, which unconditionally raises IRQL to
 // DISPATCH_LEVEL. That is an IRQL contract violation on every single
 // registration, with a real risk of a bug-check (or, on some build
@@ -461,7 +458,7 @@ AmtPtpKeyboardNotifyCallback(
     InterlockedExchange64(&pCtx->TypingSuppressUntil, suppressUntil);
 
     TraceEvents(TRACE_LEVEL_VERBOSE, TRACE_INPUT,
-        "%!FUNC! Keyboard activity — suppressing touchpad");
+        "%!FUNC! Keyboard activity - suppressing touchpad");
 }
 
 VOID
@@ -482,7 +479,7 @@ AmtPtpRegisterKeyboardNotification(_In_ PDEVICE_CONTEXT DeviceContext)
     InitializeObjectAttributes(&oa, &callbackName,
                                OBJ_CASE_INSENSITIVE | OBJ_PERMANENT, NULL, NULL);
 
-    // AUDIT FIX (#1): ExAcquireFastMutex only raises IRQL to APC_LEVEL —
+    // AUDIT FIX (#1): ExAcquireFastMutex only raises IRQL to APC_LEVEL -
     // safe for the PASSIVE_LEVEL-only ExCreateCallback() calls below,
     // unlike the spinlock previously used here.
     ExAcquireFastMutex(&g_KbdCallbackMutex);
@@ -494,7 +491,7 @@ AmtPtpRegisterKeyboardNotification(_In_ PDEVICE_CONTEXT DeviceContext)
             &g_KbdCallbackObject, &oa, TRUE, TRUE);
         if (!NT_SUCCESS(status)) {
             TraceEvents(TRACE_LEVEL_WARNING, TRACE_DRIVER,
-                "%!FUNC! ExCreateCallback failed %!STATUS! — typing suppression inactive",
+                "%!FUNC! ExCreateCallback failed %!STATUS! - typing suppression inactive",
                 status);
             InterlockedDecrement(&g_KbdCallbackRefCount);
             ExReleaseFastMutex(&g_KbdCallbackMutex);
@@ -522,7 +519,7 @@ AmtPtpRegisterKeyboardNotification(_In_ PDEVICE_CONTEXT DeviceContext)
 
     if (DeviceContext->KbdNotifyHandle == NULL) {
         TraceEvents(TRACE_LEVEL_WARNING, TRACE_DRIVER,
-            "%!FUNC! ExRegisterCallback returned NULL — typing suppression inactive");
+            "%!FUNC! ExRegisterCallback returned NULL - typing suppression inactive");
 
         ExAcquireFastMutex(&g_KbdCallbackMutex);
         if (InterlockedDecrement(&g_KbdCallbackRefCount) == 0) {
@@ -546,7 +543,7 @@ AmtPtpUnregisterKeyboardNotification(_In_ PDEVICE_CONTEXT DeviceContext)
         return;
     }
 
-    // AUDIT FIX (#1): fast mutex instead of spinlock — ObDereferenceObject
+    // AUDIT FIX (#1): fast mutex instead of spinlock - ObDereferenceObject
     // is also not guaranteed-safe at DISPATCH_LEVEL in all configurations,
     // so this path benefits from the same fix.
     ExAcquireFastMutex(&g_KbdCallbackMutex);

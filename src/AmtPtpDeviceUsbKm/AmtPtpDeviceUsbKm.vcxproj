@@ -27,23 +27,31 @@
     </ProjectConfiguration>
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="ActiveContact.c" />
     <ClCompile Include="DebugUtils.c" />
     <ClCompile Include="Device.c" />
     <ClCompile Include="Driver.c" />
+    <ClCompile Include="Gesture.c" />
     <ClCompile Include="Hid.c" />
+    <ClCompile Include="Input.c" />
     <ClCompile Include="Interrupt.c" />
     <ClCompile Include="Match.c" />
+    <ClCompile Include="Palm.c" />
+    <ClCompile Include="PTPCore.c" />
     <ClCompile Include="Queue.c" />
-    <ClCompile Include="Track.c" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="ActiveContact.h" />
     <ClInclude Include="Device.h" />
     <ClInclude Include="Driver.h" />
+    <ClInclude Include="Gesture.h" />
+    <ClInclude Include="Input.h" />
     <ClInclude Include="Match.h" />
+    <ClInclude Include="Palm.h" />
+    <ClInclude Include="PTPCore.h" />
     <ClInclude Include="Public.h" />
     <ClInclude Include="Queue.h" />
     <ClInclude Include="resource.h" />
-    <ClInclude Include="Track.h" />
     <ClInclude Include="Trace.h" />
   </ItemGroup>
   <PropertyGroup Label="Globals">
