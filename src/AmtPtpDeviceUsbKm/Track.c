@@ -1,6 +1,6 @@
 // Track.c - Track FSM implementation. See Track.h for the full design
 // rationale (state machine, frame-determinism rule, why ContactID is
-// monotonic and never reused while warm).
+// monotonic and never reused while warm — TRACK_RETAP_POLICY).
 
 #include "Driver.h"
 #include "Track.h"
@@ -34,7 +34,10 @@ AmtTrackSmoothCoord(_In_ USHORT rawVal, _In_ USHORT prevVal)
 // This is the single choke point through which every ACTIVE track gets
 // its identity, called from exactly two places (AmtTrackBirth, and
 // AmtTrackRecycle via its internal AmtTrackBirth call) — there is no
-// other path in the codebase that may write Track->ContactID.
+// other path in the codebase that may write Track->ContactID. See
+// TRACK_RETAP_POLICY in Track.h: every re-tap, however fast, comes
+// through here and gets a number that has never been seen before, full
+// stop — there is no conditional reuse path anywhere below.
 static inline ULONG
 AmtTrackAssignContactId(_Inout_ ULONG* NextContactId)
 {
@@ -77,6 +80,116 @@ AmtTrackBirth(
     t->ReportedLastFrame  = FALSE;
 }
 
+// FIX (task #2 — raw-snap-on-fast-retap): see the long comment on this
+// function's declaration in Track.h. This is AmtTrackBirth plus exactly
+// one extra thing: the baseline ReportX/Y/HystX/HystY is seeded to the
+// NEW touch-down position (same as AmtTrackBirth — there is still no
+// continuity claim made to Windows, still a brand-new ContactID), but
+// PendingFirstSample is left FALSE instead of TRUE, so the very next
+// AmtTrackUpdate call runs the NORMAL deadzone+EMA path rather than the
+// raw bypass — and that EMA blends against ReportX/Y, which we seed here
+// to the RECENT LIFT position rather than the new touch-down position.
+// The net effect: the first reported sample is a smoothed blend between
+// "where the finger lifted" and "where it just landed", instead of a
+// raw, unsmoothed jump straight to the landing position. No ContactID
+// is reused, no Windows-facing continuity is claimed — purely a local
+// rendering smoothness choice.
+VOID
+AmtTrackBirthWithRetapSmoothing(
+    _Inout_ PTRACK Tracks,
+    _In_    size_t  index,
+    _Inout_ ULONG*  NextContactId,
+    _In_    USHORT  x,
+    _In_    USHORT  y,
+    _In_    USHORT  RecentLiftX,
+    _In_    USHORT  RecentLiftY
+)
+{
+    PTRACK t = &Tracks[index];
+
+#if DBG
+    NT_ASSERT(t->State == TRACK_DEAD);
+#endif
+
+    t->State             = TRACK_ACTIVE;
+    t->ContactID          = AmtTrackAssignContactId(NextContactId);
+    t->ReportX            = RecentLiftX;
+    t->ReportY            = RecentLiftY;
+    t->HystX              = RecentLiftX;
+    t->HystY              = RecentLiftY;
+    t->TipDropCount       = 0;
+    t->WasInGesture       = FALSE;
+    // Deliberately FALSE, not TRUE — see the function-level comment
+    // above. We WANT AmtTrackUpdate's normal deadzone+EMA path to run on
+    // the first real sample, blending from RecentLiftX/Y (just seeded
+    // above) toward the actual new touch-down coordinates handed to
+    // AmtTrackUpdate by the caller.
+    t->PendingFirstSample = FALSE;
+    t->ReportedLastFrame  = FALSE;
+}
+
+BOOLEAN
+AmtTrackIsRecentLiftNearby(
+    _In_ LONGLONG LiftQpc,
+    _In_ USHORT   LiftX,
+    _In_ USHORT   LiftY,
+    _In_ LONGLONG NowQpc,
+    _In_ LONGLONG PerfFrequencyHz,
+    _In_ USHORT   CandX,
+    _In_ USHORT   CandY
+)
+{
+    // LiftQpc == 0 is the documented "no recent lift recorded" sentinel
+    // (see DEVICE_CONTEXT.SlotLastLiftQpc in Device.h) — QPC values are
+    // never legitimately 0 once the device has entered D0.
+    if (LiftQpc == 0)
+        return FALSE;
+
+    if (NowQpc < LiftQpc)
+        return FALSE; // defensive: QPC must be monotonic; never trust a
+                       // negative delta rather than risk a huge unsigned
+                       // wrap if LONGLONG arithmetic assumptions change.
+
+    // FIX (units bug): LiftQpc/NowQpc are raw QPC ticks. Converting the
+    // FIXED window (RETAP_WINDOW_100NS, expressed in 100ns units) into
+    // QPC ticks via PerfFrequencyHz — rather than comparing the raw tick
+    // delta directly against a 100ns-unit constant — is required because
+    // QueryPerformanceFrequency is not architecturally guaranteed to be
+    // exactly 10,000,000 Hz on every platform; comparing raw ticks
+    // against a 100ns-unit constant silently assumed that and would
+    // make this window wrong (by the ratio of actual-Hz to 10MHz) on any
+    // system where it doesn't hold. Mirrors the existing, correct
+    // ticksPer100ns pattern in AmtPtpKeyboardNotifyCallback (Device.c).
+    if (PerfFrequencyHz <= 0)
+        return FALSE; // no usable clock — fail closed to the always-
+                       // correct raw/unsmoothed birth path.
+
+    LONGLONG deltaTicks       = NowQpc - LiftQpc;
+    LONGLONG windowTicks      = (RETAP_WINDOW_100NS * PerfFrequencyHz) / 10000000LL;
+
+    if (deltaTicks > windowTicks)
+        return FALSE;
+
+    INT dx = (INT)CandX - (INT)LiftX;
+    if (dx < 0) dx = -dx;
+    INT dy = (INT)CandY - (INT)LiftY;
+    if (dy < 0) dy = -dy;
+
+    return (dx <= RETAP_MAX_DISTANCE) && (dy <= RETAP_MAX_DISTANCE);
+}
+
+// AUDIT NOTE (task #1, ContactID lifecycle): AmtTrackRecycle is NOT
+// currently called from anywhere in Interrupt.c. Every Phase A
+// transition uses either AmtTrackKill (untainted lift) or
+// AmtTrackEnterGrace+AmtTrackExpireGrace (gesture-tainted lift), and
+// every Phase B transition is AmtTrackBirth/AmtTrackBirthWithRetapSmoothing
+// on a slot Phase A has already guaranteed is TRACK_DEAD this frame.
+// This function is kept as the principled single-call "replace in
+// place" primitive (see its Track.h doc comment) but is presently dead
+// code from Interrupt.c's point of view. It is NOT a hidden reuse path:
+// like every other path, it always calls AmtTrackBirth internally,
+// which always calls AmtTrackAssignContactId — there is no branch in
+// this file that hands out an old ContactID under any condition.
 VOID
 AmtTrackRecycle(
     _Inout_  PTRACK  Tracks,
@@ -131,6 +244,19 @@ AmtTrackKill(
     *OldX         = t->ReportX;
     *OldY         = t->ReportY;
 
+    // FIX (task #1 invariant: "ніколи не перевикористовувати slot якщо
+    // ReportedLastFrame=TRUE" without going through a reported lift
+    // first): RtlZeroMemory below resets ReportedLastFrame to FALSE as
+    // part of the full-struct clear, same as every other field. The
+    // slot is only handed back to Phase B (AmtTrackBirth, which asserts
+    // State==TRACK_DEAD) AFTER this completes, and AmtEmitLift in
+    // Interrupt.c is always called with this function's Old* outputs
+    // BEFORE Phase B can run for the same slot in the same frame (see
+    // the Phase A/B/C ordering in Interrupt.c) — so a slot that was
+    // ReportedLastFrame==TRUE always gets its TipSwitch=0 lift-off
+    // queued before it can ever be reborn. There is no path that skips
+    // straight from "reported as down" to "reported as a different
+    // contact" without an intervening TipSwitch=0 frame.
     RtlZeroMemory(t, sizeof(TRACK));   // -> TRACK_DEAD, ContactID cleared
 }
 
@@ -155,30 +281,22 @@ AmtTrackEnterGrace(
     *OldY         = t->ReportY;
 
     // Quarantine rather than fully clear — current policy (see
-    // AmtTrackExpireGrace and the TRACK_RETAP_POLICY note in Track.h)
-    // never actually re-binds a GRACE track to a later retap, so this
-    // state is observable for exactly one instant before the caller
-    // (Interrupt.c) immediately calls AmtTrackExpireGrace on it.
+    // AmtTrackExpireGrace and TRACK_RETAP_POLICY in Track.h) never
+    // actually re-binds a GRACE track to a later retap, so this state is
+    // observable for exactly one instant before the caller (Interrupt.c)
+    // immediately calls AmtTrackExpireGrace on it.
     //
-    // FIX (closing the "retap continuation" question permanently, not
-    // provisionally): a real continuation would mean handing the SAME
-    // ContactID to a later touch-down after this lift-off has already
-    // been reported with TipSwitch=0. That is in direct conflict with
-    // the monotonic-NextContactId invariant in Device.h — "never reuse
-    // an ID while it might still be warm in Windows' contact tracking" —
-    // which exists specifically to kill the cursor-teleport bug this
-    // entire rewrite was built to fix. Reusing an ID across a reported
-    // lift, even a few milliseconds later, reopens exactly that bug
-    // class: Windows would interpret the new touch-down as a
-    // continuation of the just-removed contact and "correct" the
-    // cursor toward the new position instead of treating it as a fresh
-    // press. GRACE therefore stays a pure quarantine, permanently, not
-    // a held reservation — it exists only so a diagnostics/invariant
-    // pass has an explicit state to assert against instead of inferring
-    // "this was a gesture lift" from a side boolean. Any future
-    // continuation feature would need a DIFFERENT signal to Windows
-    // (e.g. a position correlation hint outside ContactID reuse), not
-    // a change to this function.
+    // See TRACK_RETAP_POLICY in Track.h for the full reasoning (task
+    // #5/#6): a real ContactID-reuse continuation across a reported
+    // lift-off is permanently off the table — it reopens the exact
+    // cursor-teleport bug this driver was built to fix, because Windows
+    // would interpret a reused ID at a new position as a correction of
+    // the OLD contact rather than a fresh press. GRACE therefore stays a
+    // pure, same-frame quarantine marker, not a held reservation. The
+    // actual fix for a smooth-feeling fast re-tap is the
+    // PendingFirstSample bypass in AmtTrackUpdate/AmtTrackCommitSample —
+    // a brand-new track's first sample is never smoothed against
+    // anything, new ID or not.
     t->State = TRACK_GRACE;
     UNREFERENCED_PARAMETER(NowQpc);
 }
@@ -213,7 +331,11 @@ AmtTrackEvaluateDeadzone(
     if (dy < 0) dy = -dy;
 
     // "Outside the deadzone" means at least one axis moved far enough
-    // to count as real motion rather than sensor jitter.
+    // to count as real motion rather than sensor jitter. This is PASS 1
+    // of the 2-pass evaluator (task #9) — read-only, compares against
+    // the CURRENT (not-yet-updated-this-frame) HystX/Y baseline. See the
+    // long ordering-correctness comment on
+    // AmtTrackApplyDeadzone2Pass in Track.h.
     return (dx >= XY_DEADZONE_UNITS) || (dy >= XY_DEADZONE_UNITS);
 #else
     UNREFERENCED_PARAMETER(Track);
@@ -255,14 +377,23 @@ AmtTrackCommitSample(
         repX = Track->ReportX;
         repY = Track->ReportY;
     } else {
-        // New information: commit the fresh hysteresis baseline first.
+        // New information: commit the fresh hysteresis baseline first,
+        // BEFORE touching EMA (pass-2 ordering — see
+        // AmtTrackApplyDeadzone2Pass in Track.h for why this order, and
+        // specifically why the EMA call below still blends against the
+        // OLD Track->ReportX/Y rather than the just-written HystX/Y:
+        // HystX/Y is the jitter-rejection baseline, ReportX/Y is the
+        // smoothed value actually shown to Windows, and EMA's whole job
+        // is to blend the OLD shown value toward the NEW raw candidate).
         Track->HystX = candX;
         Track->HystY = candY;
 
         // Skip EMA blending entirely on:
         //   - the very first sample of a brand-new baseline
         //     (PendingFirstSample) — there is no prior ReportX/Y worth
-        //     blending against, and
+        //     blending against, and this is also what makes a post-
+        //     gesture re-tap land cleanly without ever needing to reuse
+        //     a ContactID (see TRACK_RETAP_POLICY in Track.h), or
         //   - the first SOLO-finger sample immediately after this track
         //     was part of a multi-finger gesture (WasInGesture &&
         //     aliveCountIsOne) — blending here would pull the cursor
@@ -274,21 +405,25 @@ AmtTrackCommitSample(
             repX = candX;
             repY = candY;
 
-            // FIX (one-shot taint consumed without firing): this used to
-            // live UNCONDITIONALLY after the if/else below, keyed only on
-            // (WasInGesture && aliveCountIsOne) — not on whether skipEma
-            // actually ran. That meant a low-velocity first post-gesture
-            // solo sample that FAILS the deadzone test (passedDeadzone ==
-            // FALSE, handled in the sibling branch above, which just holds
-            // ReportX/Y and never reaches here) would still have
-            // WasInGesture cleared by the old unconditional check below,
-            // having never actually received the skip-EMA treatment. The
-            // NEXT frame — the first one to clear the deadzone — would
-            // then blend via the normal EMA path against the still-stale
-            // multi-finger-era ReportX/Y, reopening exactly the
-            // post-gesture cursor-jump class this flag exists to prevent.
-            // The taint must only be consumed at the moment it is
-            // actually spent.
+            // FIX (task #2 — the actual remaining jump root cause): the
+            // taint must be consumed at the moment it is actually spent,
+            // and "spent" must be evaluated against THIS FRAME's
+            // aliveCountIsOne — including the exact frame a gesture
+            // partner finger lifts and drops the alive count from >=2 to
+            // 1. The caller (Interrupt.c Phase C) computes
+            // aliveCountIsOne from the alive count AFTER Phase A's
+            // lift-offs have already been applied for this same frame,
+            // not a value cached from before the lift — see the
+            // aliveCount computation in Interrupt.c. That is what closes
+            // the original gap: previously a one-frame-stale alive count
+            // could let a tainted track take one more (unsmoothed-skip-
+            // missing) EMA-blended frame against its stale multi-finger
+            // baseline before the skip actually fired, which is exactly
+            // the visible "tap after gesture -> jump" symptom task #2
+            // described. With the count current as of THIS frame, the
+            // skip fires on the correct frame, every time, and is
+            // consumed here so it cannot fire again on a later frame
+            // against an already-corrected baseline.
             if (Track->WasInGesture && aliveCountIsOne) {
                 Track->WasInGesture = FALSE;
             }
@@ -348,6 +483,7 @@ AmtTrackCheckInvariants(_In_reads_(PTP_MAX_CONTACT_POINTS) const TRACK* Tracks)
         if (t->State == TRACK_DEAD) {
             NT_ASSERT(!t->PendingFirstSample);
             NT_ASSERT(!t->WasInGesture);
+            NT_ASSERT(t->ContactID == 0);
             continue;
         }
 

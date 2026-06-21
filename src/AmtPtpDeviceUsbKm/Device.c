@@ -190,6 +190,25 @@ AmtPtpEvtDeviceD0Entry(
     pDeviceContext->OverflowCount        = 0;
     AmtTrackPoolInit(pDeviceContext->Tracks);
 
+    // FIX (task #2 retap-smoothing consistency): SlotLastLift{Qpc,X,Y}
+    // (see Device.h / Interrupt.c's AmtRecordSlotLift) is position-only
+    // memory used purely as a smoothing hint for a fast re-tap — it
+    // never feeds ContactID assignment, so leaving it stale across a
+    // power transition could not reopen the cursor-teleport class of
+    // bug. But it COULD, in principle, cause an extremely unlikely
+    // false-positive "looks like a retap" smoothing decision against a
+    // touch position from a completely different session (pre-sleep)
+    // matched purely by coincidence against a post-wake touch-down in
+    // the same raw slot. SlotLastLiftQpc==0 is the documented sentinel
+    // for "no recent lift" (see AmtTrackIsRecentLiftNearby in Track.c)
+    // — explicitly zeroing it here, every D0Entry, removes that
+    // possibility entirely rather than relying on QPC values from two
+    // different power sessions never accidentally landing within
+    // RETAP_WINDOW_100NS of each other.
+    RtlZeroMemory(pDeviceContext->SlotLastLiftQpc, sizeof(pDeviceContext->SlotLastLiftQpc));
+    RtlZeroMemory(pDeviceContext->SlotLastLiftX,   sizeof(pDeviceContext->SlotLastLiftX));
+    RtlZeroMemory(pDeviceContext->SlotLastLiftY,   sizeof(pDeviceContext->SlotLastLiftY));
+
     status = AmtPtpSetWellspringMode(pDeviceContext, TRUE);
     if (!NT_SUCCESS(status)) {
         TraceEvents(TRACE_LEVEL_WARNING, TRACE_DRIVER,

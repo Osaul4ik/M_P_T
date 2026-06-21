@@ -120,6 +120,29 @@ typedef struct _DEVICE_CONTEXT
     USHORT OverflowY[PTP_MAX_CONTACT_POINTS];
     UCHAR  OverflowCount;
 
+    // ---------------------------------------------------------------
+    // FIX (task #2 — raw-snap-on-fast-retap) — per-slot "recent lift"
+    // memory, used ONLY to seed a smoothing anchor for
+    // AmtTrackBirthWithRetapSmoothing (see Track.h/Track.c). Captured
+    // from AmtTrackKill/AmtTrackEnterGrace's Old* out-parameters at the
+    // moment a track is lifted, indexed by the SAME raw slot index the
+    // track occupied. Deliberately NOT part of TRACK — TRACK is fully
+    // zeroed on every kill/grace-expire transition (see the frame-
+    // determinism rule in Track.h), and this memory must specifically
+    // SURVIVE that zeroing so a later birth on the same slot can still
+    // see where the previous occupant lifted from.
+    //
+    // This is position-only memory. It never feeds ContactID assignment
+    // and never causes a re-tap to claim continuity with the lifted
+    // contact — see TRACK_RETAP_POLICY in Track.h. SlotLastLiftQpc==0
+    // is the "no recent lift" sentinel (see AmtTrackIsRecentLiftNearby),
+    // and is the natural state after AmtTrackPoolInit/D0Entry zero the
+    // whole DEVICE_CONTEXT — no separate reset code is required for it.
+    // ---------------------------------------------------------------
+    LONGLONG SlotLastLiftQpc[PTP_MAX_CONTACT_POINTS];
+    USHORT   SlotLastLiftX[PTP_MAX_CONTACT_POINTS];
+    USHORT   SlotLastLiftY[PTP_MAX_CONTACT_POINTS];
+
 } DEVICE_CONTEXT, *PDEVICE_CONTEXT;
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(DEVICE_CONTEXT, DeviceGetContext)
