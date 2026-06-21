@@ -12,6 +12,7 @@
 
 #include "Driver.h"
 #include "PTPCore.h"
+#include "PTPCore.tmh"
 #include "ActiveContact.h"
 #include "Match.h"
 #include "Gesture.h"
