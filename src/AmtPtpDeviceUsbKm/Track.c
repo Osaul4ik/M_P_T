@@ -83,24 +83,24 @@ AmtTrackBirth(
 // FIX (task #2 — raw-snap-on-fast-retap): see the long comment on this
 // function's declaration in Track.h. This is AmtTrackBirth plus exactly
 // one extra thing: the baseline ReportX/Y/HystX/HystY is seeded to the
-// NEW touch-down position (same as AmtTrackBirth — there is still no
-// continuity claim made to Windows, still a brand-new ContactID), but
+// RECENT LIFT position rather than the new touch-down position, and
 // PendingFirstSample is left FALSE instead of TRUE, so the very next
-// AmtTrackUpdate call runs the NORMAL deadzone+EMA path rather than the
-// raw bypass — and that EMA blends against ReportX/Y, which we seed here
-// to the RECENT LIFT position rather than the new touch-down position.
-// The net effect: the first reported sample is a smoothed blend between
-// "where the finger lifted" and "where it just landed", instead of a
-// raw, unsmoothed jump straight to the landing position. No ContactID
-// is reused, no Windows-facing continuity is claimed — purely a local
-// rendering smoothness choice.
+// AmtTrackUpdate call (Phase C, same frame, called by the caller
+// immediately afterward — see Interrupt.c) runs the NORMAL deadzone+EMA
+// path rather than the raw bypass, blending from this seeded anchor
+// toward the real touch-down coordinates passed to THAT call. The net
+// effect: the first reported sample is a smoothed blend between "where
+// the finger lifted" and "where it just landed", instead of a raw,
+// unsmoothed jump straight to the landing position. No ContactID is
+// reused, no Windows-facing continuity is claimed — purely a local
+// rendering smoothness choice. This function deliberately does not take
+// the new touch-down (x, y) itself — it has no use for it, since
+// AmtTrackUpdate is what writes the real position, immediately after.
 VOID
 AmtTrackBirthWithRetapSmoothing(
     _Inout_ PTRACK Tracks,
     _In_    size_t  index,
     _Inout_ ULONG*  NextContactId,
-    _In_    USHORT  x,
-    _In_    USHORT  y,
     _In_    USHORT  RecentLiftX,
     _In_    USHORT  RecentLiftY
 )

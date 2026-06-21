@@ -1,5 +1,4 @@
 // Match.c - L1 frame parsing and raw-slot -> Track matching.
-// See Match.h for the responsibility split this enforces.
 
 #include "Driver.h"
 #include "Match.h"
@@ -9,15 +8,9 @@
 #define TIP_DROP_DEBOUNCE_FRAMES 2
 #define TIP_DROP_MAX_REPOSITION_DELTA 300
 
-// FIX (spatial sanity check on continuation - see the long comment on
-// AmtMatchFrame in Match.h): 4000 normalized units is ~20% of this
-// hardware's full coordinate range (device x-range is ~20000 units, see
-// AppleDefinition.h). At the USB polling rate this driver runs at, no
-// real finger crosses 20% of the pad's width in a single frame even
-// during a fast swipe - this threshold exists to catch an implausible
-// teleport (a different finger's position appearing under a track that
-// firmware did NOT flag as reindexed), not to constrain normal motion.
-// Deliberately generous so it can never misfire on legitimate input.
+// Spatial sanity threshold: ~20% of pad width (~20000 units). No real
+// finger teleports this far in one USB polling interval. Deliberately
+// generous to avoid misfiring on legitimate fast motion.
 #define MATCH_MAX_CONTINUATION_DELTA 4000
 
 static inline INT
@@ -105,9 +98,7 @@ AmtMatchParseFrame(
         Samples[i].IdentityBreak = (f->origin == 0);
 
         if (major <= 0 && minor <= 0) {
-            // No contact at all this frame - tip-drop debounce never
-            // applies here (that's for borderline-small-but-present
-            // contacts, not absent ones).
+            // No contact — tip-drop debounce doesn't apply.
             continue;
         }
 
@@ -121,8 +112,7 @@ AmtMatchParseFrame(
 
         if (palm == PALM_LARGE) {
             *LargePalmDetected = TRUE;
-            // Caller blanks the whole pad on large-palm; no point
-            // continuing to parse the rest of this frame's slots.
+            // Large palm — caller blanks the whole pad.
             for (size_t j = 0; j < PTP_MAX_CONTACT_POINTS; j++) {
                 RtlZeroMemory(&Samples[j], sizeof(MATCH_SAMPLE));
             }
@@ -137,11 +127,8 @@ AmtMatchParseFrame(
         BOOLEAN tip = (major << 1) >= 200 || (minor << 1) >= 150;
 
         if (!tip) {
-            // Borderline-small contact. Tip-drop debounce: if this track
-            // is currently ACTIVE and the candidate position is close to
-            // its last reported position, keep it alive on that last
-            // position for a short number of frames rather than treating
-            // a single weak sample as a lift-off.
+            // Tip-drop debounce: keep ACTIVE track alive on last known
+            // position for a few frames if the new sample is borderline.
             const TRACK* t = &Tracks[i];
 
             if (t->State == TRACK_ACTIVE) {
@@ -163,8 +150,7 @@ AmtMatchParseFrame(
                     continue;
                 }
             }
-            // Debounce window exhausted (or track wasn't active): treat
-            // as genuinely absent this frame.
+            // Debounce exhausted or track inactive — treat as absent.
             continue;
         }
 
@@ -181,15 +167,8 @@ AmtMatchFrame(
     _In_reads_(PTP_MAX_CONTACT_POINTS) const TRACK*         Tracks,
     _Out_writes_(PTP_MAX_CONTACT_POINTS) MATCH_VERDICT*      Verdicts)
 {
-    // See the long comment in Match.h: matching is by raw slot index in
-    // the current hardware model (the firmware already guarantees index
-    // stability except where it explicitly signals a break via
-    // origin==0, OR where the spatial sanity check below catches an
-    // undetected one). O(N) single pass, N <= PTP_MAX_CONTACT_POINTS ==
-    // 5 - no O(N^2) search and no grid/partition structure needed at
-    // this scale; this function exists as the single, isolated place
-    // that decision is made, per the L1/matching/gesture separation this
-    // header establishes.
+    // O(N) single pass by raw slot index. Firmware guarantees index
+    // stability except where origin==0 or spatial sanity check fires.
     for (size_t i = 0; i < PTP_MAX_CONTACT_POINTS; i++) {
         Verdicts[i] = MATCH_CONTINUES;
     }
@@ -206,16 +185,11 @@ AmtMatchFrame(
         BOOLEAN identityChanged;
 
         if (Samples[i].IdentityBreak) {
-            // Authoritative signal straight from firmware: this index
-            // now belongs to a different physical finger.
+            // Firmware says this index now belongs to a different finger.
             identityChanged = TRUE;
         } else {
-            // FIX (spatial sanity / defense-in-depth - see Match.h):
-            // origin != 0 claims continuity, but verify it's physically
-            // plausible against the track's last REPORTED position
-            // before trusting it. Compared against ReportX/Y (the
-            // post-EMA value Windows last saw), not HystX/Y, since that
-            // is what a real teleport would visibly jump away from.
+            // Spatial sanity: verify continuity is physically plausible
+            // against last ReportX/Y (post-EMA, what Windows last saw).
             INT dx = (INT)Samples[i].X - (INT)Tracks[i].ReportX;
             if (dx < 0) dx = -dx;
             INT dy = (INT)Samples[i].Y - (INT)Tracks[i].ReportY;

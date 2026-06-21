@@ -173,38 +173,18 @@ AmtPtpEvtDeviceD0Entry(
     pDeviceContext->LastReportTime =
         KeQueryPerformanceCounter(&pDeviceContext->PerfFrequency);
 
-    // FIX (cursor-jump after gesture + re-tap), revised — see the long
-    // comment on AmtTrackAssignContactId() in Track.c for the full story.
-    //
-    // Reseed the monotonic ContactID counter AND reset every track to
-    // TRACK_DEAD on every D0Entry (cold boot AND resume-from-sleep) so a
-    // track can never replay a ContactID value Windows might still
-    // consider "warm" from before a sleep/wake cycle, and so no track
-    // carries over stale ACTIVE/GRACE state across a power transition.
-    // NextContactId starts at 0; AmtTrackBirth's first call pre-increments
-    // it to 1, so 0 stays permanently reserved/unassigned (see the
-    // invariant check in Track.c).
+    // Reseed ContactID counter and reset all tracks to DEAD on D0Entry.
+    // Prevents stale ContactIDs from surviving sleep/wake cycles.
+    // NextContactId=0 reserved; first birth pre-increments to 1.
     pDeviceContext->NextContactId        = 0;
     pDeviceContext->GestureSessionActive = FALSE;
     pDeviceContext->LastHotPathTraceQpc  = 0;
     pDeviceContext->OverflowCount        = 0;
     AmtTrackPoolInit(pDeviceContext->Tracks);
 
-    // FIX (task #2 retap-smoothing consistency): SlotLastLift{Qpc,X,Y}
-    // (see Device.h / Interrupt.c's AmtRecordSlotLift) is position-only
-    // memory used purely as a smoothing hint for a fast re-tap — it
-    // never feeds ContactID assignment, so leaving it stale across a
-    // power transition could not reopen the cursor-teleport class of
-    // bug. But it COULD, in principle, cause an extremely unlikely
-    // false-positive "looks like a retap" smoothing decision against a
-    // touch position from a completely different session (pre-sleep)
-    // matched purely by coincidence against a post-wake touch-down in
-    // the same raw slot. SlotLastLiftQpc==0 is the documented sentinel
-    // for "no recent lift" (see AmtTrackIsRecentLiftNearby in Track.c)
-    // — explicitly zeroing it here, every D0Entry, removes that
-    // possibility entirely rather than relying on QPC values from two
-    // different power sessions never accidentally landing within
-    // RETAP_WINDOW_100NS of each other.
+    // Zero SlotLastLift* on D0Entry to prevent stale retap-smoothing
+    // hints from a previous power session. SlotLastLiftQpc==0 is the
+    // "no recent lift" sentinel.
     RtlZeroMemory(pDeviceContext->SlotLastLiftQpc, sizeof(pDeviceContext->SlotLastLiftQpc));
     RtlZeroMemory(pDeviceContext->SlotLastLiftX,   sizeof(pDeviceContext->SlotLastLiftX));
     RtlZeroMemory(pDeviceContext->SlotLastLiftY,   sizeof(pDeviceContext->SlotLastLiftY));

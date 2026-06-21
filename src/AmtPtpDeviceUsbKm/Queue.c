@@ -11,8 +11,7 @@ NTSTATUS
 AmtPtpDeviceUsbKmQueueInitialize(
     _In_ WDFDEVICE Device
     )
-// Configures I/O dispatch callbacks and creates a default parallel queue
-// plus a manual queue for touch read requests.
+// Creates default parallel queue and manual queue for touch reads.
 {
     WDFQUEUE queue;
     NTSTATUS status;
@@ -23,7 +22,7 @@ AmtPtpDeviceUsbKmQueueInitialize(
 
 	pDeviceContext = DeviceGetContext(Device);
     
-    // Configure a default queue for non-forwarded requests.
+    // Default queue for non-forwarded requests.
     WDF_IO_QUEUE_CONFIG_INIT_DEFAULT_QUEUE(&queueConfig, WdfIoQueueDispatchParallel);
 
     queueConfig.EvtIoInternalDeviceControl = AmtPtpDeviceUsbKmEvtIoDeviceControl;
@@ -41,7 +40,7 @@ AmtPtpDeviceUsbKmQueueInitialize(
         return status;
     }
 
-	// Create secondary manual queue for touch read requests.
+	// Manual queue for touch read requests.
 	WDF_IO_QUEUE_CONFIG_INIT(&queueConfig, WdfIoQueueDispatchManual);
 	queueConfig.PowerManaged = WdfFalse;
 
@@ -71,7 +70,7 @@ AmtPtpDeviceUsbKmEvtIoDeviceControl(
     _In_ size_t InputBufferLength,
     _In_ ULONG IoControlCode
     )
-// Called on IRP_MJ_DEVICE_CONTROL. Dispatches HID IOCTLs to handler functions.
+// Dispatches HID IOCTLs to handler functions.
 {
 	NTSTATUS status;
 	WDFDEVICE device = WdfIoQueueGetDevice(Queue);
@@ -163,7 +162,6 @@ AmtPtpDeviceUsbKmEvtIoStop(
     _In_ ULONG ActionFlags
 )
 // Called before device leaves D0 for power-managed queues.
-// Completes, cancels, or postpones the I/O request as appropriate.
 {
     TraceEvents(TRACE_LEVEL_INFORMATION, 
                 TRACE_QUEUE, 

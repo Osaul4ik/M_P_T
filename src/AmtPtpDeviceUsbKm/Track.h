@@ -257,8 +257,8 @@ AmtTrackBirth(
 // AmtTrackBirthWithRetapSmoothing - identical to AmtTrackBirth (still
 // assigns a brand-new, never-before-used ContactID — see
 // TRACK_RETAP_POLICY; this does NOT relax that invariant in any way),
-// except the very first reported sample is smoothed against a caller-
-// supplied "recent lift" position instead of being reported raw.
+// except the baseline is seeded from a "recent lift" position instead
+// of the new touch-down position, and PendingFirstSample is left FALSE.
 //
 // FIX (task #2 — raw-snap-on-fast-retap, the actual remaining jump
 // source): AmtTrackBirth's PendingFirstSample bypass is correct for an
@@ -274,17 +274,24 @@ AmtTrackBirth(
 // sample a smoothing anchor when, and only when, the caller has
 // determined (via AmtTrackIsRecentLiftNearby below) that this looks
 // like a continuation gesture in the human sense, not the protocol
-// sense. RecentLiftX/Y is what that anchor blends against, exactly once,
-// on the first sample only — PendingFirstSample is still cleared
-// afterward and every subsequent sample goes through the normal
-// deadzone+EMA path against the now-established ReportX/Y.
+// sense.
+//
+// This function does NOT take the new touch-down (x, y) — only the
+// RecentLiftX/Y anchor. It seeds ReportX/Y/HystX/Y to that anchor and
+// clears PendingFirstSample, so the caller's IMMEDIATE follow-up call
+// to AmtTrackUpdate (Phase C, same frame — see Interrupt.c) is what
+// actually applies the real touch-down coordinates, through the normal
+// deadzone+EMA path, blending from this seeded anchor toward them. A
+// previous revision accepted (x, y) here without using them (the
+// function never had a reason to write them directly — AmtTrackUpdate
+// always does that immediately afterward), which is also exactly the
+// kind of redundant parameter the L3-read-only / single-mutation-path
+// contract in this header is meant to prevent.
 VOID
 AmtTrackBirthWithRetapSmoothing(
     _Inout_ PTRACK Tracks,
     _In_    size_t  index,
     _Inout_ ULONG*  NextContactId,
-    _In_    USHORT  x,
-    _In_    USHORT  y,
     _In_    USHORT  RecentLiftX,
     _In_    USHORT  RecentLiftY
 );

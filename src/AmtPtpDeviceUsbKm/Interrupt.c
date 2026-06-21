@@ -660,7 +660,6 @@ AmtPtpEvtUsbInterruptPipeReadComplete(
             if (looksLikeRetap) {
                 AmtTrackBirthWithRetapSmoothing(
                     pCtx->Tracks, i, &pCtx->NextContactId,
-                    samples[i].X, samples[i].Y,
                     pCtx->SlotLastLiftX[i], pCtx->SlotLastLiftY[i]);
             } else {
                 AmtTrackBirth(pCtx->Tracks, i, &pCtx->NextContactId,

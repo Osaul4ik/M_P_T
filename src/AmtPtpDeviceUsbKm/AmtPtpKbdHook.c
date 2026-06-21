@@ -1,13 +1,5 @@
-/*
- * AmtPtpKbdHook.c
- *
- * Keyboard upper-filter driver. Fires \Callback\AmtPtpKbdActivity only on
- * key-down events so AmtPtpDeviceUsbKm suppresses touchpad input for 500 ms.
- *
- * Build: separate KMDF project, DriverType=KMDF, Universal.
- * Link: ntstrsafe.lib only.
- * INF: UpperFilters = AmtPtpKbdHook under [DDInstall.HW] for Class=Keyboard.
- */
+// AmtPtpKbdHook.c - Keyboard upper-filter driver. Fires
+// \Callback\AmtPtpKbdActivity on key-down for 500 ms touchpad suppression.
 
 #include <ntddk.h>
 #include <wdf.h>
@@ -40,7 +32,7 @@ DriverEntry(
                            WDF_NO_OBJECT_ATTRIBUTES, &config, WDF_NO_HANDLE);
 }
 
-// KbdHookEvtDeviceContextCleanup — releases the callback object.
+// Releases the callback object.
 
 VOID
 KbdHookEvtDeviceContextCleanup(_In_ WDFOBJECT Device)
@@ -103,7 +95,7 @@ KbdHookEvtDeviceAdd(
     return status;
 }
 
-// KbdHookEvtIoRead — forward read IRP to lower driver.
+// Forward read IRP to lower driver.
 
 VOID
 KbdHookEvtIoRead(
@@ -121,7 +113,7 @@ KbdHookEvtIoRead(
 
     sent = WdfRequestSend(Request, WdfDeviceGetIoTarget(device), WDF_NO_SEND_OPTIONS);
 
-    // FIX: handle WdfRequestSend failure to avoid stalling the keyboard queue.
+    // Handle WdfRequestSend failure to avoid stalling keyboard queue.
     if (!sent) {
         NTSTATUS status = WdfRequestGetStatus(Request);
         TraceEvents(TRACE_LEVEL_ERROR, TRACE_DRIVER,
@@ -130,13 +122,8 @@ KbdHookEvtIoRead(
     }
 }
 
-// KbdHookReadCompletion — fire callback only on key-down events.
-//
-// FIX: original code fired on every read completion including KEY_BREAK and
-// empty reads, doubling the suppression window (~1s instead of 500ms).
-// We iterate the KEYBOARD_INPUT_DATA array and skip KEY_BREAK (0x01) flags.
-//
-// Called at DISPATCH_LEVEL.
+// Fire callback only on key-down events. Skip KEY_BREAK flags to avoid
+// doubling the suppression window. Called at DISPATCH_LEVEL.
 
 VOID
 KbdHookReadCompletion(
@@ -152,7 +139,7 @@ KbdHookReadCompletion(
 
     if (NT_SUCCESS(status) && pCtx->CallbackObject != NULL)
     {
-        // Iterate KEYBOARD_INPUT_DATA; fire callback once per key-down batch.
+        // Fire callback once per key-down batch.
         ULONG_PTR bytesTransferred =
             Params->Parameters.Read.Length;  // actual bytes returned
 
@@ -167,11 +154,11 @@ KbdHookReadCompletion(
 
             for (ULONG k = 0; k < recordCount; k++)
             {
-                // KEY_BREAK → key-up; skip to avoid extending suppression.
+                // Skip key-up to avoid extending suppression.
                 if (kbdData[k].Flags & KEY_BREAK)
                     continue;
 
-                // At least one key-down: fire. One callback per read suffices.
+                // At least one key-down: fire once per read.
                 ExNotifyCallback(pCtx->CallbackObject, NULL, NULL);
                 break;
             }

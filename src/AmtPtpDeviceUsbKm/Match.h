@@ -1,21 +1,7 @@
 // Match.h - L1 frame parsing and raw-slot -> Track matching.
 //
-// FIX (separation of concerns): the previous Interrupt.c interleaved
-// three distinct responsibilities in one pass over the raw finger array:
-//   L1 - decoding raw TRACKPAD_FINGER bytes into normalized coordinates,
-//        palm classification, tip-size debounce.
-//   L2 - deciding which logical Track a raw slot index continues
-//        (the `f->origin == 0` reindex check).
-//   L3 - gesture-state bookkeeping (multi-finger taint marking).
-// All three were read/mutated through the same shared per-slot arrays
-// in the same loop bodies, which is what made the matching logic hard to
-// reason about and is the direct cause of the "1-frame ambiguity" this
-// rewrite is meant to remove.
-//
-// This header owns L1 (parsing into MATCH_SAMPLE) and the raw-slot ->
-// Track binding decision (AmtMatchFrame). Gesture-session bookkeeping
-// stays in Interrupt.c, which is the only place with full frame context
-// (alive count across ALL slots, not just one).
+// Owns L1 (parsing into MATCH_SAMPLE) and binding decisions
+// (AmtMatchFrame). Gesture-session bookkeeping stays in Interrupt.c.
 
 #pragma once
 
@@ -23,9 +9,7 @@
 
 EXTERN_C_START
 
-// One decoded, normalized sample from the raw USB frame for a single
-// raw slot index. Produced entirely by AmtMatchParseFrame (L1); contains
-// no Track-FSM state and no gesture-state.
+// One decoded, normalized sample from a raw USB frame slot (L1).
 typedef struct _MATCH_SAMPLE
 {
     BOOLEAN Present;       // FALSE if this raw slot reported no contact
@@ -44,12 +28,9 @@ typedef struct _MATCH_SAMPLE
                             // fresh this frame (feeds Confidence).
 } MATCH_SAMPLE;
 
-// AmtMatchParseFrame - L1. Decodes raw_n raw TRACKPAD_FINGER records into
-// Samples[0..raw_n-1]. Performs palm classification and tip-size
-// debounce (which needs each track's last good position, hence the
-// Tracks parameter - read-only access for the debounce comparison; no
-// Track state is mutated here). Returns the count of slots classified as
-// PALM_LARGE-driving-a-full-pad-blank via *LargePalmDetected.
+// L1: Decodes raw TRACKPAD_FINGER records into MATCH_SAMPLE[].
+// Performs palm classification and tip-size debounce (read-only Track
+// access). Sets *LargePalmDetected for full-pad palm blanking.
 VOID
 AmtMatchParseFrame(
     _In_  const UCHAR*                    FrameBase,
@@ -61,47 +42,11 @@ AmtMatchParseFrame(
     _Out_ BOOLEAN* LargePalmDetected
 );
 
-// AmtMatchFrame - decides, for each raw slot index that has a Present
-// sample this frame, whether it continues the Track currently occupying
-// that index (same physical finger) or represents a brand new physical
-// finger arriving in that slot.
-//
-// Two independent signals feed this decision, both checked for any slot
-// whose Track is currently ACTIVE:
-//
-//   1. Samples[i].IdentityBreak (the firmware's own origin==0 signal) -
-//      authoritative when present: the hardware is explicitly telling us
-//      "this index used to mean something else".
-//
-//   2. FIX (spatial sanity / defense-in-depth against an undetected
-//      reindex): even when origin != 0, a candidate position that has
-//      jumped further than MATCH_MAX_CONTINUATION_DELTA from the track's
-//      last REPORTED position within a single USB polling interval is
-//      not physically plausible for a continuing finger - real fingers
-//      do not teleport across the pad in ~8ms. This guards against a
-//      firmware edge case where a reindex happens WITHOUT the origin bit
-//      being asserted (the entire premise this driver's matching design
-//      otherwise trusts blindly). Misclassifying a genuine continuation
-//      as NEW_IDENTITY here costs nothing worse than one extra,
-//      never-reused ContactID (see Track.h); trusting a bad origin bit
-//      blindly risks reintroducing exactly the cursor-teleport class of
-//      bug this whole rewrite exists to remove. The threshold is
-//      deliberately generous (see Match.c) so it never fires on
-//      legitimate fast motion.
-//
-// This is still, by design, a CONSTANT-TIME check per raw slot (O(1),
-// O(N) total for N<=PTP_MAX_CONTACT_POINTS<=5) - it is a bound check
-// against ONE track (the one already occupying that raw index), not a
-// nearest-neighbour search across all tracks. A real grid/partition-
-// based spatial matcher is intentionally NOT implemented: with hardware
-// that caps simultaneous contacts at 5 and (per the firmware's own
-// index-compaction contract) already guarantees raw-index stability
-// except where IdentityBreak says otherwise, an O(N^2) or grid-based
-// search would add real complexity for zero measurable benefit. If a
-// future hardware revision is found that does NOT honour that contract,
-// this function's body - and only this function's body - is where a
-// real spatial matcher would go; the MATCH_VERDICT[] output shape is
-// already future-proofed for that swap.
+// Decides CONTINUES vs NEW_IDENTITY for each Present slot.
+// Two signals: (1) firmware origin==0 (IdentityBreak), (2) spatial
+// sanity check — a position jump beyond MATCH_MAX_CONTINUATION_DELTA
+// from last ReportX/Y is implausible in one USB polling interval.
+// O(N) single-pass, N <= PTP_MAX_CONTACT_POINTS.
 typedef enum { MATCH_CONTINUES = 0, MATCH_NEW_IDENTITY = 1 } MATCH_VERDICT;
 
 VOID
