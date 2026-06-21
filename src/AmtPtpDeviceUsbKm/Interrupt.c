@@ -1,18 +1,14 @@
 // Interrupt.c: USB completion handling.
 //
-// CORRECTED scope (see audit/04_correction_plan.md): this file now owns
-// exactly four things, in order:
+// CORRECTED scope: this file owns exactly four things:
 //   1. USB read completion mechanics (buffer validation, request plumbing)
 //   2. RawFrame construction (delegated to Input.c - no decisions here)
 //   3. ONE call to PTPCore_ProcessFrame (all matching, lifecycle FSM,
 //      palm/gesture session bookkeeping lives there - see PTPCore.c)
-//   4. Serializing PTP_CORE_FRAME into the wire-format PTP_REPORT
+//   4. Serializing PTP_CORE_FRAME into wire-format PTP_REPORT
 //
-// It does NOT decide grace-vs-kill, retap-vs-raw, or any other
-// lifecycle routing - those decisions are not visible in this file at
-// all anymore. The previous version of this refactor still had that
-// orchestration inline here; that was wrong and has been moved into
-// PTPCore_ProcessFrame.
+// It does NOT decide grace-vs-kill, retap-vs-raw, or any other lifecycle
+// routing - those decisions are not visible in this file at all anymore.
 
 #include "Driver.h"
 #include "PTPCore.h"
@@ -22,11 +18,9 @@
 // Hot-path trace rate limiting - max 1 verbose/info trace per interval.
 #define TRACE_HOT_PATH_MIN_INTERVAL_100NS  (50LL * 10000LL)  // 50 ms
 
-// FIX (Task 4.1, instrumentation): no longer static - PTPCore.c now
-// shares this exact rate-gate (and the same DEVICE_CONTEXT.
-// LastHotPathTraceQpc state) for its own per-frame diagnostic trace,
-// instead of duplicating the gate or running two independent gates
-// against the same field. Declared in PTPCore.h.
+// FIX (Task 4.1): no longer static - PTPCore.c shares this rate-gate
+// (and DEVICE_CONTEXT.LastHotPathTraceQpc state) for its own diagnostic
+// trace. Declared in PTPCore.h.
 BOOLEAN
 AmtHotPathTraceGate(_Inout_ PDEVICE_CONTEXT pCtx, _In_ LONGLONG NowQpc100ns)
 {
@@ -53,9 +47,8 @@ AmtReportCheckInvariants(_In_ const PTP_REPORT* Report)
 #define AmtReportCheckInvariants(Report) ((VOID)0)
 #endif
 
-// Serializes a PTP_CORE_FRAME (PTPCore's layer-1 output) into the
-// wire-format PTP_REPORT. Pure formatting - no decisions about what is
-// reported or why; that was already decided by PTPCore_ProcessFrame.
+// Serializes PTP_CORE_FRAME into wire-format PTP_REPORT. Pure formatting
+// - no decisions about what is reported or why.
 static VOID
 AmtSerializeCoreFrameToReport(
     _In_  const PTP_CORE_FRAME* CoreFrame,
@@ -63,7 +56,7 @@ AmtSerializeCoreFrameToReport(
 )
 {
     UCHAR n = CoreFrame->ContactCount;
-    if (n > PTP_MAX_CONTACT_POINTS) n = PTP_MAX_CONTACT_POINTS; // defensive
+    if (n > PTP_MAX_CONTACT_POINTS) n = PTP_MAX_CONTACT_POINTS;
 
     for (UCHAR i = 0; i < n; i++) {
         const PTP_CORE_CONTACT* c = &CoreFrame->Contacts[i];
@@ -192,20 +185,11 @@ AmtPtpEvtUsbInterruptPipeReadComplete(
     BOOLEAN buttonSnapshot =
         pCtx->PtpReportButton && TouchBuffer[pCtx->DeviceInfo->tp_button];
 
-    // Typing suppression: this is a "should we process input at all"
-    // gate, not a PTPCore frame decision - it stays here. When active,
-    // the frame is treated as empty (no raw contacts), which drives
-    // PTPCore_ProcessFrame to lift every active contact through its
-    // normal Phase A path. This intentionally replaces the old
-    // Interrupt.c behavior of force-Kill'ing every track during
-    // suppression (bypassing the WasInGesture->EnterGrace check): Phase
-    // A's EnterGrace+ExpireGrace sequence zeroes the same struct fields
-    // and returns the same Old* (ContactID/X/Y) as a direct Kill within
-    // a single frame, so the externally observable result - which
-    // ContactIDs report TipSwitch=0 this frame, at what position - is
-    // identical either way. Reusing the one Phase A path here removes a
-    // second, parallel lift-off implementation instead of keeping it as
-    // a special case.
+    // Typing suppression: "should we process input at all" gate, not a
+    // PTPCore frame decision - stays here. When active, frame is treated
+    // as empty, driving PTPCore_ProcessFrame to lift every active contact
+    // through normal Phase A path (EnterGrace+ExpireGrace for gesture-
+    // tainted contacts, same observable result as old direct Kill).
     BOOLEAN suppressingTyping = FALSE;
     {
         LONGLONG suppressUntil = InterlockedCompareExchange64(
@@ -238,8 +222,7 @@ AmtPtpEvtUsbInterruptPipeReadComplete(
         AmtInputParseFrame(f_base, fingerSize, raw_n, pCtx->DeviceInfo,
                            Now.QuadPart, &rawFrame);
     }
-    // else: empty RawFrame (suppressingTyping, or touch reporting off) -
-    // PTPCore_ProcessFrame naturally lifts every active contact.
+    // else: empty RawFrame -> PTPCore_ProcessFrame lifts all active contacts.
 
     // ---- 3. PTPCore: the single orchestration entry point ----
     PTP_CORE_FRAME coreFrame;

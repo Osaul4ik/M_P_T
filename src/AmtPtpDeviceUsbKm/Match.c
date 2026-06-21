@@ -1,6 +1,4 @@
-// Match.c - PTPCore / ContactMatcher. See Match.h for scope notes and
-// audit/04_correction_plan.md for why this replaced the slot-indexed
-// version.
+// Match.c - PTPCore / ContactMatcher. See Match.h for scope notes.
 
 #include "Driver.h"
 #include "Match.h"
@@ -9,22 +7,15 @@
 #define TIP_DROP_DEBOUNCE_FRAMES        2
 #define TIP_DROP_MAX_REPOSITION_DELTA   300
 
-// Spatial sanity threshold: ~20% of pad width (~20000 units). No real
-// finger teleports this far in one USB polling interval.
+// Spatial sanity: ~20% of pad width (~20000 units). No finger teleports
+// this far in one USB polling interval.
 #define MATCH_MAX_CONTINUATION_DELTA 4000
 
-// Matching-cost tuning. Cost is dominated by spatial distance. The
-// slot-hint match is used ONLY to break near-ties (see the epsilon
-// comparison in AmtMatchCorrespond) - it must never be able to flip a
-// genuinely-closer candidate at a different slot into losing, or this
-// silently reintroduces slot-as-identity behavior through the back
-// door. An earlier version of this file used a fixed cost subtraction
-// for slot-hint matches, which was provably wrong: at typical
-// frame-to-frame finger movement (a few units, squared distance in the
-// low hundreds), a fixed subtraction of a few thousand could override a
-// genuinely closer candidate at a different slot. Fixed by replacing it
-// with a same-magnitude-only epsilon tie-break instead - see below.
-#define MATCH_TIE_EPSILON_SQ 4  // ~2 units of linear distance, squared
+// Matching-cost tuning. Cost is dominated by spatial distance. Slot-hint
+// is used ONLY to break near-ties (MATCH_TIE_EPSILON_SQ) - never a fixed
+// cost subtraction, which was provably wrong (could override genuinely
+// closer candidates at different slots).
+#define MATCH_TIE_EPSILON_SQ 4  // ~2 units linear distance, squared
 
 static UCHAR
 AmtMatchCandidateTip(_In_ USHORT major, _In_ USHORT minor)
@@ -52,7 +43,7 @@ AmtMatchBuildCandidates(
 
         if (palm == PALM_LARGE) {
             *LargePalmDetected = TRUE;
-            OutCandidates->Count = 0; // caller blanks the whole pad
+            OutCandidates->Count = 0; // blank whole pad
             return;
         }
 
@@ -76,11 +67,8 @@ AmtMatchBuildCandidates(
             continue;
         }
 
-        // Below tip-size threshold - tip-size debounce. Find the pool
-        // entry most recently associated with this hardware slot (by
-        // LastSlotHint - a hint, used here only to find a debounce
-        // anchor, never as a direct index) and bridge to its last good
-        // position if it's plausibly the same physical contact.
+        // Below tip threshold - debounce. Find pool entry by LastSlotHint
+        // (hint only, never direct index) and bridge to last good position.
         size_t bestPoolIdx = MAX_CONTACTS;
         for (size_t p = 0; p < MAX_CONTACTS; p++) {
             if (Pool[p].State != CONTACT_ACTIVE)
@@ -101,18 +89,12 @@ AmtMatchBuildCandidates(
         }
 
         if (bestPoolIdx == MAX_CONTACTS) {
-            // FIX (soft-tap-loss audit, Phase 4): no anchor means this
-            // is a brand-new contact, not a noisy re-appearance of an
-            // existing one. The debounce below exists to bridge a
-            // momentary small-size sample WITHIN an already-tracked
-            // contact's lifetime - it must never gate the very first
-            // sample of a touch-down, or genuinely soft/quick taps are
-            // silently dropped before they ever reach the matcher, and
-            // the contact never births at all. Let it through as a
-            // low-confidence birth candidate instead of discarding it.
+            // FIX (soft-tap-loss): no anchor means brand-new contact, not
+            // noise. Let through as low-confidence birth candidate instead
+            // of silently dropping first touch-down.
             cand.X              = rc->X;
             cand.Y              = rc->Y;
-            cand.TipDropApplied = 1; // mark low-confidence, not "no contact"
+            cand.TipDropApplied = 1;
             OutCandidates->Candidates[OutCandidates->Count++] = cand;
             continue;
         }
@@ -123,10 +105,7 @@ AmtMatchBuildCandidates(
             cand.TipDropApplied = (UCHAR)(Pool[bestPoolIdx].TipDropCount + 1);
             OutCandidates->Candidates[OutCandidates->Count++] = cand;
         }
-        // else: debounce exhausted with an existing anchor - drop this
-        // candidate (treat as absent over-debounced noise). This path
-        // is unchanged from before the fix - it only applies when an
-        // anchor DOES exist, i.e. mid-contact noise, never first touch.
+        // else: debounce exhausted with anchor - drop candidate (noise).
     }
 }
 
@@ -144,13 +123,8 @@ AmtMatchCorrespond(
     BOOLEAN poolClaimed[MAX_CONTACTS];
     RtlZeroMemory(poolClaimed, sizeof(poolClaimed));
 
-    // Greedy minimum-cost assignment. For N,M <= PTP_MAX_CONTACT_POINTS
-    // (5), this is well within the regime where greedy-by-ascending-cost
-    // gives the same practical result as an optimal assignment, at a
-    // fraction of the complexity - see Match.h doc comment.
-    //
-    // Build all (candidate, pool) cost pairs, then repeatedly take the
-    // globally cheapest unclaimed pair until either side is exhausted.
+    // Greedy minimum-cost assignment. For N,M <= 5, greedy-by-ascending-
+    // cost gives same practical result as optimal assignment.
     typedef struct { UCHAR candIdx; size_t poolIdx; LONG cost; BOOLEAN slotHintMatch; } PAIR;
     PAIR pairs[PTP_MAX_CONTACT_POINTS * MAX_CONTACTS];
     UCHAR pairCount = 0;
@@ -161,7 +135,7 @@ AmtMatchCorrespond(
         OutResult->CorrespondingPoolIndex[ci] = MATCH_NO_CORRESPONDENCE;
 
         if (cand->PalmLocal)
-            continue; // palm candidates never match/birth via this path
+            continue;
 
         for (size_t p = 0; p < MAX_CONTACTS; p++) {
             if (Pool[p].State != CONTACT_ACTIVE)
@@ -169,8 +143,7 @@ AmtMatchCorrespond(
 
             INT dx = (INT)cand->X - (INT)Pool[p].ReportX;
             INT dy = (INT)cand->Y - (INT)Pool[p].ReportY;
-            LONG dist = (LONG)dx * dx + (LONG)dy * dy; // squared distance,
-                                                        // the ONLY cost term
+            LONG dist = (LONG)dx * dx + (LONG)dy * dy; // squared distance
 
             pairs[pairCount].candIdx       = ci;
             pairs[pairCount].poolIdx       = p;
@@ -180,15 +153,9 @@ AmtMatchCorrespond(
         }
     }
 
-    // Selection sort by ascending cost, claiming greedily. pairCount is
-    // bounded by PTP_MAX_CONTACT_POINTS * MAX_CONTACTS == 25, so an
-    // O(n^2) selection pass is negligible on this hot path.
-    //
-    // Slot-hint is used ONLY as a tie-breaker: when two candidate pairs
-    // are within MATCH_TIE_EPSILON_SQ of each other in cost, prefer the
-    // one whose SlotIndex matches Pool[p].LastSlotHint. This can never
-    // override a genuinely cheaper match outside the epsilon band - see
-    // the file-header comment on why a fixed cost bonus was wrong.
+    // Selection sort by ascending cost, greedy claiming. pairCount <= 25,
+    // so O(n^2) is negligible. Slot-hint is tie-breaker only within
+    // MATCH_TIE_EPSILON_SQ - never overrides genuinely cheaper match.
     BOOLEAN pairUsed[PTP_MAX_CONTACT_POINTS * MAX_CONTACTS];
     RtlZeroMemory(pairUsed, sizeof(pairUsed));
 
@@ -219,13 +186,10 @@ AmtMatchCorrespond(
                                     (delta < MATCH_TIE_EPSILON_SQ);
 
             if (pairs[k].cost < bestCost && !withinEpsilon) {
-                // Strictly cheaper outside the tie band - always wins,
-                // regardless of slot hint.
                 bestCost          = pairs[k].cost;
                 bestIdx           = k;
                 bestSlotHintMatch = pairs[k].slotHintMatch;
             } else if (withinEpsilon && pairs[k].slotHintMatch && !bestSlotHintMatch) {
-                // Near-tie: prefer the slot-hint match.
                 bestCost          = pairs[k].cost;
                 bestIdx           = k;
                 bestSlotHintMatch = TRUE;
@@ -233,23 +197,18 @@ AmtMatchCorrespond(
         }
 
         if (!found)
-            break; // every remaining candidate or pool entry is claimed
+            break;
 
         pairUsed[bestIdx]                 = TRUE;
         UCHAR  ci = pairs[bestIdx].candIdx;
         size_t p  = pairs[bestIdx].poolIdx;
 
-        // Reject implausible matches outright - this candidate gets no
-        // correspondence (-> new birth) rather than a bogus continuation.
+        // Reject implausible matches - candidate gets no correspondence.
         BOOLEAN spatialReject = pairs[bestIdx].cost >
             (LONG)MATCH_MAX_CONTINUATION_DELTA * MATCH_MAX_CONTINUATION_DELTA;
 
-        // FIX (Task 2.2): explicit time-domain rejection, independent of
-        // the spatial one. LastSeenQpc==0 means "born but never updated
-        // yet" - this frame's own Phase B contacts can't reach here
-        // (the matcher runs before Phase B), so a zero here only ever
-        // means "no time information available" and must NOT be
-        // rejected on time alone.
+        // FIX (Task 2.2): time-domain rejection. LastSeenQpc==0 means
+        // "never updated" - must not be rejected on time alone.
         BOOLEAN timeReject = FALSE;
         if (Pool[p].LastSeenQpc != 0 && PerfFrequencyHz > 0) {
             LONGLONG deltaTicks = NowQpc - Pool[p].LastSeenQpc;
@@ -258,8 +217,8 @@ AmtMatchCorrespond(
         }
 
         if (spatialReject || timeReject) {
-            candClaimed[ci] = TRUE; // don't reconsider this candidate
-            continue;               // leave pool entry p available
+            candClaimed[ci] = TRUE;
+            continue;
         }
 
         candClaimed[ci] = TRUE;
@@ -270,8 +229,7 @@ AmtMatchCorrespond(
             Candidates->Candidates[ci].IdentityBreak ? TRUE : FALSE;
     }
 
-    // Any pool entry never claimed has no corresponding candidate this
-    // frame -> lift.
+    // Unclaimed pool entries -> lift.
     for (size_t p = 0; p < MAX_CONTACTS; p++) {
         if (Pool[p].State != CONTACT_ACTIVE)
             continue;

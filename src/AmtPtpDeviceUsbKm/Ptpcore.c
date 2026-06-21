@@ -1,14 +1,11 @@
-// PTPCore.c - PTPCore_ProcessFrame: the single frame-orchestration
-// entry point. Owns Phase A (lift) -> Phase B (birth) -> Phase C
-// (update/report) sequencing, palm session bookkeeping, and gesture
-// session bookkeeping. This is everything that used to live inline in
-// Interrupt.c's USB completion routine - see audit/04_correction_plan.md
-// for why it moved here.
+// PTPCore.c - PTPCore_ProcessFrame: single frame-orchestration entry point.
+// Owns Phase A (lift) -> Phase B (birth) -> Phase C (update/report)
+// sequencing, palm session, and gesture session bookkeeping. Everything
+// that used to live inline in Interrupt.c's USB completion routine.
 //
-// Frame-determinism rule (unchanged from the old Track.h): after
-// AmtMatchCorrespond resolves correspondences, no ACTIVE_CONTACT may be
-// mutated except through the ordered phase sequence below. Pre-
-// transition state must be read BEFORE AmtContactKill/EnterGrace.
+// Frame-determinism rule: after AmtMatchCorrespond resolves
+// correspondences, no ACTIVE_CONTACT may be mutated except through the
+// ordered phase sequence below.
 
 #include "Driver.h"
 #include "PTPCore.h"
@@ -62,7 +59,7 @@ AmtRecentLiftFindNearby(
         if (!e->Valid)
             continue;
         if (NowQpc < e->LiftQpc)
-            continue; // defensive: QPC must be monotonic
+            continue; // QPC must be monotonic
         if (NowQpc - e->LiftQpc > windowTicks)
             continue;
 
@@ -90,11 +87,8 @@ AmtRecentLiftFindNearby(
     return found;
 }
 
-// Writes one lift-off into OutResult, or defers to the device's
-// overflow queue if the frame is already full. Mirrors the old
-// AmtEmitLift/AmtDrainOverflow discipline (Interrupt.c history) - never
-// silently drops a lift-off, and never writes past
-// OutResult->Contacts[PTP_MAX_CONTACT_POINTS-1].
+// Writes one lift-off into OutResult, or defers to overflow queue if
+// frame is full. Never silently drops a lift-off.
 static VOID
 AmtCoreEmitLift(
     _Inout_ PDEVICE_CONTEXT pCtx,
@@ -127,9 +121,8 @@ AmtCoreEmitLift(
     }
 }
 
-// Drains deferred lift-offs from the previous frame into this frame's
-// result. Called first, before any of this frame's own lift-offs, so
-// overflow entries get at most one extra frame of latency.
+// Drains deferred lift-offs from previous frame into this frame's result.
+// Called first, before this frame's own lift-offs.
 static VOID
 AmtCoreDrainOverflow(
     _Inout_ PDEVICE_CONTEXT pCtx,
@@ -172,12 +165,8 @@ PTPCore_ProcessFrame(
     AmtMatchBuildCandidates(RawFrame, pCtx->DeviceInfo, pCtx->ActiveContacts,
                             &candidates, &largePalm);
 
-    // ---- Palm session orchestration (sticky "still palm-adjacent") ----
-    // Session-state symmetry with GestureSession: decides whether to
-    // keep suppressing candidates across frames after a large-palm
-    // event, until the pad is fully clear. Per-sample scoring lives in
-    // Palm.c (called from Match.c); this is the only orchestration
-    // layer that sees session history.
+    // ---- Palm session orchestration ----
+    // Sticky suppression across frames after large-palm, until pad clears.
     if (largePalm) {
         pCtx->PalmDetected = TRUE;
         OutResult->LargePalmBlanked = TRUE;
@@ -185,10 +174,8 @@ PTPCore_ProcessFrame(
         BOOLEAN anyContact = (candidates.Count > 0);
         if (!anyContact) {
             pCtx->PalmDetected = FALSE;
-            // Pad cleared after palm - Phase A below lifts all contacts.
         } else {
-            // Still palm-adjacent - suppress all candidates this frame.
-            candidates.Count = 0;
+            candidates.Count = 0; // still palm-adjacent - suppress all
         }
     }
 
@@ -198,9 +185,7 @@ PTPCore_ProcessFrame(
                        NowQpc, pCtx->PerfFrequency.QuadPart,
                        &matchResult);
 
-    // ---- GestureEngine: session FSM, computed from this frame's
-    // matched-or-new alive contacts (never stale - see ActiveContact.c
-    // history note on why staleness here previously caused a real bug) ----
+    // ---- GestureEngine: session FSM ----
     UCHAR aliveCount = 0;
     for (UCHAR ci = 0; ci < candidates.Count; ci++) {
         if (!candidates.Candidates[ci].PalmLocal)
@@ -210,15 +195,12 @@ PTPCore_ProcessFrame(
     AmtGestureSessionUpdate(&pCtx->GestureSession, aliveCount);
     BOOLEAN gestureThisFrame = AmtGestureIsMultiFingerFrame(aliveCount);
 
-    // Drain deferred lift-offs from the previous frame first - see
-    // AmtCoreDrainOverflow doc comment.
+    // Drain deferred lift-offs from previous frame first.
     AmtCoreDrainOverflow(pCtx, OutResult);
 
-    // ---- Phase A (lift): every pool entry with no surviving
-    // correspondence this frame lifts. Gesture-tainted routes through
-    // GRACE; others via Kill - UNLESS the contact hasn't yet reached
-    // MIN_CONTACT_LIFETIME_FRAMES, in which case the kill is deferred
-    // by one frame (Task 4.2, soft-tap-loss audit). ----
+    // ---- Phase A (lift): unmatched pool entries lift. Gesture-tainted
+    // routes through GRACE; others via Kill - unless contact is too fresh
+    // (FramesAlive < MIN_CONTACT_LIFETIME_FRAMES), defer by one frame. ----
     for (UCHAR u = 0; u < matchResult.UnmatchedCount; u++) {
         size_t p = matchResult.UnmatchedPoolIndices[u];
 
@@ -228,13 +210,8 @@ PTPCore_ProcessFrame(
             AmtContactEnterGrace(pCtx->ActiveContacts, p, &oldId, &oldX, &oldY);
             AmtContactExpireGrace(pCtx->ActiveContacts, p);
         } else if (pCtx->ActiveContacts[p].FramesAlive < MIN_CONTACT_LIFETIME_FRAMES) {
-            // FIX (Task 4.2): too-fresh solo contact would otherwise be
-            // killed before Windows' PTP gesture recognizer ever sees
-            // the DOWN that preceded it. Defer the kill: re-report it
-            // as MOVE this frame at its last known position (consuming
-            // one more frame of life) instead of lifting. If it's still
-            // unmatched on a later frame once FramesAlive has reached
-            // the floor, it lifts normally then.
+            // FIX (Task 4.2): too-fresh solo contact - defer kill by one
+            // frame so Windows' gesture recognizer sees the DOWN first.
             pCtx->ActiveContacts[p].FramesAlive++;
 
             if (OutResult->ContactCount < PTP_MAX_CONTACT_POINTS) {
@@ -248,7 +225,7 @@ PTPCore_ProcessFrame(
                 OutResult->ContactCount++;
                 pCtx->ActiveContacts[p].ReportedLastFrame = TRUE;
             }
-            continue; // no lift-off this frame - skip the emit below
+            continue; // no lift-off this frame
         } else {
             AmtContactKill(pCtx->ActiveContacts, p, &oldId, &oldX, &oldY);
         }
@@ -257,13 +234,9 @@ PTPCore_ProcessFrame(
         AmtCoreEmitLift(pCtx, OutResult, oldId, oldX, oldY);
     }
 
-    // A correspondence that was found but flagged NewIdentity (firmware
-    // origin==0) is ALSO a lift-of-old, immediately followed by a
-    // birth-of-new at Phase B below - the old pool entry must be killed
-    // here, not just left ACTIVE, or Phase C would wrongly continue it.
-    // (Deliberately NOT subject to MIN_CONTACT_LIFETIME_FRAMES: an
-    // identity break is a hard firmware signal, not an absence, and
-    // must always resolve immediately.)
+    // NewIdentity (firmware origin==0) is also a lift-of-old + birth-of-new.
+    // Not subject to MIN_CONTACT_LIFETIME_FRAMES - identity break is a
+    // hard firmware signal, must resolve immediately.
     for (UCHAR ci = 0; ci < candidates.Count; ci++) {
         if (candidates.Candidates[ci].PalmLocal) continue;
 
@@ -282,16 +255,14 @@ PTPCore_ProcessFrame(
         AmtRecentLiftRecord(&pCtx->RecentLifts, NowQpc, oldX, oldY);
         AmtCoreEmitLift(pCtx, OutResult, oldId, oldX, oldY);
 
-        // This candidate now has no live correspondence - mark it so
-        // Phase B treats it as a fresh birth, not Phase C continuation.
+        // Mark for Phase B as fresh birth.
         matchResult.CorrespondingPoolIndex[ci] = MATCH_NO_CORRESPONDENCE;
     }
 
     AmtContactPoolCheckInvariants(pCtx->ActiveContacts);
 
-    // ---- Phase B (birth): every candidate with no correspondence
-    // births a new pool entry. Uses retap smoothing when recent-lift
-    // memory indicates a fast re-tap nearby. ----
+    // ---- Phase B (birth): unmatched candidates birth new pool entries.
+    // Uses retap smoothing when recent-lift memory indicates fast re-tap. ----
     for (UCHAR ci = 0; ci < candidates.Count; ci++) {
         const MATCH_CANDIDATE* cand = &candidates.Candidates[ci];
         if (cand->PalmLocal) continue;
@@ -325,22 +296,20 @@ PTPCore_ProcessFrame(
             pCtx->ActiveContacts[freeIdx].WasInGesture = TRUE;
         }
 
-        // This candidate is now an ACTIVE contact - route it through
-        // Phase C immediately below by recording the correspondence.
+        // Route through Phase C immediately.
         matchResult.CorrespondingPoolIndex[ci] = freeIdx;
     }
 
     AmtContactPoolCheckInvariants(pCtx->ActiveContacts);
 
     // ---- Phase C (update / report): every candidate now has a
-    // correspondence (either pre-existing from this frame's matcher, or
-    // just born in Phase B). Update once, report once. ----
+    // correspondence. Update once, report once. ----
     for (UCHAR ci = 0; ci < candidates.Count; ci++) {
         const MATCH_CANDIDATE* cand = &candidates.Candidates[ci];
         if (cand->PalmLocal) continue;
 
         size_t p = matchResult.CorrespondingPoolIndex[ci];
-        if (p == MATCH_NO_CORRESPONDENCE) continue; // shouldn't happen post-Phase-B
+        if (p == MATCH_NO_CORRESPONDENCE) continue;
 
         BOOLEAN justBorn = (pCtx->ActiveContacts[p].LastSeenQpc == 0);
 
@@ -353,16 +322,6 @@ PTPCore_ProcessFrame(
                          cand->SlotIndex, NowQpc,
                          (BOOLEAN)(aliveCount == 1), &repX, &repY);
 
-        // NOTE on asymmetry: lift-offs (Phase A, AmtCoreEmitLift) have
-        // an overflow queue and are never silently dropped. Live
-        // updates here do not - if the frame is already full (only
-        // possible when this frame's lift-off count plus live-update
-        // count exceeds PTP_MAX_CONTACT_POINTS, which cannot happen
-        // since both lift-offs and live updates draw from the same
-        // <=5-contact pool and a contact is in exactly one Phase A/B/C
-        // bucket per frame), this candidate's update is skipped this
-        // frame. Preserved unchanged from the old Interrupt.c Phase C
-        // behavior - documented here rather than silently inherited.
         if (OutResult->ContactCount < PTP_MAX_CONTACT_POINTS) {
             PPTP_CORE_CONTACT outC = &OutResult->Contacts[OutResult->ContactCount];
             outC->ContactID = pCtx->ActiveContacts[p].ContactID;
@@ -370,8 +329,7 @@ PTPCore_ProcessFrame(
             outC->Y         = repY;
             outC->Phase     = justBorn ? CONTACT_PHASE_DOWN : CONTACT_PHASE_MOVE;
             outC->Confident = (cand->TipDropApplied == 0);
-            outC->PalmSuspect = FALSE; // candidates reaching here already
-                                       // passed palm filtering in Match.c
+            outC->PalmSuspect = FALSE;
             OutResult->ContactCount++;
             pCtx->ActiveContacts[p].ReportedLastFrame = TRUE;
         }
@@ -379,13 +337,8 @@ PTPCore_ProcessFrame(
 
     AmtContactPoolCheckInvariants(pCtx->ActiveContacts);
 
-    // FIX (Task 4.1, instrumentation): per-frame diagnostic summary for
-    // soft/double-tap-loss investigation. Verbose level, rate-gated via
-    // the same hot-path gate Interrupt.c uses (shared
-    // DEVICE_CONTEXT.LastHotPathTraceQpc) so this is safe to leave
-    // compiled into release builds - it only ever fires when WPP
-    // verbose tracing for TRACE_INPUT is actually enabled, and even
-    // then at most once per TRACE_HOT_PATH_MIN_INTERVAL_100NS.
+    // FIX (Task 4.1): per-frame diagnostic summary. Rate-gated via
+    // shared DEVICE_CONTEXT.LastHotPathTraceQpc - safe in release builds.
     if (AmtHotPathTraceGate(pCtx, NowQpc)) {
         TraceEvents(TRACE_LEVEL_VERBOSE, TRACE_INPUT,
             "%!FUNC! raw=%u cand=%u unmatched=%u out=%u palm=%d gesture=%d alive=%u",

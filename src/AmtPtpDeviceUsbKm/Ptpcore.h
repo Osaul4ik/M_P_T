@@ -1,6 +1,6 @@
 // PTPCore.h - Layer contract for the PTP touch stack.
 //
-// This header defines the boundary types that flow between layers:
+// Defines boundary types between layers:
 //
 //   USB/Wellspring driver (Interrupt.c)
 //         |  RAW_FRAME (no state, no decisions)
@@ -9,8 +9,7 @@
 //         |  RAW_FRAME
 //         v
 //   PTPCore_ProcessFrame (PTPCore.c)    -- single orchestration entry point:
-//         |                                ContactMatcher (Match.c, cost-based,
-//         |                                identity independent of hw slot) +
+//         |                                ContactMatcher (Match.c) +
 //         |                                StateMachine (ActiveContact.c) +
 //         |                                palm session + gesture session
 //         v
@@ -18,36 +17,16 @@
 //         v
 //   Interrupt.c                         -- serializes into PTP_REPORT only
 //
-// Design notes / deliberate deviations from a literal slot-array port
-// (see audit/04_correction_plan.md for the correction history - an
-// earlier version of this refactor still indexed the contact pool by
-// hardware slot, which was wrong and has been replaced):
-//
-//   1. RAW_CONTACT/RAW_FRAME use a fixed-size array, not std::vector.
-//      This is a kernel-mode C driver running at DISPATCH_LEVEL inside
-//      a USB read completion routine - no CRT, no heap allocation on
-//      the hot path. PTP_MAX_CONTACT_POINTS (5) is a hard physical
-//      limit of the hardware, so a fixed array loses nothing.
-//
-//   2. Tip-size debounce is NOT part of InputAdapter. Tip-drop requires
-//      reading previous contact state - it is a StateMachine/Matcher
-//      concern (see Match.c AmtMatchBuildCandidates), not parsing.
-//      InputAdapter only decodes geometry; it never reads contact state.
-//
-//   3. ContactMatcher (Match.c) is a real cost-based matcher: every
-//      RawFrame contact is matched against every ACTIVE_CONTACT pool
-//      entry by squared spatial distance, with hardware slot index used
-//      ONLY as a narrow tie-breaker (see MATCH_TIE_EPSILON_SQ in
-//      Match.c), never as the correspondence key itself. A contact that
-//      moves to a different hardware slot between frames is still
-//      matched correctly by position.
-//
-//   4. Orchestration (which Match.c/ActiveContact.c primitive to call,
-//      and in what order, for all contacts in one frame) lives in
-//      PTPCore.c, not in Interrupt.c and not scattered into Match.c/
-//      ActiveContact.c. Interrupt.c calls PTPCore_ProcessFrame exactly
-//      once per USB completion and does nothing else with frame
-//      semantics - see PTPCore.c.
+// Design notes:
+//   1. RAW_CONTACT/RAW_FRAME use fixed-size array (kernel driver at
+//      DISPATCH_LEVEL - no CRT, no heap). PTP_MAX_CONTACT_POINTS (5) is
+//      a hard hardware limit.
+//   2. Tip-size debounce is NOT in InputAdapter - it reads previous
+//      contact state, so it's a Matcher concern (Match.c).
+//   3. ContactMatcher (Match.c) is cost-based: squared spatial distance
+//      with slot index as narrow tie-breaker only, never as identity key.
+//   4. Orchestration lives in PTPCore.c, not Interrupt.c or scattered
+//      into Match.c/ActiveContact.c.
 
 #pragma once
 
@@ -89,21 +68,17 @@ typedef enum _CONTACT_PHASE
     CONTACT_PHASE_UP,        // lifted this frame (-> FREE or GRACE)
 } CONTACT_PHASE;
 
-// One reportable contact for the current frame. This is PTPCore's
-// output contract - Interrupt.c reads this and nothing else; it never
-// touches ACTIVE_CONTACT directly.
+// One reportable contact for the current frame. PTPCore's output contract.
+// Interrupt.c reads this and nothing else - never touches ACTIVE_CONTACT.
 typedef struct _PTP_CORE_CONTACT
 {
     ULONG          ContactID;     // stable, monotonic, never reused while warm
     USHORT         X;
     USHORT         Y;
     CONTACT_PHASE  Phase;
-    BOOLEAN        Confident;     // FALSE if position carried over (tip-drop debounce)
-    BOOLEAN        PalmSuspect;   // local-palm classification (Palm.c scoring);
-                                  // suppression itself is applied inside
-                                  // PTPCore_ProcessFrame before this struct
-                                  // is populated - a suppressed contact simply
-                                  // does not appear in PTP_CORE_FRAME.Contacts[]
+    BOOLEAN        Confident;     // FALSE if position carried over (tip-drop)
+    BOOLEAN        PalmSuspect;   // local-palm classification; suppressed
+                                  // contacts don't appear in PTP_CORE_FRAME
 } PTP_CORE_CONTACT, *PPTP_CORE_CONTACT;
 
 typedef struct _PTP_CORE_FRAME
@@ -115,11 +90,8 @@ typedef struct _PTP_CORE_FRAME
 } PTP_CORE_FRAME, *PPTP_CORE_FRAME;
 
 // ===========================================================================
-// PTPCore_ProcessFrame - the single entry point that owns all frame
-// orchestration: contact matching, lifecycle FSM transitions, gesture
-// session bookkeeping, palm session bookkeeping. Interrupt.c calls this
-// exactly once per USB completion and does nothing else with frame
-// semantics - see PTPCore.c and audit/04_correction_plan.md.
+// PTPCore_ProcessFrame - single entry point owning all frame orchestration:
+// matching, lifecycle FSM, gesture/palm session bookkeeping.
 // ===========================================================================
 
 struct _DEVICE_CONTEXT; // fwd decl, defined in Device.h
@@ -132,24 +104,14 @@ PTPCore_ProcessFrame(
     _Out_   PTP_CORE_FRAME*         OutResult
 );
 
-// FIX (Task 4.1, instrumentation): hot-path trace rate gate. Originally
-// a static helper duplicated only in Interrupt.c; promoted to a shared
-// declaration here so PTPCore.c can use the SAME rate-limit state
-// (DEVICE_CONTEXT.LastHotPathTraceQpc) for its own diagnostic trace
-// instead of either duplicating the function or flooding the log with
-// an independent gate. Defined in Interrupt.c (no behavior change there
-// beyond dropping `static`).
+// FIX (Task 4.1): hot-path trace rate gate. Shared between Interrupt.c
+// and PTPCore.c using the same DEVICE_CONTEXT.LastHotPathTraceQpc state.
 BOOLEAN
 AmtHotPathTraceGate(_Inout_ struct _DEVICE_CONTEXT* pCtx, _In_ LONGLONG NowQpc100ns);
 
 // ===========================================================================
-// Recent-lift memory for retap smoothing. Deliberately NOT slot-indexed
-// (the old DEVICE_CONTEXT.SlotLastLiftQpc/X/Y[PTP_MAX_CONTACT_POINTS]
-// arrays were keyed by hardware slot, which is the same slot-as-identity
-// mistake this refactor removes everywhere else - see
-// audit/04_correction_plan.md). A small ring buffer of "where/when did
-// a contact last lift" entries, matched by proximity at birth time, not
-// by slot.
+// Recent-lift memory for retap smoothing. Ring buffer (not slot-indexed)
+// of "where/when did a contact last lift", matched by proximity at birth.
 // ===========================================================================
 
 #define RECENT_LIFT_CAPACITY PTP_MAX_CONTACT_POINTS
@@ -176,9 +138,8 @@ AmtRecentLiftRecord(
     _In_    USHORT            Y
 );
 
-// Finds the closest-in-time-and-space recent lift to (CandX, CandY) and
-// reports it via Out*. Returns FALSE if none qualifies (caller falls
-// back to raw unsmoothed birth - always correct).
+// Finds closest-in-time-and-space recent lift to (CandX, CandY).
+// Returns FALSE if none qualifies (caller falls back to raw birth).
 BOOLEAN
 AmtRecentLiftFindNearby(
     _In_  const RECENT_LIFT_RING* Ring,

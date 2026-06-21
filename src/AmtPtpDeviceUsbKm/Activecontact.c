@@ -1,6 +1,5 @@
-// ActiveContact.c - Contact lifecycle FSM. See ActiveContact.h for the
-// full design rationale (why pool position != identity, LastSlotHint
-// vs identity test, frame-determinism rule).
+// ActiveContact.c - Contact lifecycle FSM. See ActiveContact.h for design
+// rationale (pool position != identity, LastSlotHint vs identity test).
 
 #include "Driver.h"
 #include "ActiveContact.h"
@@ -18,9 +17,7 @@ AmtContactSmoothCoord(_In_ USHORT rawVal, _In_ USHORT prevVal)
     return (USHORT)(blended < 0 ? 0 : blended);
 }
 
-// Single choke point for ContactID issuance - unchanged policy from the
-// old Track.c: pre-increment, 0 permanently reserved/unassigned, never
-// reused while warm. See TRACK_RETAP_POLICY note in ActiveContact.h.
+// ContactID issuance: pre-increment, 0 reserved, never reused while warm.
 static inline ULONG
 AmtContactAssignId(_Inout_ ULONG* NextContactId)
 {
@@ -40,8 +37,7 @@ AmtContactPoolFindFree(_In_reads_(MAX_CONTACTS) const ACTIVE_CONTACT* Pool)
         if (Pool[i].State == CONTACT_FREE)
             return i;
     }
-    return MAX_CONTACTS; // pool exhausted (should not happen: pool size
-                          // == hardware max simultaneous fingers)
+    return MAX_CONTACTS; // pool exhausted (should not happen)
 }
 
 VOID
@@ -72,14 +68,11 @@ AmtContactBirth(
     c->ReportedLastFrame  = FALSE;
     c->LastSlotHint        = slotHint;
     c->LastSeenQpc         = 0; // set by first AmtContactUpdate call
-    c->FramesAlive         = 1; // FIX (Task 4.2): birth frame counts as 1
+    c->FramesAlive         = 1; // birth frame counts as 1
 }
 
-// Same rationale as the old AmtTrackBirthWithRetapSmoothing (Track.c
-// history): seeds baseline to the recent-lift position and leaves
-// PendingFirstSample FALSE so the immediately-following AmtContactUpdate
-// call runs the normal deadzone+EMA path, blending lift position toward
-// the real touch-down coordinates. No ContactID reuse.
+// Seeds baseline to recent-lift position, PendingFirstSample=FALSE so
+// first AmtContactUpdate runs normal deadzone+EMA path. No ContactID reuse.
 VOID
 AmtContactBirthWithRetapSmoothing(
     _Inout_ PACTIVE_CONTACT Pool,
@@ -104,11 +97,11 @@ AmtContactBirthWithRetapSmoothing(
     c->HystY              = RecentLiftY;
     c->TipDropCount       = 0;
     c->WasInGesture       = FALSE;
-    c->PendingFirstSample = FALSE; // deliberate - see header comment
+    c->PendingFirstSample = FALSE; // deliberate - see header
     c->ReportedLastFrame  = FALSE;
     c->LastSlotHint        = slotHint;
     c->LastSeenQpc         = 0;
-    c->FramesAlive         = 1; // FIX (Task 4.2): birth frame counts as 1
+    c->FramesAlive         = 1;
 }
 
 BOOLEAN
@@ -123,13 +116,13 @@ AmtContactIsRecentLiftNearby(
 )
 {
     if (LiftQpc == 0)
-        return FALSE; // sentinel: no recent lift recorded
+        return FALSE; // no recent lift recorded
 
     if (NowQpc < LiftQpc)
-        return FALSE; // defensive: QPC must be monotonic
+        return FALSE; // QPC must be monotonic
 
     if (PerfFrequencyHz <= 0)
-        return FALSE; // no usable clock - fail closed to raw birth path
+        return FALSE; // no usable clock - fail closed
 
     LONGLONG deltaTicks  = NowQpc - LiftQpc;
     LONGLONG windowTicks = (RETAP_WINDOW_100NS * PerfFrequencyHz) / 10000000LL;
@@ -164,11 +157,8 @@ AmtContactKill(
     *OldX         = c->ReportX;
     *OldY         = c->ReportY;
 
-    // Full reset to FREE. ReportedLastFrame also clears here, same
-    // invariant as before (see ActiveContact.h frame-determinism rule):
-    // a contact that was ReportedLastFrame==TRUE always gets its
-    // TipSwitch=0 lift-off queued (by the caller, using Old* above)
-    // before this pool slot can be reused by Phase B.
+    // Full reset to FREE. ReportedLastFrame also clears here - caller
+    // already emitted TipSwitch=0 lift-off using Old* before pool reuse.
     RtlZeroMemory(c, sizeof(ACTIVE_CONTACT));
 }
 
@@ -191,10 +181,7 @@ AmtContactEnterGrace(
     *OldX         = c->ReportX;
     *OldY         = c->ReportY;
 
-    // Quarantine, not held reservation - see TRACK_RETAP_POLICY note in
-    // ActiveContact.h. A real ContactID-reuse continuation across a
-    // reported lift-off reopens the cursor-teleport bug this driver was
-    // built to fix.
+    // Quarantine, not held reservation - no ContactID reuse.
     c->State = CONTACT_GRACE;
 }
 
@@ -304,13 +291,12 @@ AmtContactUpdate(
 
     AmtContactCommitSample(Contact, rawX, rawY, passed, aliveCountIsOne, OutX, OutY);
 
-    // Matching-hint maintenance - NOT identity. See ActiveContact.h.
+    // Matching-hint maintenance - NOT identity.
     Contact->LastSlotHint = slotHint;
     Contact->LastSeenQpc  = nowQpc;
 
-    // FIX (Task 4.2): age the contact. Saturates at 255 (UCHAR) - this
-    // only ever needs to be compared against the small
-    // MIN_CONTACT_LIFETIME_FRAMES threshold, so saturation is harmless.
+    // Age the contact. Saturates at 255 - only compared against small
+    // MIN_CONTACT_LIFETIME_FRAMES, so saturation is harmless.
     if (Contact->FramesAlive < 255)
         Contact->FramesAlive++;
 }

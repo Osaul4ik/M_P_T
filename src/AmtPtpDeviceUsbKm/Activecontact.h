@@ -1,44 +1,29 @@
-// ActiveContact.h - Contact lifecycle FSM, addressed by pool slot, NOT
-// by hardware slot index.
+// ActiveContact.h - Contact lifecycle FSM, pool-slot addressed (not hw slot).
 //
-// This replaces Track.h/TRACK[PTP_MAX_CONTACT_POINTS] indexed by raw
-// USB slot. That scheme made hardware slot index the identity key,
-// which is wrong: if a finger lifts from hw slot 2 and a new touch
-// lands in hw slot 0 on the very next frame, the old scheme had no way
-// to express "maybe these are related" - it could only ever see "hw
-// slot 0 has a new contact". Matching decisions belong to the matcher
-// (ActiveContact.c's caller, ContactMatcher in Match.c), not to array
-// indexing.
+// Replaces Track.h/TRACK[PTP_MAX_CONTACT_POINTS] indexed by raw USB slot.
+// Old scheme used hw slot as identity key - wrong: a finger lifting from
+// slot 2 and a new touch landing on slot 0 next frame couldn't express
+// "maybe related". Matching belongs in Match.c, not array indexing.
 //
-// ACTIVE_CONTACT pool slots are an implementation detail (which free
-// pool entry a contact happens to occupy) - never exposed as identity.
-// ContactID is the only identity. LastSlotHint is a matching
-// OPTIMIZATION ONLY: "this contact was last seen at hardware slot N",
-// used by ContactMatcher to cheaply check the common case (slot stable
-// across frames) before falling back to full cost evaluation. Removing
-// LastSlotHint entirely would only cost CPU cycles, never correctness -
-// that is the test for whether something is a hint or an identity.
+// Pool slots are an implementation detail - never exposed as identity.
+// ContactID is the only identity. LastSlotHint is a matching OPTIMIZATION
+// ONLY: removing it costs CPU, never correctness.
 //
 // ---------------------------------------------------------------------
-// State machine (same shape as before, decoupled from slot)
+// State machine
 // ---------------------------------------------------------------------
 //   FREE --(birth)--> ACTIVE --(lift)--> FREE
 //                        |
 //                        |--(gesture lift)--> GRACE --(expire)--> FREE
 //
-// ContactID is NEVER reused while "warm" - monotonic counter via
-// DEVICE_CONTEXT.NextContactId. Smooth, non-jumpy re-tap is achieved
-// via PendingFirstSample bypass, NOT ContactID reuse (TRACK_RETAP_POLICY,
-// unchanged from the old Track.h).
+// ContactID never reused while warm (monotonic counter). Smooth re-tap
+// via PendingFirstSample bypass, not ContactID reuse.
 //
 // ---------------------------------------------------------------------
-// Frame determinism rule (unchanged)
+// Frame determinism rule
 // ---------------------------------------------------------------------
-// After ContactMatcher resolves correspondences, no contact may be
-// mutated except through the ordered phase sequence: Phase A (lift) ->
-// Phase B (birth) -> Phase C (update/report). All phase ordering now
-// lives in PTPCore.c (PTPCore_ProcessFrame), not in the USB completion
-// routine.
+// After matching, contacts mutate only via Phase A (lift) -> Phase B
+// (birth) -> Phase C (update/report). Ordering in PTPCore.c.
 
 #pragma once
 
@@ -51,21 +36,19 @@ typedef enum _CONTACT_STATE
 {
     CONTACT_FREE = 0,  // free pool slot, no identity
     CONTACT_ACTIVE,    // finger down, identity live
-    CONTACT_GRACE,     // same-frame quarantine after gesture lift; never
-                       // persists past the frame it was entered.
+    CONTACT_GRACE,     // same-frame quarantine after gesture lift
 } CONTACT_STATE;
 
-// One pool entry. Pool position is NOT identity - ContactID is.
+// One pool entry. Pool position != identity - ContactID is.
 typedef struct _ACTIVE_CONTACT
 {
     CONTACT_STATE State;
 
-    // Windows-facing identity. Valid only while State != CONTACT_FREE.
-    // Never reused while "warm" - see TRACK_RETAP_POLICY (Track.h
-    // history; same policy, this is its continuation).
+    // Windows-facing identity. Valid while State != CONTACT_FREE.
+    // Never reused while warm.
     ULONG ContactID;
 
-    // Reported (post deadzone + EMA) position, in normalized device units.
+    // Reported (post deadzone + EMA) position, normalized device units.
     USHORT ReportX;
     USHORT ReportY;
 
@@ -76,62 +59,45 @@ typedef struct _ACTIVE_CONTACT
     // Tip-size debounce counter.
     UCHAR TipDropCount;
 
-    // TRUE if contact was part of a >=2-finger frame during its ACTIVE
-    // lifetime. Causes EMA skip on first solo frame (aliveCountIsOne).
+    // TRUE if contact was in >=2-finger frame during ACTIVE lifetime.
+    // Causes EMA skip on first solo frame (aliveCountIsOne).
     BOOLEAN WasInGesture;
 
-    // TRUE on first frame after birth/recycle. Bypasses deadzone+EMA
-    // on first sample.
+    // TRUE on first frame after birth. Bypasses deadzone+EMA.
     BOOLEAN PendingFirstSample;
 
     // Reported last frame? Drives Phase A lift-off detection.
     BOOLEAN ReportedLastFrame;
 
-    // ---- Matching-hint fields. NOT identity. See file header. ----
-    USHORT   LastSlotHint;    // hw slot this contact was matched to last
-                               // frame; used only to speed up matching.
-    LONGLONG LastSeenQpc;      // QPC of last successful match; used for
-                               // grace/retap timing instead of a
-                               // slot-indexed side array.
+    // ---- Matching-hint fields. NOT identity. ----
+    USHORT   LastSlotHint;    // hw slot matched to last frame; speeds up matching
+    LONGLONG LastSeenQpc;     // QPC of last successful match; grace/retap timing
 
-    // FIX (Task 4.2, soft-tap-loss audit): frames this contact has
-    // survived since birth, including the birth frame itself (=1 right
-    // after AmtContactBirth/AmtContactBirthWithRetapSmoothing,
-    // incremented once per AmtContactUpdate call thereafter). Used
-    // ONLY by PTPCore's Phase A to hold a too-fresh solo contact alive
-    // for a minimum number of frames so Windows' PTP gesture
-    // recognizer has time to observe a DOWN before the matching UP -
-    // see MIN_CONTACT_LIFETIME_FRAMES below. This is NOT identity and
-    // NOT a matching hint; it never influences AmtMatchCorrespond.
+    // FIX (Task 4.2): frames alive since birth. Used by Phase A to hold
+    // a too-fresh solo contact alive for MIN_CONTACT_LIFETIME_FRAMES so
+    // Windows' gesture recognizer sees DOWN before UP. NOT identity,
+    // NOT a matching hint.
     UCHAR FramesAlive;
 } ACTIVE_CONTACT, *PACTIVE_CONTACT;
 
-#define MAX_CONTACTS PTP_MAX_CONTACT_POINTS  // pool capacity, not a slot count
+#define MAX_CONTACTS PTP_MAX_CONTACT_POINTS  // pool capacity, not slot count
 
-// FIX (Task 4.2): minimum number of frames a contact must have been
-// alive (see ACTIVE_CONTACT.FramesAlive) before PTPCore's Phase A is
-// allowed to Kill it outright on an unmatched frame. Below this floor,
-// PTPCore instead re-reports the contact as CONTACT_PHASE_MOVE at its
-// last known position for one more frame and defers the lift - see
-// PTPCore.c Phase A. Deliberately conservative: 2 frames at the
-// trackpad's USB polling interval (~8ms) is ~16ms, far below human tap
-// perception, but enough for Windows' PTP gesture recognizer to
-// register the DOWN before it sees the UP. This does NOT apply to the
-// WasInGesture/EnterGrace path - multi-finger gesture release timing is
-// a different contract and must stay immediate.
+// FIX (Task 4.2): min frames before Phase A can Kill an unmatched contact.
+// Below this, re-reports as MOVE at last position for one more frame.
+// 2 frames @ ~8ms = ~16ms, below human tap perception, enough for Windows
+// gesture recognizer. Does NOT apply to WasInGesture/EnterGrace path.
 #define MIN_CONTACT_LIFETIME_FRAMES 2
 
 // Zero/FREE-initialise the whole pool. Call at device creation and D0Entry.
 VOID
 AmtContactPoolInit(_Out_writes_(MAX_CONTACTS) PACTIVE_CONTACT Pool);
 
-// Finds a FREE pool entry. Returns its index, or MAX_CONTACTS if the
-// pool is full (should never happen: pool size == hardware max fingers).
+// Finds a FREE pool entry. Returns index or MAX_CONTACTS if full.
 size_t
 AmtContactPoolFindFree(_In_reads_(MAX_CONTACTS) const ACTIVE_CONTACT* Pool);
 
 // FREE -> ACTIVE. Assigns fresh ContactID, seeds baseline.
-// Precondition: Pool[index].State == CONTACT_FREE (debug-asserted).
+// Precondition: Pool[index].State == CONTACT_FREE.
 VOID
 AmtContactBirth(
     _Inout_ PACTIVE_CONTACT Pool,
@@ -142,9 +108,8 @@ AmtContactBirth(
     _In_    USHORT          slotHint
 );
 
-// Like AmtContactBirth but seeds baseline to RecentLiftX/Y and leaves
-// PendingFirstSample=FALSE, so first sample is EMA-blended against the
-// lift position. No ContactID reuse - see TRACK_RETAP_POLICY note above.
+// Like AmtContactBirth but seeds baseline to RecentLiftX/Y with
+// PendingFirstSample=FALSE, so first sample EMA-blends against lift pos.
 VOID
 AmtContactBirthWithRetapSmoothing(
     _Inout_ PACTIVE_CONTACT Pool,
@@ -155,9 +120,8 @@ AmtContactBirthWithRetapSmoothing(
     _In_    USHORT          slotHint
 );
 
-// Heuristic: is touch-down near a recent lift in time AND space?
-// Time: within RETAP_WINDOW_100NS. Space: within RETAP_MAX_DISTANCE.
-// Conservative - FALSE falls back to raw unsmoothed birth (always correct).
+// Is touch-down near a recent lift in time (RETAP_WINDOW_100NS) AND space
+// (RETAP_MAX_DISTANCE)? FALSE -> raw unsmoothed birth (always correct).
 #define RETAP_WINDOW_100NS      (700LL * 10000LL)  // 700 ms
 #define RETAP_MAX_DISTANCE      600                // normalized units
 
@@ -182,8 +146,8 @@ AmtContactKill(
     _Out_   USHORT*         OldY
 );
 
-// ACTIVE -> GRACE. Used when WasInGesture is TRUE at lift-off.
-// Same-frame quarantine marker only - never re-binds ContactID.
+// ACTIVE -> GRACE. Used when WasInGesture at lift-off.
+// Same-frame quarantine only - never re-binds ContactID.
 VOID
 AmtContactEnterGrace(
     _Inout_ PACTIVE_CONTACT Pool,
@@ -193,14 +157,12 @@ AmtContactEnterGrace(
     _Out_   USHORT*         OldY
 );
 
-// GRACE -> FREE. Called same frame after AmtContactEnterGrace.
-// No report - lift-off already emitted by caller.
+// GRACE -> FREE. Called same frame after EnterGrace. No report emitted.
 VOID
 AmtContactExpireGrace(_Inout_ PACTIVE_CONTACT Pool, _In_ size_t index);
 
-// 2-pass deadzone evaluator. Pass 1: read-only check against current
-// HystX/Y. Pass 2 (in AmtContactUpdate): commits HystX/Y first, then
-// EMA blends OLD ReportX/Y toward new candidate.
+// 2-pass deadzone evaluator. Pass 1: read-only check vs HystX/Y.
+// Pass 2 (in AmtContactUpdate): commits HystX/Y, then EMA blends.
 BOOLEAN
 AmtContactEvaluateDeadzone(
     _In_ const ACTIVE_CONTACT* Contact,
@@ -209,9 +171,8 @@ AmtContactEvaluateDeadzone(
 );
 
 // Per-frame ACTIVE contact update (Phase C). Deadzone + EMA (skipped on
-// PendingFirstSample and first solo post-gesture). Writes ReportX/Y and
-// LastSeenQpc/LastSlotHint (matching-hint maintenance), and increments
-// FramesAlive (see ACTIVE_CONTACT.FramesAlive / MIN_CONTACT_LIFETIME_FRAMES).
+// PendingFirstSample and first solo post-gesture). Updates matching hints
+// and increments FramesAlive.
 VOID
 AmtContactUpdate(
     _Inout_ PACTIVE_CONTACT Contact,
@@ -225,8 +186,7 @@ AmtContactUpdate(
 );
 
 #if DBG
-// Debug-only pool invariant check: unique ContactIDs, no zero IDs on
-// non-FREE entries, no flags set on FREE entries.
+// Debug: unique ContactIDs, no zero IDs on non-FREE, no flags on FREE.
 VOID
 AmtContactPoolCheckInvariants(_In_reads_(MAX_CONTACTS) const ACTIVE_CONTACT* Pool);
 #else
