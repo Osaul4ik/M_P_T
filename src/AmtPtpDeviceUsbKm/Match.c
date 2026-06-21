@@ -100,15 +100,33 @@ AmtMatchBuildCandidates(
             }
         }
 
-        if (bestPoolIdx != MAX_CONTACTS &&
-            Pool[bestPoolIdx].TipDropCount < TIP_DROP_DEBOUNCE_FRAMES) {
+        if (bestPoolIdx == MAX_CONTACTS) {
+            // FIX (soft-tap-loss audit, Phase 4): no anchor means this
+            // is a brand-new contact, not a noisy re-appearance of an
+            // existing one. The debounce below exists to bridge a
+            // momentary small-size sample WITHIN an already-tracked
+            // contact's lifetime - it must never gate the very first
+            // sample of a touch-down, or genuinely soft/quick taps are
+            // silently dropped before they ever reach the matcher, and
+            // the contact never births at all. Let it through as a
+            // low-confidence birth candidate instead of discarding it.
+            cand.X              = rc->X;
+            cand.Y              = rc->Y;
+            cand.TipDropApplied = 1; // mark low-confidence, not "no contact"
+            OutCandidates->Candidates[OutCandidates->Count++] = cand;
+            continue;
+        }
+
+        if (Pool[bestPoolIdx].TipDropCount < TIP_DROP_DEBOUNCE_FRAMES) {
             cand.X              = Pool[bestPoolIdx].ReportX;
             cand.Y              = Pool[bestPoolIdx].ReportY;
             cand.TipDropApplied = (UCHAR)(Pool[bestPoolIdx].TipDropCount + 1);
             OutCandidates->Candidates[OutCandidates->Count++] = cand;
         }
-        // else: debounce exhausted or no anchor found - drop this
-        // candidate (treat as absent), matching old behavior.
+        // else: debounce exhausted with an existing anchor - drop this
+        // candidate (treat as absent over-debounced noise). This path
+        // is unchanged from before the fix - it only applies when an
+        // anchor DOES exist, i.e. mid-contact noise, never first touch.
     }
 }
 
@@ -116,7 +134,9 @@ VOID
 AmtMatchCorrespond(
     _In_  const MATCH_CANDIDATE_SET*               Candidates,
     _In_reads_(MAX_CONTACTS) const ACTIVE_CONTACT*  Pool,
-    _Out_ MATCH_RESULT*                             OutResult
+    _In_  LONGLONG                                  NowQpc,
+    _In_  LONGLONG                                  PerfFrequencyHz,
+    _Out_ MATCH_RESULT*                              OutResult
 )
 {
     RtlZeroMemory(OutResult, sizeof(MATCH_RESULT));
@@ -221,8 +241,23 @@ AmtMatchCorrespond(
 
         // Reject implausible matches outright - this candidate gets no
         // correspondence (-> new birth) rather than a bogus continuation.
-        if (pairs[bestIdx].cost >
-            (LONG)MATCH_MAX_CONTINUATION_DELTA * MATCH_MAX_CONTINUATION_DELTA) {
+        BOOLEAN spatialReject = pairs[bestIdx].cost >
+            (LONG)MATCH_MAX_CONTINUATION_DELTA * MATCH_MAX_CONTINUATION_DELTA;
+
+        // FIX (Task 2.2): explicit time-domain rejection, independent of
+        // the spatial one. LastSeenQpc==0 means "born but never updated
+        // yet" - this frame's own Phase B contacts can't reach here
+        // (the matcher runs before Phase B), so a zero here only ever
+        // means "no time information available" and must NOT be
+        // rejected on time alone.
+        BOOLEAN timeReject = FALSE;
+        if (Pool[p].LastSeenQpc != 0 && PerfFrequencyHz > 0) {
+            LONGLONG deltaTicks = NowQpc - Pool[p].LastSeenQpc;
+            LONGLONG maxTicks   = (MATCH_MAX_TIME_DELTA_100NS * PerfFrequencyHz) / 10000000LL;
+            timeReject = (NowQpc < Pool[p].LastSeenQpc) || (deltaTicks > maxTicks);
+        }
+
+        if (spatialReject || timeReject) {
             candClaimed[ci] = TRUE; // don't reconsider this candidate
             continue;               // leave pool entry p available
         }

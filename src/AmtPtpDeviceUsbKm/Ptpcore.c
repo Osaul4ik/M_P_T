@@ -194,7 +194,9 @@ PTPCore_ProcessFrame(
 
     // ---- ContactMatcher: cost-based correspondence ----
     MATCH_RESULT matchResult;
-    AmtMatchCorrespond(&candidates, pCtx->ActiveContacts, &matchResult);
+    AmtMatchCorrespond(&candidates, pCtx->ActiveContacts,
+                       NowQpc, pCtx->PerfFrequency.QuadPart,
+                       &matchResult);
 
     // ---- GestureEngine: session FSM, computed from this frame's
     // matched-or-new alive contacts (never stale - see ActiveContact.c
@@ -214,7 +216,9 @@ PTPCore_ProcessFrame(
 
     // ---- Phase A (lift): every pool entry with no surviving
     // correspondence this frame lifts. Gesture-tainted routes through
-    // GRACE; others via Kill. ----
+    // GRACE; others via Kill - UNLESS the contact hasn't yet reached
+    // MIN_CONTACT_LIFETIME_FRAMES, in which case the kill is deferred
+    // by one frame (Task 4.2, soft-tap-loss audit). ----
     for (UCHAR u = 0; u < matchResult.UnmatchedCount; u++) {
         size_t p = matchResult.UnmatchedPoolIndices[u];
 
@@ -223,6 +227,28 @@ PTPCore_ProcessFrame(
         if (pCtx->ActiveContacts[p].WasInGesture) {
             AmtContactEnterGrace(pCtx->ActiveContacts, p, &oldId, &oldX, &oldY);
             AmtContactExpireGrace(pCtx->ActiveContacts, p);
+        } else if (pCtx->ActiveContacts[p].FramesAlive < MIN_CONTACT_LIFETIME_FRAMES) {
+            // FIX (Task 4.2): too-fresh solo contact would otherwise be
+            // killed before Windows' PTP gesture recognizer ever sees
+            // the DOWN that preceded it. Defer the kill: re-report it
+            // as MOVE this frame at its last known position (consuming
+            // one more frame of life) instead of lifting. If it's still
+            // unmatched on a later frame once FramesAlive has reached
+            // the floor, it lifts normally then.
+            pCtx->ActiveContacts[p].FramesAlive++;
+
+            if (OutResult->ContactCount < PTP_MAX_CONTACT_POINTS) {
+                PPTP_CORE_CONTACT outC = &OutResult->Contacts[OutResult->ContactCount];
+                outC->ContactID   = pCtx->ActiveContacts[p].ContactID;
+                outC->X           = pCtx->ActiveContacts[p].ReportX;
+                outC->Y           = pCtx->ActiveContacts[p].ReportY;
+                outC->Phase       = CONTACT_PHASE_MOVE;
+                outC->Confident   = TRUE;
+                outC->PalmSuspect = FALSE;
+                OutResult->ContactCount++;
+                pCtx->ActiveContacts[p].ReportedLastFrame = TRUE;
+            }
+            continue; // no lift-off this frame - skip the emit below
         } else {
             AmtContactKill(pCtx->ActiveContacts, p, &oldId, &oldX, &oldY);
         }
@@ -235,6 +261,9 @@ PTPCore_ProcessFrame(
     // origin==0) is ALSO a lift-of-old, immediately followed by a
     // birth-of-new at Phase B below - the old pool entry must be killed
     // here, not just left ACTIVE, or Phase C would wrongly continue it.
+    // (Deliberately NOT subject to MIN_CONTACT_LIFETIME_FRAMES: an
+    // identity break is a hard firmware signal, not an absence, and
+    // must always resolve immediately.)
     for (UCHAR ci = 0; ci < candidates.Count; ci++) {
         if (candidates.Candidates[ci].PalmLocal) continue;
 
@@ -349,4 +378,23 @@ PTPCore_ProcessFrame(
     }
 
     AmtContactPoolCheckInvariants(pCtx->ActiveContacts);
+
+    // FIX (Task 4.1, instrumentation): per-frame diagnostic summary for
+    // soft/double-tap-loss investigation. Verbose level, rate-gated via
+    // the same hot-path gate Interrupt.c uses (shared
+    // DEVICE_CONTEXT.LastHotPathTraceQpc) so this is safe to leave
+    // compiled into release builds - it only ever fires when WPP
+    // verbose tracing for TRACE_INPUT is actually enabled, and even
+    // then at most once per TRACE_HOT_PATH_MIN_INTERVAL_100NS.
+    if (AmtHotPathTraceGate(pCtx, NowQpc)) {
+        TraceEvents(TRACE_LEVEL_VERBOSE, TRACE_INPUT,
+            "%!FUNC! raw=%u cand=%u unmatched=%u out=%u palm=%d gesture=%d alive=%u",
+            RawFrame->ContactCount,
+            candidates.Count,
+            matchResult.UnmatchedCount,
+            OutResult->ContactCount,
+            largePalm,
+            gestureThisFrame,
+            aliveCount);
+    }
 }

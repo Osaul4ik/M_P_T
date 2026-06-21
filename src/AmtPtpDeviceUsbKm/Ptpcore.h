@@ -132,6 +132,16 @@ PTPCore_ProcessFrame(
     _Out_   PTP_CORE_FRAME*         OutResult
 );
 
+// FIX (Task 4.1, instrumentation): hot-path trace rate gate. Originally
+// a static helper duplicated only in Interrupt.c; promoted to a shared
+// declaration here so PTPCore.c can use the SAME rate-limit state
+// (DEVICE_CONTEXT.LastHotPathTraceQpc) for its own diagnostic trace
+// instead of either duplicating the function or flooding the log with
+// an independent gate. Defined in Interrupt.c (no behavior change there
+// beyond dropping `static`).
+BOOLEAN
+AmtHotPathTraceGate(_Inout_ struct _DEVICE_CONTEXT* pCtx, _In_ LONGLONG NowQpc100ns);
+
 // ===========================================================================
 // Recent-lift memory for retap smoothing. Deliberately NOT slot-indexed
 // (the old DEVICE_CONTEXT.SlotLastLiftQpc/X/Y[PTP_MAX_CONTACT_POINTS]

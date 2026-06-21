@@ -72,6 +72,7 @@ AmtContactBirth(
     c->ReportedLastFrame  = FALSE;
     c->LastSlotHint        = slotHint;
     c->LastSeenQpc         = 0; // set by first AmtContactUpdate call
+    c->FramesAlive         = 1; // FIX (Task 4.2): birth frame counts as 1
 }
 
 // Same rationale as the old AmtTrackBirthWithRetapSmoothing (Track.c
@@ -107,6 +108,7 @@ AmtContactBirthWithRetapSmoothing(
     c->ReportedLastFrame  = FALSE;
     c->LastSlotHint        = slotHint;
     c->LastSeenQpc         = 0;
+    c->FramesAlive         = 1; // FIX (Task 4.2): birth frame counts as 1
 }
 
 BOOLEAN
@@ -305,6 +307,12 @@ AmtContactUpdate(
     // Matching-hint maintenance - NOT identity. See ActiveContact.h.
     Contact->LastSlotHint = slotHint;
     Contact->LastSeenQpc  = nowQpc;
+
+    // FIX (Task 4.2): age the contact. Saturates at 255 (UCHAR) - this
+    // only ever needs to be compared against the small
+    // MIN_CONTACT_LIFETIME_FRAMES threshold, so saturation is harmless.
+    if (Contact->FramesAlive < 255)
+        Contact->FramesAlive++;
 }
 
 #if DBG

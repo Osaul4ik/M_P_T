@@ -32,7 +32,11 @@ typedef struct _MATCH_CANDIDATE
     USHORT  Y;
     BOOLEAN PalmLocal;       // excluded from matching/reporting, doesn't blank pad
     BOOLEAN IdentityBreak;   // firmware origin==0 signal for this slot
-    UCHAR   TipDropApplied;  // non-zero if position substituted by debounce
+    UCHAR   TipDropApplied;  // non-zero if position substituted by debounce,
+                              // OR (FIX, soft-tap-loss) if this is a
+                              // first-touch candidate with no debounce
+                              // anchor that was let through at low
+                              // confidence - see AmtMatchBuildCandidates.
 } MATCH_CANDIDATE;
 
 typedef struct _MATCH_CANDIDATE_SET
@@ -71,6 +75,12 @@ typedef struct _MATCH_RESULT
 // the ActiveContact pool by LastSlotHint, not by direct index - this is
 // the stateful step that cannot live in InputAdapter; see PTPCore.h #2).
 // Sets *LargePalmDetected for full-pad blanking.
+//
+// FIX (soft-tap-loss audit, Phase 4): a below-tip-size candidate with
+// NO existing debounce anchor in the pool is a first touch-down, not
+// noise - it is now passed through as a low-confidence birth candidate
+// instead of being silently dropped. Tip-size debounce only ever
+// suppresses noise WITHIN an already-tracked contact's lifetime.
 VOID
 AmtMatchBuildCandidates(
     _In_  const RAW_FRAME*                        RawFrame,
@@ -80,6 +90,16 @@ AmtMatchBuildCandidates(
     _Out_ BOOLEAN*                                 LargePalmDetected
 );
 
+// Max time since a pool entry's last successful match (ACTIVE_CONTACT.
+// LastSeenQpc) before a spatially-close candidate is still rejected as
+// an implausible continuation (Task 2.2). Independent of, and tighter
+// than, RETAP_WINDOW_100NS (700ms) - that window governs the deliberate
+// re-tap path (recent-lift ring, new ContactID), whereas this one
+// governs the matcher's "is this candidate still plausibly the SAME
+// live contact" decision (continuation, same ContactID). 150ms is
+// generous relative to the USB polling interval.
+#define MATCH_MAX_TIME_DELTA_100NS (150LL * 10000LL)
+
 // L1.5b: Cost-based correspondence between Candidates and the ACTIVE
 // pool. Cost = spatial distance (primary) with a bonus (cost reduction)
 // for SlotIndex == Pool[i].LastSlotHint (cheap common-case win, not a
@@ -87,12 +107,16 @@ AmtMatchBuildCandidates(
 // a full Hungarian/optimal assignment is unnecessary at this scale.
 // A candidate's correspondence is rejected (-> NewIdentity / new birth)
 // if firmware signalled IdentityBreak, OR if the best-cost match still
-// exceeds MATCH_MAX_CONTINUATION_DELTA (implausible jump).
+// exceeds MATCH_MAX_CONTINUATION_DELTA (implausible spatial jump), OR
+// (FIX, Task 2.2) if the matched pool entry hasn't been seen within
+// MATCH_MAX_TIME_DELTA_100NS.
 VOID
 AmtMatchCorrespond(
     _In_  const MATCH_CANDIDATE_SET*               Candidates,
     _In_reads_(MAX_CONTACTS) const ACTIVE_CONTACT*  Pool,
-    _Out_ MATCH_RESULT*                             OutResult
+    _In_  LONGLONG                                  NowQpc,
+    _In_  LONGLONG                                  PerfFrequencyHz,
+    _Out_ MATCH_RESULT*                              OutResult
 );
 
 EXTERN_C_END

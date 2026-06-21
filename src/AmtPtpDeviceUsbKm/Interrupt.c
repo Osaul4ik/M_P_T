@@ -22,7 +22,12 @@
 // Hot-path trace rate limiting - max 1 verbose/info trace per interval.
 #define TRACE_HOT_PATH_MIN_INTERVAL_100NS  (50LL * 10000LL)  // 50 ms
 
-static inline BOOLEAN
+// FIX (Task 4.1, instrumentation): no longer static - PTPCore.c now
+// shares this exact rate-gate (and the same DEVICE_CONTEXT.
+// LastHotPathTraceQpc state) for its own per-frame diagnostic trace,
+// instead of duplicating the gate or running two independent gates
+// against the same field. Declared in PTPCore.h.
+BOOLEAN
 AmtHotPathTraceGate(_Inout_ PDEVICE_CONTEXT pCtx, _In_ LONGLONG NowQpc100ns)
 {
     if (NowQpc100ns - pCtx->LastHotPathTraceQpc < TRACE_HOT_PATH_MIN_INTERVAL_100NS)

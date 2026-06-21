@@ -93,9 +93,33 @@ typedef struct _ACTIVE_CONTACT
     LONGLONG LastSeenQpc;      // QPC of last successful match; used for
                                // grace/retap timing instead of a
                                // slot-indexed side array.
+
+    // FIX (Task 4.2, soft-tap-loss audit): frames this contact has
+    // survived since birth, including the birth frame itself (=1 right
+    // after AmtContactBirth/AmtContactBirthWithRetapSmoothing,
+    // incremented once per AmtContactUpdate call thereafter). Used
+    // ONLY by PTPCore's Phase A to hold a too-fresh solo contact alive
+    // for a minimum number of frames so Windows' PTP gesture
+    // recognizer has time to observe a DOWN before the matching UP -
+    // see MIN_CONTACT_LIFETIME_FRAMES below. This is NOT identity and
+    // NOT a matching hint; it never influences AmtMatchCorrespond.
+    UCHAR FramesAlive;
 } ACTIVE_CONTACT, *PACTIVE_CONTACT;
 
 #define MAX_CONTACTS PTP_MAX_CONTACT_POINTS  // pool capacity, not a slot count
+
+// FIX (Task 4.2): minimum number of frames a contact must have been
+// alive (see ACTIVE_CONTACT.FramesAlive) before PTPCore's Phase A is
+// allowed to Kill it outright on an unmatched frame. Below this floor,
+// PTPCore instead re-reports the contact as CONTACT_PHASE_MOVE at its
+// last known position for one more frame and defers the lift - see
+// PTPCore.c Phase A. Deliberately conservative: 2 frames at the
+// trackpad's USB polling interval (~8ms) is ~16ms, far below human tap
+// perception, but enough for Windows' PTP gesture recognizer to
+// register the DOWN before it sees the UP. This does NOT apply to the
+// WasInGesture/EnterGrace path - multi-finger gesture release timing is
+// a different contract and must stay immediate.
+#define MIN_CONTACT_LIFETIME_FRAMES 2
 
 // Zero/FREE-initialise the whole pool. Call at device creation and D0Entry.
 VOID
@@ -186,7 +210,8 @@ AmtContactEvaluateDeadzone(
 
 // Per-frame ACTIVE contact update (Phase C). Deadzone + EMA (skipped on
 // PendingFirstSample and first solo post-gesture). Writes ReportX/Y and
-// LastSeenQpc/LastSlotHint (matching-hint maintenance).
+// LastSeenQpc/LastSlotHint (matching-hint maintenance), and increments
+// FramesAlive (see ACTIVE_CONTACT.FramesAlive / MIN_CONTACT_LIFETIME_FRAMES).
 VOID
 AmtContactUpdate(
     _Inout_ PACTIVE_CONTACT Contact,
