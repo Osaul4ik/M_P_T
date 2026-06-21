@@ -17,12 +17,15 @@ AmtPtpKeyboardNotifyCallback(
 );
 
 // AmtPtpGetDeviceConfig
+//
+// AUDIT FIX (#7): takes the descriptor by pointer instead of by value —
+// avoids an unnecessary full-struct copy onto the stack on every call.
 
 _IRQL_requires_(PASSIVE_LEVEL)
 static const struct BCM5974_CONFIG*
-AmtPtpGetDeviceConfig(_In_ USB_DEVICE_DESCRIPTOR deviceInfo)
+AmtPtpGetDeviceConfig(_In_ const PUSB_DEVICE_DESCRIPTOR DeviceDescriptor)
 {
-    USHORT id = deviceInfo.idProduct;
+    USHORT id = DeviceDescriptor->idProduct;
     const struct BCM5974_CONFIG* cfg;
 
     for (cfg = Bcm5974ConfigTable; cfg->identification; ++cfg) {
@@ -110,7 +113,7 @@ AmtPtpDeviceUsbKmEvtDevicePrepareHardware(
     WdfUsbTargetDeviceGetDeviceDescriptor(
         pDeviceContext->UsbDevice, &pDeviceContext->DeviceDescriptor);
 
-    pDeviceContext->DeviceInfo = AmtPtpGetDeviceConfig(pDeviceContext->DeviceDescriptor);
+    pDeviceContext->DeviceInfo = AmtPtpGetDeviceConfig(&pDeviceContext->DeviceDescriptor);
     if (pDeviceContext->DeviceInfo == NULL) {
         TraceEvents(TRACE_LEVEL_ERROR, TRACE_DEVICE,
             "AmtPtpGetDeviceConfig failed");
@@ -393,21 +396,43 @@ cleanup:
     return status;
 }
 
+// ---------------------------------------------------------------------
 // Keyboard notification / typing suppression
+//
+// AUDIT FIX (#1, CRITICAL): the original implementation called
+// ExCreateCallback()/ExRegisterCallback() — PASSIVE_LEVEL-only APIs —
+// while holding a KSPIN_LOCK, which unconditionally raises IRQL to
+// DISPATCH_LEVEL. That is an IRQL contract violation on every single
+// registration, with a real risk of a bug-check (or, on some build
+// configurations, silently undefined behavior) the very first time a
+// device is powered up. Fixed by switching the serialization primitive
+// from KSPIN_LOCK to a FAST_MUTEX. A fast mutex only raises IRQL to
+// APC_LEVEL (never DISPATCH_LEVEL) and is the standard WDM primitive for
+// guarding PASSIVE_LEVEL-only object-manager calls like this one.
+//
+// AUDIT FIX (#6): the lazy one-shot initialisation of the lock itself is
+// now a proper atomic check-and-set (InterlockedCompareExchange) instead
+// of a bare "if (!flag) { init(); flag = TRUE; }", which was a classic
+// unsynchronized double-checked-init data race if two device instances
+// ever reached AmtPtpRegisterKeyboardNotification concurrently.
+// ---------------------------------------------------------------------
 
 #define CALLBACK_OBJECT_NAME L"\\Callback\\AmtPtpKbdActivity"
 
 static PCALLBACK_OBJECT g_KbdCallbackObject   = NULL;
 static LONG             g_KbdCallbackRefCount = 0;
-static KSPIN_LOCK       g_KbdCallbackLock;
-static BOOLEAN          g_KbdCallbackLockInit = FALSE;
+static FAST_MUTEX       g_KbdCallbackMutex;
+static LONG             g_KbdCallbackLockInitState = 0; // 0 = not init, 1 = init done
 
 VOID
 AmtPtpInitKeyboardNotificationLock(VOID)
 {
-    if (!g_KbdCallbackLockInit) {
-        KeInitializeSpinLock(&g_KbdCallbackLock);
-        g_KbdCallbackLockInit = TRUE;
+    // Atomic one-shot init: only the thread that transitions the state
+    // from 0 -> 1 performs ExInitializeFastMutex; every other caller
+    // (including ones that lose the race) simply returns, exactly as
+    // intended by the original (but unsynchronized) lazy-init pattern.
+    if (InterlockedCompareExchange(&g_KbdCallbackLockInitState, 1, 0) == 0) {
+        ExInitializeFastMutex(&g_KbdCallbackMutex);
     }
 }
 
@@ -445,8 +470,8 @@ AmtPtpRegisterKeyboardNotification(_In_ PDEVICE_CONTEXT DeviceContext)
     NTSTATUS          status;
     OBJECT_ATTRIBUTES oa;
     UNICODE_STRING    callbackName;
-    KIRQL             oldIrql;
     PCALLBACK_OBJECT  openedObject;
+    LONG              newCount;
 
     if (DeviceContext->KbdNotifyHandle != NULL)
         return;
@@ -457,9 +482,12 @@ AmtPtpRegisterKeyboardNotification(_In_ PDEVICE_CONTEXT DeviceContext)
     InitializeObjectAttributes(&oa, &callbackName,
                                OBJ_CASE_INSENSITIVE | OBJ_PERMANENT, NULL, NULL);
 
-    KeAcquireSpinLock(&g_KbdCallbackLock, &oldIrql);
+    // AUDIT FIX (#1): ExAcquireFastMutex only raises IRQL to APC_LEVEL —
+    // safe for the PASSIVE_LEVEL-only ExCreateCallback() calls below,
+    // unlike the spinlock previously used here.
+    ExAcquireFastMutex(&g_KbdCallbackMutex);
 
-    LONG newCount = InterlockedIncrement(&g_KbdCallbackRefCount);
+    newCount = InterlockedIncrement(&g_KbdCallbackRefCount);
 
     if (newCount == 1) {
         status = ExCreateCallback(
@@ -469,7 +497,7 @@ AmtPtpRegisterKeyboardNotification(_In_ PDEVICE_CONTEXT DeviceContext)
                 "%!FUNC! ExCreateCallback failed %!STATUS! — typing suppression inactive",
                 status);
             InterlockedDecrement(&g_KbdCallbackRefCount);
-            KeReleaseSpinLock(&g_KbdCallbackLock, oldIrql);
+            ExReleaseFastMutex(&g_KbdCallbackMutex);
             return;
         }
     } else {
@@ -479,13 +507,13 @@ AmtPtpRegisterKeyboardNotification(_In_ PDEVICE_CONTEXT DeviceContext)
             TraceEvents(TRACE_LEVEL_WARNING, TRACE_DRIVER,
                 "%!FUNC! ExCreateCallback (open) failed %!STATUS!", status);
             InterlockedDecrement(&g_KbdCallbackRefCount);
-            KeReleaseSpinLock(&g_KbdCallbackLock, oldIrql);
+            ExReleaseFastMutex(&g_KbdCallbackMutex);
             return;
         }
         ObDereferenceObject(openedObject);
     }
 
-    KeReleaseSpinLock(&g_KbdCallbackLock, oldIrql);
+    ExReleaseFastMutex(&g_KbdCallbackMutex);
 
     DeviceContext->KbdNotifyHandle = ExRegisterCallback(
         g_KbdCallbackObject,
@@ -496,12 +524,12 @@ AmtPtpRegisterKeyboardNotification(_In_ PDEVICE_CONTEXT DeviceContext)
         TraceEvents(TRACE_LEVEL_WARNING, TRACE_DRIVER,
             "%!FUNC! ExRegisterCallback returned NULL — typing suppression inactive");
 
-        KeAcquireSpinLock(&g_KbdCallbackLock, &oldIrql);
+        ExAcquireFastMutex(&g_KbdCallbackMutex);
         if (InterlockedDecrement(&g_KbdCallbackRefCount) == 0) {
             ObDereferenceObject(g_KbdCallbackObject);
             g_KbdCallbackObject = NULL;
         }
-        KeReleaseSpinLock(&g_KbdCallbackLock, oldIrql);
+        ExReleaseFastMutex(&g_KbdCallbackMutex);
     } else {
         TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DRIVER,
             "%!FUNC! Keyboard notification registered");
@@ -511,8 +539,6 @@ AmtPtpRegisterKeyboardNotification(_In_ PDEVICE_CONTEXT DeviceContext)
 VOID
 AmtPtpUnregisterKeyboardNotification(_In_ PDEVICE_CONTEXT DeviceContext)
 {
-    KIRQL oldIrql;
-
     if (DeviceContext->KbdNotifyHandle != NULL) {
         ExUnregisterCallback(DeviceContext->KbdNotifyHandle);
         DeviceContext->KbdNotifyHandle = NULL;
@@ -520,12 +546,15 @@ AmtPtpUnregisterKeyboardNotification(_In_ PDEVICE_CONTEXT DeviceContext)
         return;
     }
 
-    KeAcquireSpinLock(&g_KbdCallbackLock, &oldIrql);
+    // AUDIT FIX (#1): fast mutex instead of spinlock — ObDereferenceObject
+    // is also not guaranteed-safe at DISPATCH_LEVEL in all configurations,
+    // so this path benefits from the same fix.
+    ExAcquireFastMutex(&g_KbdCallbackMutex);
     if (InterlockedDecrement(&g_KbdCallbackRefCount) == 0) {
         if (g_KbdCallbackObject != NULL) {
             ObDereferenceObject(g_KbdCallbackObject);
             g_KbdCallbackObject = NULL;
         }
     }
-    KeReleaseSpinLock(&g_KbdCallbackLock, oldIrql);
+    ExReleaseFastMutex(&g_KbdCallbackMutex);
 }
