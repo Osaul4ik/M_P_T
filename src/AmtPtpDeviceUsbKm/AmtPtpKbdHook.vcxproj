@@ -54,7 +54,7 @@
       <WppRecorderEnabled>true</WppRecorderEnabled>
       <WppScanConfigurationData Condition="'%(ClCompile.ScanConfigurationData)' == ''">trace.h</WppScanConfigurationData>
       <WppKernelMode>true</WppKernelMode>
-      <PreprocessorDefinitions>_KERNEL_MODE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <!-- _KERNEL_MODE вже визначено автоматично через /kernel, тому видаляємо його -->
       <DisableSpecificWarnings>4214;%(DisableSpecificWarnings)</DisableSpecificWarnings>
     </ClCompile>
     <Link>
@@ -67,5 +67,11 @@
   <ItemGroup>
     <ClInclude Include="*.h" />
   </ItemGroup>
+  <ItemGroup>
+    <Inf Include="AmtPtpKbdHook.inf" />
+  </ItemGroup>
+  <Target Name="CopyInfToOutDir" AfterTargets="Build">
+    <Copy SourceFiles="@(Inf)" DestinationFolder="$(OutDir)" />
+  </Target>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>
