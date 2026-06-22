@@ -46,16 +46,20 @@ jobs:
         Add-Content $env:GITHUB_ENV "INF2CAT=$($inf2cat.FullName)"
       shell: powershell
 
-    - name: Generate test certificate
+    - name: Generate test certificate and export PFX
       run: |
         $cert = New-SelfSignedCertificate `
           -Type CodeSigningCert `
           -Subject "CN=AmtPtpKbdHookTestCert" `
-          -CertStoreLocation "Cert:\LocalMachine\My" `
+          -CertStoreLocation "Cert:\CurrentUser\My" `
           -NotAfter (Get-Date).AddYears(3)
+        $pfxPath = "$env:TEMP\AmtPtpKbdHookTestCert.pfx"
         $cerPath = "$env:TEMP\AmtPtpKbdHookTestCert.cer"
+        $pwd = ConvertTo-SecureString -String "testcert123" -Force -AsPlainText
+        Export-PfxCertificate -Cert $cert -FilePath $pfxPath -Password $pwd | Out-Null
         Export-Certificate -Cert $cert -FilePath $cerPath -Type CERT | Out-Null
-        Add-Content $env:GITHUB_ENV "KBDHOOK_CERT_THUMBPRINT=$($cert.Thumbprint)"
+        Add-Content $env:GITHUB_ENV "KBDHOOK_PFX_PATH=$pfxPath"
+        Add-Content $env:GITHUB_ENV "KBDHOOK_PFX_PWD=testcert123"
         Add-Content $env:GITHUB_ENV "KBDHOOK_CERT_PATH=$cerPath"
       shell: powershell
 
@@ -136,15 +140,19 @@ jobs:
     - name: Sign SYS and CAT for KbdHook
       run: |
         Copy-Item "$env:KBDHOOK_BUILD_DIR\AmtPtpKbdHook.sys" "$env:KBDHOOK_PKG_DIR\AmtPtpKbdHook.sys"
-        & "$env:SIGNTOOL" sign /fd sha256 /sha1 "$env:KBDHOOK_CERT_THUMBPRINT" `
+
+        & "$env:SIGNTOOL" sign /fd sha256 /f "$env:KBDHOOK_PFX_PATH" /p "$env:KBDHOOK_PFX_PWD" `
           /tr http://timestamp.digicert.com /td sha256 "$env:KBDHOOK_PKG_DIR\AmtPtpKbdHook.sys"
         if ($LASTEXITCODE -ne 0) { throw "Signing .sys failed" }
+
         $pkgAbs = (Resolve-Path $env:KBDHOOK_PKG_DIR).Path
         & "$env:INF2CAT" /driver:"$pkgAbs" /os:10_X64 /uselocaltime
         if ($LASTEXITCODE -ne 0) { throw "inf2cat failed" }
-        & "$env:SIGNTOOL" sign /fd sha256 /sha1 "$env:KBDHOOK_CERT_THUMBPRINT" `
+
+        & "$env:SIGNTOOL" sign /fd sha256 /f "$env:KBDHOOK_PFX_PATH" /p "$env:KBDHOOK_PFX_PWD" `
           /tr http://timestamp.digicert.com /td sha256 "$env:KBDHOOK_PKG_DIR\AmtPtpKbdHook.cat"
         if ($LASTEXITCODE -ne 0) { throw "Signing .cat failed" }
+
         Copy-Item "$env:KBDHOOK_CERT_PATH" "$env:KBDHOOK_PKG_DIR\AmtPtpKbdHookTestCert.cer"
         Get-ChildItem $env:KBDHOOK_PKG_DIR | Select-Object Name
       shell: powershell
