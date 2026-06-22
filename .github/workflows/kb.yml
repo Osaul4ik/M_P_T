@@ -1,4 +1,4 @@
-name: Build + KbdHook
+name: kb
 
 on:
   push:
