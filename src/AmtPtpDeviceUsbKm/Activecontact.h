@@ -1,29 +1,9 @@
-// ActiveContact.h - Contact lifecycle FSM, pool-slot addressed (not hw slot).
+// ActiveContact.h - Contact lifecycle FSM. Pool-slot addressed (not hw slot).
+// ContactID is the only identity; LastSlotHint is a matching hint only.
 //
-// Replaces Track.h/TRACK[PTP_MAX_CONTACT_POINTS] indexed by raw USB slot.
-// Old scheme used hw slot as identity key - wrong: a finger lifting from
-// slot 2 and a new touch landing on slot 0 next frame couldn't express
-// "maybe related". Matching belongs in Match.c, not array indexing.
-//
-// Pool slots are an implementation detail - never exposed as identity.
-// ContactID is the only identity. LastSlotHint is a matching OPTIMIZATION
-// ONLY: removing it costs CPU, never correctness.
-//
-// ---------------------------------------------------------------------
-// State machine
-// ---------------------------------------------------------------------
-//   FREE --(birth)--> ACTIVE --(lift)--> FREE
-//                        |
-//                        |--(gesture lift)--> GRACE --(expire)--> FREE
-//
-// ContactID never reused while warm (monotonic counter). Smooth re-tap
-// via EMA baseline seeding in BirthWithRetapSmoothing, not ContactID reuse.
-//
-// ---------------------------------------------------------------------
-// Frame determinism rule
-// ---------------------------------------------------------------------
-// After matching, contacts mutate only via Phase A (lift) -> Phase B
-// (birth) -> Phase C (update/report). Ordering in PTPCore.c.
+// State machine: FREE -> ACTIVE -> FREE | GRACE -> FREE
+// ContactID monotonic, never reused while warm.
+// Frame determinism: Phase A (lift) -> Phase B (birth) -> Phase C (update).
 
 #pragma once
 
@@ -70,23 +50,8 @@ typedef struct _ACTIVE_CONTACT
     // and the deadzone+EMA path runs normally on this first sample.
     BOOLEAN PendingFirstSample;
 
-    // BUG FIX: previously AmtContactUpdate() unconditionally overwrote
-    // HystX/Y with the raw just-sampled position whenever
-    // PendingFirstSample was TRUE, and AmtContactCommitSample()
-    // unconditionally skipped EMA in that case too. That meant the
-    // EMA-seed baseline written by AmtContactBirthWithRetapSmoothing
-    // (RecentLiftX/Y) was clobbered by the very first AmtContactUpdate
-    // call in the SAME frame, before it was ever read - making
-    // AmtContactBirthWithRetapSmoothing behaviorally identical to a
-    // plain AmtContactBirth. Retap smoothing never actually smoothed
-    // anything.
-    //
-    // RetapSeeded distinguishes "first sample after a fresh birth"
-    // (HystX/Y should be reset to the real finger position) from
-    // "first sample after a retap-smoothed birth" (HystX/Y already
-    // hold a deliberate seed and must be evaluated/blended normally,
-    // not reset). Cleared together with PendingFirstSample once the
-    // first sample has been committed.
+    // Prevents first-frame clobber of EMA seed from
+    // AmtContactBirthWithRetapSmoothing.
     BOOLEAN RetapSeeded;
 
     // Reported last frame? Drives Phase A lift-off detection.
@@ -96,20 +61,13 @@ typedef struct _ACTIVE_CONTACT
     USHORT   LastSlotHint;    // hw slot matched to last frame; speeds up matching
     LONGLONG LastSeenQpc;     // QPC of last successful match; grace/retap timing
 
-    // Frames alive since birth. Used by Phase A to hold the last finger
-    // of a gesture session alive for MIN_CONTACT_LIFETIME_FRAMES so
-    // Windows' gesture recognizer sees DOWN before UP.
-    // NOT used for solo tap deferral (Issue #2 fix).
-    // NOT identity, NOT a matching hint.
+    // Gesture-last-finger deferral counter. NOT identity/matching hint.
     UCHAR FramesAlive;
 } ACTIVE_CONTACT, *PACTIVE_CONTACT;
 
 #define MAX_CONTACTS PTP_MAX_CONTACT_POINTS  // pool capacity, not slot count
 
-// Min frames before Phase A defers kill on the last finger of a gesture
-// session. Applied ONLY when WasInGesture=TRUE && aliveCount==0.
-// Solo contacts are killed immediately regardless of FramesAlive.
-// See PTPCore.c Phase A for the full gating logic.
+// Gesture-last-finger kill deferral. Solo contacts killed immediately.
 #define MIN_CONTACT_LIFETIME_FRAMES 2
 
 // Zero/FREE-initialise the whole pool. Call at device creation and D0Entry.
@@ -132,18 +90,7 @@ AmtContactBirth(
     _In_    USHORT          slotHint
 );
 
-// Like AmtContactBirth but seeds HystX/Y and ReportX/Y to RecentLiftX/Y
-// so EMA blends smoothly from the lift position on subsequent MOVE frames
-// (cursor continuity on re-tap).
-//
-// Sets RetapSeeded=TRUE (see ACTIVE_CONTACT.RetapSeeded above) so the
-// FIRST AmtContactUpdate call after this birth does NOT clobber the
-// seeded HystX/Y with the raw touch-down position - it instead runs the
-// normal deadzone+EMA path against the seeded baseline, which is what
-// actually produces the intended smooth-cursor-continuity-on-retap
-// behavior. (Previously RetapSeeded did not exist and the seed was
-// overwritten before ever being used - see the FIX comment on
-// RetapSeeded in ActiveContact.h.)
+// AmtContactBirth + EMA baseline seed from lift position + RetapSeeded=TRUE.
 VOID
 AmtContactBirthWithRetapSmoothing(
     _Inout_ PACTIVE_CONTACT Pool,
@@ -204,12 +151,7 @@ AmtContactEvaluateDeadzone(
     _In_ USHORT                candY
 );
 
-// Per-frame ACTIVE contact update (Phase C). Deadzone + EMA (skipped on
-// PendingFirstSample for a plain birth, and on first solo post-gesture
-// frame). For a retap-seeded birth (RetapSeeded==TRUE), the first sample
-// runs deadzone+EMA normally against the seeded baseline instead of
-// bypassing it - see ACTIVE_CONTACT.RetapSeeded. Updates matching hints
-// and increments FramesAlive.
+// Per-frame ACTIVE contact update (Phase C). Deadzone + EMA.
 VOID
 AmtContactUpdate(
     _Inout_ PACTIVE_CONTACT Contact,
@@ -223,7 +165,7 @@ AmtContactUpdate(
 );
 
 #if DBG
-// Debug: unique ContactIDs, no zero IDs on non-FREE, no flags on FREE.
+// Debug invariants.
 VOID
 AmtContactPoolCheckInvariants(_In_reads_(MAX_CONTACTS) const ACTIVE_CONTACT* Pool);
 #else

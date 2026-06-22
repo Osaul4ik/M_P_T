@@ -1,32 +1,5 @@
 // PTPCore.h - Layer contract for the PTP touch stack.
-//
-// Defines boundary types between layers:
-//
-//   USB/Wellspring driver (Interrupt.c)
-//         |  RAW_FRAME (no state, no decisions)
-//         v
-//   InputAdapter (Input.c)              -- decode + normalize only
-//         |  RAW_FRAME
-//         v
-//   PTPCore_ProcessFrame (PTPCore.c)    -- single orchestration entry point:
-//         |                                ContactMatcher (Match.c) +
-//         |                                StateMachine (ActiveContact.c) +
-//         |                                palm session + gesture session
-//         v
-//   PTP_CORE_FRAME (stable ContactID[] with FSM phase)
-//         v
-//   Interrupt.c                         -- serializes into PTP_REPORT only
-//
-// Design notes:
-//   1. RAW_CONTACT/RAW_FRAME use fixed-size array (kernel driver at
-//      DISPATCH_LEVEL - no CRT, no heap). PTP_MAX_CONTACT_POINTS (5) is
-//      a hard hardware limit.
-//   2. Tip-size debounce is NOT in InputAdapter - it reads previous
-//      contact state, so it's a Matcher concern (Match.c).
-//   3. ContactMatcher (Match.c) is cost-based: squared spatial distance
-//      with slot index as narrow tie-breaker only, never as identity key.
-//   4. Orchestration lives in PTPCore.c, not Interrupt.c or scattered
-//      into Match.c/ActiveContact.c.
+// Interrupt.c -> Input.c -> PTPCore.c (Match.c + ActiveContact.c + Gesture.c) -> PTP_REPORT.
 
 #pragma once
 
@@ -35,9 +8,7 @@
 
 EXTERN_C_START
 
-// ===========================================================================
-// Layer 0: Raw input (InputAdapter output). No state, no decisions.
-// ===========================================================================
+// Raw input (InputAdapter output). No state, no decisions.
 
 typedef struct _RAW_CONTACT
 {
@@ -56,9 +27,7 @@ typedef struct _RAW_FRAME
     RAW_CONTACT Contacts[PTP_MAX_CONTACT_POINTS];
 } RAW_FRAME, *PRAW_FRAME;
 
-// ===========================================================================
-// Layer 1: PTPCore output. Stable contact identities + FSM phase.
-// ===========================================================================
+// PTPCore output. Stable contact identities + FSM phase.
 
 typedef enum _CONTACT_PHASE
 {
@@ -68,8 +37,7 @@ typedef enum _CONTACT_PHASE
     CONTACT_PHASE_UP,        // lifted this frame (-> FREE or GRACE)
 } CONTACT_PHASE;
 
-// One reportable contact for the current frame. PTPCore's output contract.
-// Interrupt.c reads this and nothing else - never touches ACTIVE_CONTACT.
+// PTPCore output contract. Interrupt.c reads only this.
 typedef struct _PTP_CORE_CONTACT
 {
     ULONG          ContactID;     // stable, monotonic, never reused while warm
@@ -89,10 +57,7 @@ typedef struct _PTP_CORE_FRAME
     BOOLEAN           LargePalmBlanked;  // whole-pad palm event this frame
 } PTP_CORE_FRAME, *PPTP_CORE_FRAME;
 
-// ===========================================================================
-// PTPCore_ProcessFrame - single entry point owning all frame orchestration:
-// matching, lifecycle FSM, gesture/palm session bookkeeping.
-// ===========================================================================
+// PTPCore_ProcessFrame - single frame-orchestration entry point.
 
 struct _DEVICE_CONTEXT; // fwd decl, defined in Device.h
 
@@ -104,15 +69,11 @@ PTPCore_ProcessFrame(
     _Out_   PTP_CORE_FRAME*         OutResult
 );
 
-// FIX (Task 4.1): hot-path trace rate gate. Shared between Interrupt.c
-// and PTPCore.c using the same DEVICE_CONTEXT.LastHotPathTraceQpc state.
+// Hot-path trace rate gate. Shared between Interrupt.c and PTPCore.c.
 BOOLEAN
 AmtHotPathTraceGate(_Inout_ struct _DEVICE_CONTEXT* pCtx, _In_ LONGLONG NowQpc100ns);
 
-// ===========================================================================
-// Recent-lift memory for retap smoothing. Ring buffer (not slot-indexed)
-// of "where/when did a contact last lift", matched by proximity at birth.
-// ===========================================================================
+// Recent-lift ring buffer for retap smoothing.
 
 #define RECENT_LIFT_CAPACITY PTP_MAX_CONTACT_POINTS
 
@@ -138,8 +99,7 @@ AmtRecentLiftRecord(
     _In_    USHORT            Y
 );
 
-// Finds closest-in-time-and-space recent lift to (CandX, CandY).
-// Returns FALSE if none qualifies (caller falls back to raw birth).
+// Find closest lift to (CandX, CandY). FALSE -> raw birth.
 BOOLEAN
 AmtRecentLiftFindNearby(
     _In_  const RECENT_LIFT_RING* Ring,

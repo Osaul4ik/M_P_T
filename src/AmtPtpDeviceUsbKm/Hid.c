@@ -1,4 +1,4 @@
-// HID descriptor and report handling. Kernel-mode Driver Framework
+// HID descriptor and report handling.
 
 #include "Driver.h"
 #include "hid.tmh"
@@ -61,7 +61,7 @@ AmtPtpGetHidDescriptor(
 		case USB_DEVICE_ID_APPLE_T2_7B:
 		case USB_DEVICE_ID_APPLE_T2_7C:
 		case USB_DEVICE_ID_APPLE_T2_7D:
-		// MacBookPro16,1 (2019) — product ID 0x0340, not in the 13"/15" list.
+        // MacBookPro16,1 (2019)
 		case USB_DEVICE_ID_APPLE_T2_16:
 		{
 			szCopy = AmtPtpT2DefaultHidDescriptor.bLength;
@@ -206,7 +206,7 @@ AmtPtpGetReportDescriptor(
 		case USB_DEVICE_ID_APPLE_T2_7B:
 		case USB_DEVICE_ID_APPLE_T2_7C:
 		case USB_DEVICE_ID_APPLE_T2_7D:
-		// See matching comment in AmtPtpGetHidDescriptor.
+        // See AmtPtpGetHidDescriptor.
 		case USB_DEVICE_ID_APPLE_T2_16:
 		{
 
@@ -392,8 +392,7 @@ AmtPtpReportFeatures(
 
 			PPTP_DEVICE_HQA_CERTIFICATION_REPORT certReport = (PPTP_DEVICE_HQA_CERTIFICATION_REPORT)pHidPacket->reportBuffer;
 
-			// Use RtlCopyMemory — direct assignment was a comma expression
-			// that only wrote the last byte.
+            // RtlCopyMemory (direct assignment was a comma-expression bug).
 			{
 				static const UCHAR HqaBlob[256] = { DEFAULT_PTP_HQA_BLOB };
 				C_ASSERT(sizeof(HqaBlob) == sizeof(certReport->CertificationBlob));
@@ -523,12 +522,7 @@ AmtPtpSetFeatures(
 				}
 				default:
 				{
-					// FIX: previously no default case here. An unknown
-					// Mode value fell through the switch doing nothing,
-					// while status remained STATUS_SUCCESS (set earlier)
-					// and the code below logged "is fulfilled" - silently
-					// claiming success for a request that was never
-					// actually handled.
+                // Unknown Mode: previously fell through silently claiming success.
 					TraceEvents(
 						TRACE_LEVEL_WARNING, TRACE_DRIVER,
 						"%!FUNC! Report REPORTID_REPORTMODE requested unknown Mode=%d",
@@ -560,34 +554,8 @@ AmtPtpSetFeatures(
 				secInput->SurfaceReport
 			);
 
-			// REVERTED: an earlier revision of this function applied
-			// secInput->ButtonReport/SurfaceReport directly to
-			// pDeviceContext->PtpReportButton/PtpReportTouch. That is
-			// the technically "correct" reading of the Selective
-			// Report Mode feature report per the PTP/HID spec, but it
-			// regressed real hardware: Windows (or its HID class
-			// driver stack) sends this report during normal operation
-			// with SurfaceReport==0 under conditions this driver does
-			// not currently disambiguate (e.g. capability negotiation,
-			// mouse-emulation fallback windows). The moment that
-			// happens, PtpReportTouch latches FALSE and stays FALSE
-			// (see DEVICE_CONTEXT.PtpReportTouch / Interrupt.c, which
-			// has no other path to re-enable it outside of a full
-			// D0Exit/D0Entry power cycle) - Interrupt.c then
-			// deliberately builds an EMPTY RAW_FRAME every interrupt,
-			// so PTPCore_ProcessFrame lifts every active contact and
-			// the pad appears to stop responding to movement entirely,
-			// even though the USB pipe and core pipeline are still
-			// running normally.
-			//
-			// Until this driver can reliably distinguish "Windows
-			// wants touch suppressed for a real reason" from "Windows
-			// sent a stale/negotiation SetFeature", honoring this
-			// report for surface/button gating does more harm than
-			// good. Left as trace-only (matching the original,
-			// long-standing behavior) - PtpReportButton/PtpReportTouch
-			// remain driven only by AmtPtpDeviceUsbKmCreateDevice /
-			// AmtPtpDeviceUsbKmEvtDevicePrepareHardware (always TRUE).
+            // REVERTED: honoring SurfaceReport regressed real hardware
+            // (pad stops responding). Kept trace-only.
 			TraceEvents(
 				TRACE_LEVEL_INFORMATION, TRACE_DRIVER,
 				"%!FUNC! Report REPORTID_FUNCSWITCH is fulfilled"

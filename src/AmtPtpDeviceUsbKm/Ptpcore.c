@@ -1,11 +1,4 @@
-// PTPCore.c - PTPCore_ProcessFrame: single frame-orchestration entry point.
-// Owns Phase A (lift) -> Phase B (birth) -> Phase C (update/report)
-// sequencing, palm session, and gesture session bookkeeping. Everything
-// that used to live inline in Interrupt.c's USB completion routine.
-//
-// Frame-determinism rule: after AmtMatchCorrespond resolves
-// correspondences, no ACTIVE_CONTACT may be mutated except through the
-// ordered phase sequence below.
+// PTPCore.c - Frame orchestration: Phase A (lift) -> Phase B (birth) -> Phase C (update).
 
 #include "Driver.h"
 #include "PTPCore.h"
@@ -14,9 +7,7 @@
 #include "Match.h"
 #include "Gesture.h"
 
-// ---------------------------------------------------------------------
 // Recent-lift ring buffer (slot-independent retap memory)
-// ---------------------------------------------------------------------
 
 VOID
 AmtRecentLiftRecord(
@@ -87,8 +78,7 @@ AmtRecentLiftFindNearby(
     return found;
 }
 
-// Writes one lift-off into OutResult, or defers to overflow queue if
-// frame is full. Never silently drops a lift-off.
+// Emit lift-off; overflow queue if frame full.
 static VOID
 AmtCoreEmitLift(
     _Inout_ PDEVICE_CONTEXT pCtx,
@@ -121,8 +111,7 @@ AmtCoreEmitLift(
     }
 }
 
-// Drains deferred lift-offs from previous frame into this frame's result.
-// Called first, before this frame's own lift-offs.
+// Drain deferred lift-offs from previous frame.
 static VOID
 AmtCoreDrainOverflow(
     _Inout_ PDEVICE_CONTEXT pCtx,
@@ -141,9 +130,7 @@ AmtCoreDrainOverflow(
     pCtx->OverflowCount = 0;
 }
 
-// ---------------------------------------------------------------------
 // PTPCore_ProcessFrame
-// ---------------------------------------------------------------------
 
 VOID
 PTPCore_ProcessFrame(
@@ -158,31 +145,15 @@ PTPCore_ProcessFrame(
     RtlZeroMemory(OutResult, sizeof(PTP_CORE_FRAME));
     OutResult->TimestampQpc = NowQpc;
 
-    // ---- ContactMatcher: build candidates (palm + tip-debounce) ----
+    // Build candidates (palm + tip-debounce)
     MATCH_CANDIDATE_SET candidates;
     BOOLEAN              largePalm = FALSE;
 
     AmtMatchBuildCandidates(RawFrame, pCtx->DeviceInfo, pCtx->ActiveContacts,
                             &candidates, &largePalm);
 
-    // ---- Palm session orchestration ----
-    //
-    // BUG FIX: track whether THIS frame's candidate set was forcibly
-    // blanked because of a palm event (either a brand-new PALM_LARGE
-    // this frame, or an ongoing PalmDetected latch suppressing
-    // already-down fingers). Previously, any real ACTIVE contact that
-    // got unmatched as a side effect of this blanking was killed in
-    // Phase A exactly like a genuine, organic finger lift-off -
-    // including being recorded into RecentLifts for retap-smoothing
-    // (AmtRecentLiftRecord). That is wrong: a palm touching the pad and
-    // "stealing"/suppressing real fingers does not mean those fingers
-    // were deliberately lifted at that X/Y - it's an artifact of palm
-    // rejection, not a meaningful "last tap position". Recording it
-    // let a later, genuinely new tap get incorrectly retap-smoothed
-    // (and, depending on timing, get an EMA seed) against a phantom
-    // palm-induced lift instead of - or in addition to - a real one.
-    // This mirrors the existing, intentional exclusion already applied
-    // to gesture lifts (Issue #4 fix) below.
+    // Palm session: suppress candidates when palm active.
+    // Palm-induced lifts are NOT recorded in RecentLifts.
     BOOLEAN palmSuppressedFrame = FALSE;
 
     if (largePalm) {
@@ -199,13 +170,13 @@ PTPCore_ProcessFrame(
         }
     }
 
-    // ---- ContactMatcher: cost-based correspondence ----
+    // Cost-based correspondence
     MATCH_RESULT matchResult;
     AmtMatchCorrespond(&candidates, pCtx->ActiveContacts,
                        NowQpc, pCtx->PerfFrequency.QuadPart,
                        &matchResult);
 
-    // ---- GestureEngine: session FSM ----
+    // Gesture session FSM
     UCHAR aliveCount = 0;
     for (UCHAR ci = 0; ci < candidates.Count; ci++) {
         if (!candidates.Candidates[ci].PalmLocal)
@@ -215,36 +186,11 @@ PTPCore_ProcessFrame(
     AmtGestureSessionUpdate(&pCtx->GestureSession, aliveCount);
     BOOLEAN gestureThisFrame = AmtGestureIsMultiFingerFrame(aliveCount);
 
-    // Drain deferred lift-offs from previous frame first.
+    // Drain deferred lift-offs
     AmtCoreDrainOverflow(pCtx, OutResult);
 
-    // ---- Phase A (lift): unmatched pool entries lift. ----
-    //
-    // FIX (Issue #2): MIN_CONTACT_LIFETIME_FRAMES deferral removed for
-    // solo contacts.
-    //
-    // OLD behavior: any contact with FramesAlive < 2 would get a fake
-    // MOVE injected for one extra frame before Kill. Intent was to give
-    // Windows' gesture recognizer time to see DOWN before UP.
-    //
-    // Problem: for soft taps this produces:
-    //   DOWN(frame N) -> fake MOVE(frame N+1) -> UP(frame N+2)
-    // The fake MOVE extends perceived contact time and shifts timing.
-    // At 120Hz each frame is ~8ms. A real 1-frame tap is 8ms; with the
-    // deferral Windows sees 16ms - still within tap window, but the
-    // artificial MOVE can confuse gesture recognizers that look for
-    // clean DOWN->UP sequences.
-    //
-    // NEW behavior: deferral is kept ONLY for gesture-tainted contacts
-    // (WasInGesture=TRUE) when this is the last finger lifting (aliveCount
-    // after this Phase A pass will be 0). For gesture cleanup, the
-    // recognizer genuinely needs DOWN before UP. For solo taps, immediate
-    // kill is correct.
-    //
-    // To check "is this the last finger", we use aliveCount from the
-    // candidate set (contacts still down this frame). An unmatched pool
-    // entry that is the ONLY active contact lifting with aliveCount==0
-    // is a solo tap scenario.
+    // Phase A (lift): unmatched pool entries lift.
+    // Gesture-tainted: defer kill on last finger; solo: kill immediately.
 
     for (UCHAR u = 0; u < matchResult.UnmatchedCount; u++) {
         size_t p = matchResult.UnmatchedPoolIndices[u];
@@ -252,14 +198,11 @@ PTPCore_ProcessFrame(
         ULONG  oldId; USHORT oldX, oldY;
 
         if (pCtx->ActiveContacts[p].WasInGesture) {
-            // Gesture-tainted: check deferral for last-finger case.
-            // FIX (Issue #2): only defer if contact is very fresh AND
-            // this was a multi-finger session ending - not for solo taps.
+            // Gesture-tainted: defer if fresh and last finger.
             if (pCtx->ActiveContacts[p].FramesAlive < MIN_CONTACT_LIFETIME_FRAMES
                 && aliveCount == 0)
             {
-                // Last finger of a gesture session, too fresh - defer one
-                // frame so gesture recognizer sees DOWN+UP properly.
+                // Defer one frame for gesture recognizer.
                 pCtx->ActiveContacts[p].FramesAlive++;
 
                 if (OutResult->ContactCount < PTP_MAX_CONTACT_POINTS) {
@@ -276,25 +219,17 @@ PTPCore_ProcessFrame(
                 continue; // no lift-off this frame
             }
 
-            // FIX (Issue #4): do NOT record gesture lift in RecentLifts.
-            // Post-gesture lifts should not trigger retap smoothing for
-            // subsequent solo taps. The lift position after a scroll/pinch
-            // is where the finger happened to stop - not a meaningful "last
-            // tap position" that a new solo tap should smooth against.
+            // Gesture lift: not recorded in RecentLifts.
             AmtContactEnterGrace(pCtx->ActiveContacts, p, &oldId, &oldX, &oldY);
             AmtContactExpireGrace(pCtx->ActiveContacts, p);
             // No AmtRecentLiftRecord here - intentional (Issue #4 fix).
             AmtCoreEmitLift(pCtx, OutResult, oldId, oldX, oldY);
 
         } else {
-            // FIX (Issue #2): solo contact - kill immediately, no deferral.
-            // Clean DOWN -> UP is what Windows needs for tap recognition.
+            // Solo contact: kill immediately.
             AmtContactKill(pCtx->ActiveContacts, p, &oldId, &oldX, &oldY);
 
-            // Solo lift: record for retap smoothing (cursor continuity) -
-            // but ONLY if this lift is a genuine finger-up, not an
-            // artifact of palm rejection blanking the whole candidate
-            // set this frame (see palmSuppressedFrame comment above).
+            // Record in RecentLifts unless palm-suppressed.
             if (!palmSuppressedFrame) {
                 AmtRecentLiftRecord(&pCtx->RecentLifts, NowQpc, oldX, oldY);
             }
@@ -302,7 +237,7 @@ PTPCore_ProcessFrame(
         }
     }
 
-    // NewIdentity (firmware origin==0) is also a lift-of-old + birth-of-new.
+    // NewIdentity (origin==0): lift old + birth new.
     for (UCHAR ci = 0; ci < candidates.Count; ci++) {
         if (candidates.Candidates[ci].PalmLocal) continue;
 
@@ -314,15 +249,10 @@ PTPCore_ProcessFrame(
         if (pCtx->ActiveContacts[p].WasInGesture) {
             AmtContactEnterGrace(pCtx->ActiveContacts, p, &oldId, &oldX, &oldY);
             AmtContactExpireGrace(pCtx->ActiveContacts, p);
-            // FIX (Issue #4): gesture lift not recorded in RecentLifts.
+            // Gesture lift: not recorded in RecentLifts.
         } else {
             AmtContactKill(pCtx->ActiveContacts, p, &oldId, &oldX, &oldY);
-            // This path runs over `candidates` (post palm-suppression),
-            // so candidates.Count would already be 0 here whenever
-            // palmSuppressedFrame is TRUE - this loop body simply won't
-            // execute in that case. No additional guard needed, but the
-            // intent (no palm-artifact lifts in RecentLifts) is the same
-            // as the Phase A fix above.
+            // Palm-suppressed: candidates.Count==0, loop won't execute.
             AmtRecentLiftRecord(&pCtx->RecentLifts, NowQpc, oldX, oldY);
         }
 
@@ -333,7 +263,7 @@ PTPCore_ProcessFrame(
 
     AmtContactPoolCheckInvariants(pCtx->ActiveContacts);
 
-    // ---- Phase B (birth): unmatched candidates birth new pool entries. ----
+    // Phase B (birth): unmatched candidates birth new pool entries.
     for (UCHAR ci = 0; ci < candidates.Count; ci++) {
         const MATCH_CANDIDATE* cand = &candidates.Candidates[ci];
         if (cand->PalmLocal) continue;
@@ -354,15 +284,7 @@ PTPCore_ProcessFrame(
                                     cand->X, cand->Y, &liftX, &liftY);
 
         if (looksLikeRetap) {
-            // FIX (RetapSeeded): BirthWithRetapSmoothing now sets
-            // RetapSeeded=TRUE so the seeded HystX/Y baseline (liftX/Y)
-            // survives the first AmtContactUpdate call in Phase C below
-            // instead of being immediately overwritten - see the FIX
-            // comments in ActiveContact.c/.h. The first DOWN report
-            // still reflects the real finger position whenever it has
-            // moved outside the deadzone from the seed; if the finger
-            // landed essentially on top of the lift position, DOWN is
-            // reported at the (effectively identical) seeded position.
+            // RetapSeeded: seed survives first AmtContactUpdate.
             AmtContactBirthWithRetapSmoothing(
                 pCtx->ActiveContacts, freeIdx, &pCtx->NextContactId,
                 liftX, liftY, cand->SlotIndex);
@@ -381,8 +303,7 @@ PTPCore_ProcessFrame(
 
     AmtContactPoolCheckInvariants(pCtx->ActiveContacts);
 
-    // ---- Phase C (update / report): every candidate now has a
-    // correspondence. Update once, report once. ----
+    // Phase C (update / report): update once, report once.
     for (UCHAR ci = 0; ci < candidates.Count; ci++) {
         const MATCH_CANDIDATE* cand = &candidates.Candidates[ci];
         if (cand->PalmLocal) continue;
@@ -396,8 +317,7 @@ PTPCore_ProcessFrame(
             pCtx->ActiveContacts[p].WasInGesture = TRUE;
         }
 
-        // Mirror tip-drop verdict back into pool so debounce counter
-        // is real (see Match.c comment for full explanation).
+        // Mirror tip-drop verdict back into pool.
         pCtx->ActiveContacts[p].TipDropCount = cand->TipDropApplied;
 
         USHORT repX, repY;

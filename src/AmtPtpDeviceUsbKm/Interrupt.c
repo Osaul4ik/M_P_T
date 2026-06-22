@@ -1,26 +1,15 @@
-// Interrupt.c: USB completion handling.
-//
-// CORRECTED scope: this file owns exactly four things:
-//   1. USB read completion mechanics (buffer validation, request plumbing)
-//   2. RawFrame construction (delegated to Input.c - no decisions here)
-//   3. ONE call to PTPCore_ProcessFrame (all matching, lifecycle FSM,
-//      palm/gesture session bookkeeping lives there - see PTPCore.c)
-//   4. Serializing PTP_CORE_FRAME into wire-format PTP_REPORT
-//
-// It does NOT decide grace-vs-kill, retap-vs-raw, or any other lifecycle
-// routing - those decisions are not visible in this file at all anymore.
+// Interrupt.c: USB completion -> RawFrame -> PTPCore_ProcessFrame -> PTP_REPORT.
+// No lifecycle decisions here.
 
 #include "Driver.h"
 #include "PTPCore.h"
 #include "Input.h"
 #include "Interrupt.tmh"
 
-// Hot-path trace rate limiting - max 1 verbose/info trace per interval.
+// Hot-path trace rate limiting.
 #define TRACE_HOT_PATH_MIN_INTERVAL_100NS  (50LL * 10000LL)  // 50 ms
 
-// FIX (Task 4.1): no longer static - PTPCore.c shares this rate-gate
-// (and DEVICE_CONTEXT.LastHotPathTraceQpc state) for its own diagnostic
-// trace. Declared in PTPCore.h.
+// Shared with PTPCore.c (declared in PTPCore.h).
 BOOLEAN
 AmtHotPathTraceGate(_Inout_ PDEVICE_CONTEXT pCtx, _In_ LONGLONG NowQpc100ns)
 {
@@ -47,8 +36,7 @@ AmtReportCheckInvariants(_In_ const PTP_REPORT* Report)
 #define AmtReportCheckInvariants(Report) ((VOID)0)
 #endif
 
-// Serializes PTP_CORE_FRAME into wire-format PTP_REPORT. Pure formatting
-// - no decisions about what is reported or why.
+// Serialize PTP_CORE_FRAME to PTP_REPORT. Pure formatting.
 static VOID
 AmtSerializeCoreFrameToReport(
     _In_  const PTP_CORE_FRAME* CoreFrame,
@@ -141,7 +129,7 @@ AmtPtpEvtUsbInterruptPipeReadComplete(
     WDFREQUEST    Request;
     WDFMEMORY     RequestMemory;
 
-    // ---- 1. USB read completion mechanics ----
+    // USB read completion
 
     if (NumBytesTransferred < headerSize ||
         (NumBytesTransferred - headerSize) % fingerSize != 0) {
@@ -185,11 +173,7 @@ AmtPtpEvtUsbInterruptPipeReadComplete(
     BOOLEAN buttonSnapshot =
         pCtx->PtpReportButton && TouchBuffer[pCtx->DeviceInfo->tp_button];
 
-    // Typing suppression: "should we process input at all" gate, not a
-    // PTPCore frame decision - stays here. When active, frame is treated
-    // as empty, driving PTPCore_ProcessFrame to lift every active contact
-    // through normal Phase A path (EnterGrace+ExpireGrace for gesture-
-    // tainted contacts, same observable result as old direct Kill).
+    // Typing suppression gate (not a PTPCore decision).
     BOOLEAN suppressingTyping = FALSE;
     {
         LONGLONG suppressUntil = InterlockedCompareExchange64(
@@ -202,7 +186,7 @@ AmtPtpEvtUsbInterruptPipeReadComplete(
         }
     }
 
-    // ---- 2. RawFrame construction (InputAdapter - no decisions) ----
+    // RawFrame construction (InputAdapter - no decisions)
     RAW_FRAME rawFrame;
     RtlZeroMemory(&rawFrame, sizeof(rawFrame));
     rawFrame.TimestampQpc = Now.QuadPart;
@@ -224,11 +208,11 @@ AmtPtpEvtUsbInterruptPipeReadComplete(
     }
     // else: empty RawFrame -> PTPCore_ProcessFrame lifts all active contacts.
 
-    // ---- 3. PTPCore: the single orchestration entry point ----
+    // PTPCore orchestration
     PTP_CORE_FRAME coreFrame;
     PTPCore_ProcessFrame(pCtx, &rawFrame, Now.QuadPart, &coreFrame);
 
-    // ---- 4. Serialize into PTP_REPORT ----
+    // Serialize to PTP_REPORT
     AmtSerializeCoreFrameToReport(&coreFrame, &Report);
 
     if (buttonSnapshot) {
