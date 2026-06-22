@@ -71,8 +71,21 @@ AmtContactBirth(
     c->FramesAlive         = 1; // birth frame counts as 1
 }
 
-// Seeds baseline to recent-lift position, PendingFirstSample=FALSE so
-// first AmtContactUpdate runs normal deadzone+EMA path. No ContactID reuse.
+// Seeds EMA baseline to recent-lift position so cursor doesn't jump on
+// re-tap. PendingFirstSample=TRUE so the first AmtContactUpdate reports
+// the REAL current finger position for DOWN, then EMA blends from there.
+//
+// FIX (Issue #3): PendingFirstSample was previously FALSE here, which
+// caused the first DOWN report to use stale lift coordinates blended with
+// EMA instead of the actual touch-down position. This broke double-tap
+// detection: Windows saw DOWN at a slightly wrong position (old lift pos
+// blended with new pos), potentially outside its spatial cluster threshold.
+//
+// With PendingFirstSample=TRUE:
+//   - Frame N (DOWN):  reports real finger position (no EMA, no deadzone)
+//   - Frame N+1 (MOVE): EMA blends from real pos toward real pos -> smooth
+//   - The lift baseline (RecentLift X/Y) is stored in HystX/Y only, used
+//     as EMA seed for frame N+1 onward, never as the reported DOWN position.
 VOID
 AmtContactBirthWithRetapSmoothing(
     _Inout_ PACTIVE_CONTACT Pool,
@@ -91,13 +104,17 @@ AmtContactBirthWithRetapSmoothing(
 
     c->State             = CONTACT_ACTIVE;
     c->ContactID          = AmtContactAssignId(NextContactId);
+    // Seed EMA baseline with lift position for smooth cursor continuity
+    // on subsequent MOVE frames, but report real position on first DOWN.
     c->ReportX            = RecentLiftX;
     c->ReportY            = RecentLiftY;
     c->HystX              = RecentLiftX;
     c->HystY              = RecentLiftY;
     c->TipDropCount       = 0;
     c->WasInGesture       = FALSE;
-    c->PendingFirstSample = FALSE; // deliberate - see header
+    // FIX (Issue #3): TRUE so first Update bypasses deadzone+EMA and
+    // reports the real finger position for the DOWN event.
+    c->PendingFirstSample = TRUE;
     c->ReportedLastFrame  = FALSE;
     c->LastSlotHint        = slotHint;
     c->LastSeenQpc         = 0;
@@ -157,8 +174,6 @@ AmtContactKill(
     *OldX         = c->ReportX;
     *OldY         = c->ReportY;
 
-    // Full reset to FREE. ReportedLastFrame also clears here - caller
-    // already emitted TipSwitch=0 lift-off using Old* before pool reuse.
     RtlZeroMemory(c, sizeof(ACTIVE_CONTACT));
 }
 
@@ -181,7 +196,6 @@ AmtContactEnterGrace(
     *OldX         = c->ReportX;
     *OldY         = c->ReportY;
 
-    // Quarantine, not held reservation - no ContactID reuse.
     c->State = CONTACT_GRACE;
 }
 
@@ -291,12 +305,9 @@ AmtContactUpdate(
 
     AmtContactCommitSample(Contact, rawX, rawY, passed, aliveCountIsOne, OutX, OutY);
 
-    // Matching-hint maintenance - NOT identity.
     Contact->LastSlotHint = slotHint;
     Contact->LastSeenQpc  = nowQpc;
 
-    // Age the contact. Saturates at 255 - only compared against small
-    // MIN_CONTACT_LIFETIME_FRAMES, so saturation is harmless.
     if (Contact->FramesAlive < 255)
         Contact->FramesAlive++;
 }
