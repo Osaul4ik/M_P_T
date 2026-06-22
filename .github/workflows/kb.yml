@@ -42,8 +42,6 @@ jobs:
           Sort-Object FullName -Descending | Select-Object -First 1
         if (-not $signtool) { throw "signtool.exe not found" }
         if (-not $inf2cat)  { throw "inf2cat.exe not found" }
-        Write-Host "signtool: $($signtool.FullName)"
-        Write-Host "inf2cat:  $($inf2cat.FullName)"
         Add-Content $env:GITHUB_ENV "SIGNTOOL=$($signtool.FullName)"
         Add-Content $env:GITHUB_ENV "INF2CAT=$($inf2cat.FullName)"
       shell: powershell
@@ -55,7 +53,6 @@ jobs:
           -Subject "CN=AmtPtpKbdHookTestCert" `
           -CertStoreLocation "Cert:\LocalMachine\My" `
           -NotAfter (Get-Date).AddYears(3)
-        Write-Host "Thumbprint: $($cert.Thumbprint)"
         $cerPath = "$env:TEMP\AmtPtpKbdHookTestCert.cer"
         Export-Certificate -Cert $cert -FilePath $cerPath -Type CERT | Out-Null
         Add-Content $env:GITHUB_ENV "KBDHOOK_CERT_THUMBPRINT=$($cert.Thumbprint)"
@@ -70,89 +67,85 @@ jobs:
           /p:WindowsTargetPlatformVersion=10.0.26100.0
       shell: powershell
 
-    - name: Package, sign, and catalog KbdHook driver
+    - name: Generate INF for KbdHook
       run: |
         $buildDir = "src/AmtPtpDeviceUsbKm/build/AmtPtpKbdHook/x64/Release"
-        $pkgDir   = "$buildDir/Package"
+        $pkgDir = "$buildDir/Package"
         New-Item -ItemType Directory -Force -Path $pkgDir | Out-Null
-
         $driverVer = (Get-Date -Format "MM/dd/yyyy") + ",1.0.0.0"
-        $inf = @"
-;
-; AmtPtpKbdHook.inf - Keyboard filter driver
-;
-[Version]
-Signature="`$WINDOWS NT`$"
-Class=Keyboard
-ClassGuid={4D36E96B-E325-11CE-BFC1-08002BE10318}
-Provider=%ManufacturerName%
-CatalogFile=AmtPtpKbdHook.cat
-DriverVer=$driverVer
+        $lines = @(
+          "; AmtPtpKbdHook.inf - Keyboard filter driver",
+          "[Version]",
+          'Signature="$WINDOWS NT$"',
+          "Class=Keyboard",
+          "ClassGuid={4D36E96B-E325-11CE-BFC1-08002BE10318}",
+          "Provider=%ManufacturerName%",
+          "CatalogFile=AmtPtpKbdHook.cat",
+          "DriverVer=$driverVer",
+          "",
+          "[DestinationDirs]",
+          "DefaultDestDir = 12",
+          "",
+          "[Manufacturer]",
+          "%ManufacturerName% = Standard,NTamd64",
+          "",
+          "[Standard.NTamd64]",
+          "%KbdDeviceDesc% = KbdHook_Install, *PNP0303",
+          "%KbdDeviceDesc% = KbdHook_Install, HID_DEVICE_SYSTEM_KEYBOARD",
+          "",
+          "[KbdHook_Install]",
+          "CopyFiles = KbdHook_Files",
+          "",
+          "[KbdHook_Install.HW]",
+          "AddReg = KbdHook_AddReg",
+          "",
+          "[KbdHook_AddReg]",
+          'HKR,,"UpperFilters",0x00010000,"AmtPtpKbdHook"',
+          "",
+          "[KbdHook_Install.Services]",
+          "AddService = AmtPtpKbdHook,0x00000002,KbdHook_Service",
+          "",
+          "[KbdHook_Service]",
+          "DisplayName = %KbdFilterServiceDesc%",
+          "ServiceType = 1",
+          "StartType = 3",
+          "ErrorControl = 1",
+          "ServiceBinary = %12%\AmtPtpKbdHook.sys",
+          "",
+          "[KbdHook_Files]",
+          "AmtPtpKbdHook.sys",
+          "",
+          "[SourceDisksFiles]",
+          "AmtPtpKbdHook.sys = 1,,",
+          "",
+          "[SourceDisksNames]",
+          '1 = %DiskName%,,,""',
+          "",
+          "[Strings]",
+          'ManufacturerName = "Apple MacBook PTP"',
+          'KbdDeviceDesc = "Apple MacBook Keyboard Filter Driver"',
+          'KbdFilterServiceDesc = "AmtPtp KBD Hook Service"',
+          'DiskName = "AmtPtpKbdHook Installation Disk"'
+        )
+        Set-Content -Path "$pkgDir\AmtPtpKbdHook.inf" -Value $lines -Encoding ASCII
+        Add-Content $env:GITHUB_ENV "KBDHOOK_PKG_DIR=$pkgDir"
+        Add-Content $env:GITHUB_ENV "KBDHOOK_BUILD_DIR=$buildDir"
+      shell: powershell
 
-[DestinationDirs]
-DefaultDestDir = 12
-
-[Manufacturer]
-%ManufacturerName% = Standard,NTamd64
-
-[Standard.NTamd64]
-%KbdDeviceDesc% = KbdHook_Install, *PNP0303
-%KbdDeviceDesc% = KbdHook_Install, HID_DEVICE_SYSTEM_KEYBOARD
-
-[KbdHook_Install]
-CopyFiles = KbdHook_Files
-
-[KbdHook_Install.HW]
-AddReg = KbdHook_AddReg
-
-[KbdHook_AddReg]
-HKR,,"UpperFilters",0x00010000,"AmtPtpKbdHook"
-
-[KbdHook_Install.Services]
-AddService = AmtPtpKbdHook,0x00000002,KbdHook_Service
-
-[KbdHook_Service]
-DisplayName = %KbdFilterServiceDesc%
-ServiceType = 1
-StartType = 3
-ErrorControl = 1
-ServiceBinary = %12%\AmtPtpKbdHook.sys
-
-[KbdHook_Files]
-AmtPtpKbdHook.sys
-
-[SourceDisksFiles]
-AmtPtpKbdHook.sys = 1,,
-
-[SourceDisksNames]
-1 = %DiskName%,,,""
-
-[Strings]
-ManufacturerName = "Apple MacBook PTP"
-KbdDeviceDesc = "Apple MacBook Keyboard Filter Driver"
-KbdFilterServiceDesc = "AmtPtp KBD Hook Service"
-DiskName = "AmtPtpKbdHook Installation Disk"
-"@
-        Set-Content -Path "$pkgDir\AmtPtpKbdHook.inf" -Value $inf -Encoding ASCII
-
-        Copy-Item "$buildDir\AmtPtpKbdHook.sys" "$pkgDir\AmtPtpKbdHook.sys"
-
+    - name: Sign SYS and CAT for KbdHook
+      run: |
+        Copy-Item "$env:KBDHOOK_BUILD_DIR\AmtPtpKbdHook.sys" "$env:KBDHOOK_PKG_DIR\AmtPtpKbdHook.sys"
         & "$env:SIGNTOOL" sign /fd sha256 /sha1 "$env:KBDHOOK_CERT_THUMBPRINT" `
-          /tr http://timestamp.digicert.com /td sha256 "$pkgDir\AmtPtpKbdHook.sys"
+          /tr http://timestamp.digicert.com /td sha256 "$env:KBDHOOK_PKG_DIR\AmtPtpKbdHook.sys"
         if ($LASTEXITCODE -ne 0) { throw "Signing .sys failed" }
-
-        $pkgAbs = (Resolve-Path $pkgDir).Path
+        $pkgAbs = (Resolve-Path $env:KBDHOOK_PKG_DIR).Path
         & "$env:INF2CAT" /driver:"$pkgAbs" /os:10_X64 /uselocaltime
         if ($LASTEXITCODE -ne 0) { throw "inf2cat failed" }
-
         & "$env:SIGNTOOL" sign /fd sha256 /sha1 "$env:KBDHOOK_CERT_THUMBPRINT" `
-          /tr http://timestamp.digicert.com /td sha256 "$pkgDir\AmtPtpKbdHook.cat"
+          /tr http://timestamp.digicert.com /td sha256 "$env:KBDHOOK_PKG_DIR\AmtPtpKbdHook.cat"
         if ($LASTEXITCODE -ne 0) { throw "Signing .cat failed" }
-
-        Copy-Item "$env:KBDHOOK_CERT_PATH" "$pkgDir\AmtPtpKbdHookTestCert.cer"
-
-        Write-Host "Package contents:"
-        Get-ChildItem $pkgDir | Select-Object Name
+        Copy-Item "$env:KBDHOOK_CERT_PATH" "$env:KBDHOOK_PKG_DIR\AmtPtpKbdHookTestCert.cer"
+        Get-ChildItem $env:KBDHOOK_PKG_DIR | Select-Object Name
       shell: powershell
 
     - name: Upload USB KM Driver artifact
