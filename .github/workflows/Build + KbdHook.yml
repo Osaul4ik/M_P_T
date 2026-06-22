@@ -2,7 +2,7 @@ name: Build + KbdHook
 
 on:
   push:
-    branches: [ master ]
+    branches: [ master, MBP2019_MainFix ]
   workflow_dispatch:
 
 env:
