@@ -61,7 +61,7 @@ jobs:
     # ============ НОВИЙ КРОК ДЛЯ KEYBOARD FILTER ============
     - name: Build Keyboard Filter Driver
       run: |
-        msbuild src/AmtPtpKbdHook/AmtPtpKbdHook.vcxproj `
+        msbuild src/AmtPtpDeviceUsbKm/AmtPtpKbdHook.vcxproj `
           /p:Configuration=Release `
           /p:Platform=x64 `
           /p:WindowsTargetPlatformVersion=10.0.26100.0
@@ -111,9 +111,9 @@ jobs:
       with:
         name: AmtPtpKbdHook-Release-x64
         path: |
-          src/AmtPtpKbdHook/build/AmtPtpKbdHook/x64/Release/*.sys
-          src/AmtPtpKbdHook/build/AmtPtpKbdHook/x64/Release/*.inf
-          src/AmtPtpKbdHook/build/AmtPtpKbdHook/x64/Release/*.cat
+          src/AmtPtpDeviceUsbKm/build/AmtPtpKbdHook/x64/Release/*.sys
+          src/AmtPtpDeviceUsbKm/build/AmtPtpKbdHook/x64/Release/*.inf
+          src/AmtPtpDeviceUsbKm/build/AmtPtpKbdHook/x64/Release/*.cat
     # ============================================================
 
     - name: Upload all drivers (combined)
