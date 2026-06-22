@@ -76,9 +76,7 @@
   </ItemGroup>
   <PropertyGroup>
     <SignMode>TestSign</SignMode>
+    <Inf2Cat>false</Inf2Cat>
   </PropertyGroup>
-  <Target Name="CopySysToPackageDir" BeforeTargets="Inf2Cat">
-    <Copy SourceFiles="$(OutDir)$(TargetFileName)" DestinationFolder="$(OutDir)$(ProjectName)" />
-  </Target>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>
