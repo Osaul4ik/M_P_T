@@ -58,15 +58,31 @@ jobs:
           /p:WindowsTargetPlatformVersion=10.0.26100.0
       shell: powershell
 
-    # ============ НОВИЙ КРОК ДЛЯ KEYBOARD FILTER ============
-    - name: Build Keyboard Filter Driver
+    # ============ КРОК ДЛЯ KEYBOARD FILTER ============
+    - name: Generate test certificate for Keyboard Filter Driver
       run: |
+        $cert = New-SelfSignedCertificate -Type CodeSigningCert -Subject "CN=AmtPtpKbdHookTestCert" -CertStoreLocation "Cert:\LocalMachine\My" -NotAfter (Get-Date).AddYears(3)
+        $thumbprint = $cert.Thumbprint
+        Write-Host "Generated certificate with thumbprint: $thumbprint"
+        # Export the .cer file for the artifact
+        $cerPath = "$env:TEMP\AmtPtpKbdHookTestCert.cer"
+        Export-Certificate -Cert $cert -FilePath $cerPath -Type CERT | Out-Null
+        Write-Host "Certificate exported to $cerPath"
+        # Set output variable for later steps
+        Add-Content -Path $env:GITHUB_ENV -Value "KBDHOOK_CERT_THUMBPRINT=$thumbprint"
+        Add-Content -Path $env:GITHUB_ENV -Value "KBDHOOK_CERT_PATH=$cerPath"
+      shell: powershell
+
+    - name: Build and sign Keyboard Filter Driver
+      run: |
+        $thumbprint = if ($env:KBDHOOK_CERT_THUMBPRINT) { $env:KBDHOOK_CERT_THUMBPRINT } else { "WDKTestCert" }
         msbuild src/AmtPtpDeviceUsbKm/AmtPtpKbdHook.vcxproj `
           /p:Configuration=Release `
           /p:Platform=x64 `
-          /p:WindowsTargetPlatformVersion=10.0.26100.0
+          /p:WindowsTargetPlatformVersion=10.0.26100.0 `
+          /p:TestCertificateThumbprint=$thumbprint
       shell: powershell
-    # ========================================================
+    # ============================================================
 
     - name: Upload SPI Driver artifact
       uses: actions/upload-artifact@v4
