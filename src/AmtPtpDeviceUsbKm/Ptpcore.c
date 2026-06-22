@@ -166,7 +166,6 @@ PTPCore_ProcessFrame(
                             &candidates, &largePalm);
 
     // ---- Palm session orchestration ----
-    // Sticky suppression across frames after large-palm, until pad clears.
     if (largePalm) {
         pCtx->PalmDetected = TRUE;
         OutResult->LargePalmBlanked = TRUE;
@@ -198,45 +197,86 @@ PTPCore_ProcessFrame(
     // Drain deferred lift-offs from previous frame first.
     AmtCoreDrainOverflow(pCtx, OutResult);
 
-    // ---- Phase A (lift): unmatched pool entries lift. Gesture-tainted
-    // routes through GRACE; others via Kill - unless contact is too fresh
-    // (FramesAlive < MIN_CONTACT_LIFETIME_FRAMES), defer by one frame. ----
+    // ---- Phase A (lift): unmatched pool entries lift. ----
+    //
+    // FIX (Issue #2): MIN_CONTACT_LIFETIME_FRAMES deferral removed for
+    // solo contacts.
+    //
+    // OLD behavior: any contact with FramesAlive < 2 would get a fake
+    // MOVE injected for one extra frame before Kill. Intent was to give
+    // Windows' gesture recognizer time to see DOWN before UP.
+    //
+    // Problem: for soft taps this produces:
+    //   DOWN(frame N) -> fake MOVE(frame N+1) -> UP(frame N+2)
+    // The fake MOVE extends perceived contact time and shifts timing.
+    // At 120Hz each frame is ~8ms. A real 1-frame tap is 8ms; with the
+    // deferral Windows sees 16ms - still within tap window, but the
+    // artificial MOVE can confuse gesture recognizers that look for
+    // clean DOWN->UP sequences.
+    //
+    // NEW behavior: deferral is kept ONLY for gesture-tainted contacts
+    // (WasInGesture=TRUE) when this is the last finger lifting (aliveCount
+    // after this Phase A pass will be 0). For gesture cleanup, the
+    // recognizer genuinely needs DOWN before UP. For solo taps, immediate
+    // kill is correct.
+    //
+    // To check "is this the last finger", we use aliveCount from the
+    // candidate set (contacts still down this frame). An unmatched pool
+    // entry that is the ONLY active contact lifting with aliveCount==0
+    // is a solo tap scenario.
+
     for (UCHAR u = 0; u < matchResult.UnmatchedCount; u++) {
         size_t p = matchResult.UnmatchedPoolIndices[u];
 
         ULONG  oldId; USHORT oldX, oldY;
 
         if (pCtx->ActiveContacts[p].WasInGesture) {
+            // Gesture-tainted: check deferral for last-finger case.
+            // FIX (Issue #2): only defer if contact is very fresh AND
+            // this was a multi-finger session ending - not for solo taps.
+            if (pCtx->ActiveContacts[p].FramesAlive < MIN_CONTACT_LIFETIME_FRAMES
+                && aliveCount == 0)
+            {
+                // Last finger of a gesture session, too fresh - defer one
+                // frame so gesture recognizer sees DOWN+UP properly.
+                pCtx->ActiveContacts[p].FramesAlive++;
+
+                if (OutResult->ContactCount < PTP_MAX_CONTACT_POINTS) {
+                    PPTP_CORE_CONTACT outC = &OutResult->Contacts[OutResult->ContactCount];
+                    outC->ContactID   = pCtx->ActiveContacts[p].ContactID;
+                    outC->X           = pCtx->ActiveContacts[p].ReportX;
+                    outC->Y           = pCtx->ActiveContacts[p].ReportY;
+                    outC->Phase       = CONTACT_PHASE_MOVE;
+                    outC->Confident   = TRUE;
+                    outC->PalmSuspect = FALSE;
+                    OutResult->ContactCount++;
+                    pCtx->ActiveContacts[p].ReportedLastFrame = TRUE;
+                }
+                continue; // no lift-off this frame
+            }
+
+            // FIX (Issue #4): do NOT record gesture lift in RecentLifts.
+            // Post-gesture lifts should not trigger retap smoothing for
+            // subsequent solo taps. The lift position after a scroll/pinch
+            // is where the finger happened to stop - not a meaningful "last
+            // tap position" that a new solo tap should smooth against.
             AmtContactEnterGrace(pCtx->ActiveContacts, p, &oldId, &oldX, &oldY);
             AmtContactExpireGrace(pCtx->ActiveContacts, p);
-        } else if (pCtx->ActiveContacts[p].FramesAlive < MIN_CONTACT_LIFETIME_FRAMES) {
-            // FIX (Task 4.2): too-fresh solo contact - defer kill by one
-            // frame so Windows' gesture recognizer sees the DOWN first.
-            pCtx->ActiveContacts[p].FramesAlive++;
+            // No AmtRecentLiftRecord here - intentional (Issue #4 fix).
+            AmtCoreEmitLift(pCtx, OutResult, oldId, oldX, oldY);
 
-            if (OutResult->ContactCount < PTP_MAX_CONTACT_POINTS) {
-                PPTP_CORE_CONTACT outC = &OutResult->Contacts[OutResult->ContactCount];
-                outC->ContactID   = pCtx->ActiveContacts[p].ContactID;
-                outC->X           = pCtx->ActiveContacts[p].ReportX;
-                outC->Y           = pCtx->ActiveContacts[p].ReportY;
-                outC->Phase       = CONTACT_PHASE_MOVE;
-                outC->Confident   = TRUE;
-                outC->PalmSuspect = FALSE;
-                OutResult->ContactCount++;
-                pCtx->ActiveContacts[p].ReportedLastFrame = TRUE;
-            }
-            continue; // no lift-off this frame
         } else {
+            // FIX (Issue #2): solo contact - kill immediately, no deferral.
+            // Clean DOWN -> UP is what Windows needs for tap recognition.
             AmtContactKill(pCtx->ActiveContacts, p, &oldId, &oldX, &oldY);
-        }
 
-        AmtRecentLiftRecord(&pCtx->RecentLifts, NowQpc, oldX, oldY);
-        AmtCoreEmitLift(pCtx, OutResult, oldId, oldX, oldY);
+            // Solo lift: record for retap smoothing (cursor continuity).
+            AmtRecentLiftRecord(&pCtx->RecentLifts, NowQpc, oldX, oldY);
+            AmtCoreEmitLift(pCtx, OutResult, oldId, oldX, oldY);
+        }
     }
 
     // NewIdentity (firmware origin==0) is also a lift-of-old + birth-of-new.
-    // Not subject to MIN_CONTACT_LIFETIME_FRAMES - identity break is a
-    // hard firmware signal, must resolve immediately.
     for (UCHAR ci = 0; ci < candidates.Count; ci++) {
         if (candidates.Candidates[ci].PalmLocal) continue;
 
@@ -248,21 +288,20 @@ PTPCore_ProcessFrame(
         if (pCtx->ActiveContacts[p].WasInGesture) {
             AmtContactEnterGrace(pCtx->ActiveContacts, p, &oldId, &oldX, &oldY);
             AmtContactExpireGrace(pCtx->ActiveContacts, p);
+            // FIX (Issue #4): gesture lift not recorded in RecentLifts.
         } else {
             AmtContactKill(pCtx->ActiveContacts, p, &oldId, &oldX, &oldY);
+            AmtRecentLiftRecord(&pCtx->RecentLifts, NowQpc, oldX, oldY);
         }
 
-        AmtRecentLiftRecord(&pCtx->RecentLifts, NowQpc, oldX, oldY);
         AmtCoreEmitLift(pCtx, OutResult, oldId, oldX, oldY);
 
-        // Mark for Phase B as fresh birth.
         matchResult.CorrespondingPoolIndex[ci] = MATCH_NO_CORRESPONDENCE;
     }
 
     AmtContactPoolCheckInvariants(pCtx->ActiveContacts);
 
-    // ---- Phase B (birth): unmatched candidates birth new pool entries.
-    // Uses retap smoothing when recent-lift memory indicates fast re-tap. ----
+    // ---- Phase B (birth): unmatched candidates birth new pool entries. ----
     for (UCHAR ci = 0; ci < candidates.Count; ci++) {
         const MATCH_CANDIDATE* cand = &candidates.Candidates[ci];
         if (cand->PalmLocal) continue;
@@ -283,6 +322,11 @@ PTPCore_ProcessFrame(
                                     cand->X, cand->Y, &liftX, &liftY);
 
         if (looksLikeRetap) {
+            // FIX (Issue #3): BirthWithRetapSmoothing now sets
+            // PendingFirstSample=TRUE, so first DOWN reports real
+            // finger position, not the old lift position. The lift
+            // coords (liftX/Y) are stored only as EMA seed baseline
+            // (HystX/Y, ReportX/Y) for subsequent MOVE smoothing.
             AmtContactBirthWithRetapSmoothing(
                 pCtx->ActiveContacts, freeIdx, &pCtx->NextContactId,
                 liftX, liftY, cand->SlotIndex);
@@ -296,7 +340,6 @@ PTPCore_ProcessFrame(
             pCtx->ActiveContacts[freeIdx].WasInGesture = TRUE;
         }
 
-        // Route through Phase C immediately.
         matchResult.CorrespondingPoolIndex[ci] = freeIdx;
     }
 
@@ -317,17 +360,8 @@ PTPCore_ProcessFrame(
             pCtx->ActiveContacts[p].WasInGesture = TRUE;
         }
 
-        // BUG FIX: Match.c's tip-size debounce reads
-        // ActiveContacts[p].TipDropCount to decide when to give up
-        // bridging a weakening contact and drop it as noise, but nothing
-        // in the codebase ever WROTE to TipDropCount after birth (it was
-        // always 0, frozen from AmtContactBirth) - the debounce-exhausted
-        // path in AmtMatchBuildCandidates was unreachable dead code, and
-        // a sagging-pressure contact would bridge to its last good
-        // position (Confidence=0) forever instead of recovering or being
-        // dropped after TIP_DROP_DEBOUNCE_FRAMES. Mirror Match.c's
-        // per-candidate verdict back into the pool entry every frame so
-        // the counter is real again.
+        // Mirror tip-drop verdict back into pool so debounce counter
+        // is real (see Match.c comment for full explanation).
         pCtx->ActiveContacts[p].TipDropCount = cand->TipDropApplied;
 
         USHORT repX, repY;
@@ -350,8 +384,6 @@ PTPCore_ProcessFrame(
 
     AmtContactPoolCheckInvariants(pCtx->ActiveContacts);
 
-    // FIX (Task 4.1): per-frame diagnostic summary. Rate-gated via
-    // shared DEVICE_CONTEXT.LastHotPathTraceQpc - safe in release builds.
     if (AmtHotPathTraceGate(pCtx, NowQpc)) {
         TraceEvents(TRACE_LEVEL_VERBOSE, TRACE_INPUT,
             "%!FUNC! raw=%u cand=%u unmatched=%u out=%u palm=%d gesture=%d alive=%u",
