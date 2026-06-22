@@ -1,9 +1,14 @@
-// AmtPtpKbdHook.c - Keyboard upper-filter driver. Fires
+/ AmtPtpKbdHook.c - Keyboard upper-filter driver. Fires
 // \Callback\AmtPtpKbdActivity on key-down for 500 ms touchpad suppression.
 
 #include <ntddk.h>
 #include <wdf.h>
 #include <ntddkbd.h>     // KEYBOARD_INPUT_DATA, KEY_BREAK
+
+// ============ ДОДАНО ДЛЯ WPP ============
+#include "trace.h"               // визначення WPP_CONTROL_GUIDS та флагів
+#include "AmtPtpKbdHook.tmh"     // згенерований код трасування
+// ========================================
 
 #define CALLBACK_OBJECT_NAME L"\\Callback\\AmtPtpKbdActivity"
 #define POOL_TAG_KBD         'KBDH'
