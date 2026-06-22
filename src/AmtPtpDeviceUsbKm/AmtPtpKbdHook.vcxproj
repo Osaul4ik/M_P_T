@@ -71,7 +71,7 @@
   <ItemGroup>
     <ClInclude Include="*.h" />
   </ItemGroup>
-  <Import Project="$(VCTarget
+  <ItemGroup>
     <Inf Include="AmtPtpKbdHook.inf" />
   </ItemGroup>
   <PropertyGroup>
