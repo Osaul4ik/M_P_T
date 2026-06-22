@@ -31,6 +31,7 @@
     <DriverType>KMDF</DriverType>
     <PlatformToolset>WindowsKernelModeDriver10.0</PlatformToolset>
     <TargetVersion>Windows10</TargetVersion>
+    <InfVerif>false</InfVerif>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='ReleaseSigned|x64'" Label="Configuration">
     <ConfigurationType>Driver</ConfigurationType>
@@ -60,6 +61,9 @@
     <Link>
       <AdditionalDependencies>%(AdditionalDependencies);ntstrsafe.lib</AdditionalDependencies>
     </Link>
+    <DriverSign>
+      <FileDigestAlgorithm>sha256</FileDigestAlgorithm>
+    </DriverSign>
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="AmtPtpKbdHook.c" />
