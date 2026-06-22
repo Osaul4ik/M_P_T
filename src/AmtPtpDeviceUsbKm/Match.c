@@ -17,6 +17,12 @@
 // closer candidates at different slots).
 #define MATCH_TIE_EPSILON_SQ 4  // ~2 units linear distance, squared
 
+// FIX (#1): stationary deadzone for debounce bridge coordinate decision.
+// If finger hasn't moved more than this, use anchor (stale) coords.
+// If finger IS moving, use real coords even when below tip threshold.
+// This prevents Confidence=0 + moving stale position on soft taps.
+#define TIP_DROP_STATIONARY_DELTA       3
+
 static UCHAR
 AmtMatchCandidateTip(_In_ USHORT major, _In_ USHORT minor)
 {
@@ -89,25 +95,11 @@ AmtMatchBuildCandidates(
         }
 
         if (bestPoolIdx == MAX_CONTACTS) {
-            // FIX (soft-tap-loss + soft-tap-confidence): no anchor means
-            // brand-new contact, not noise. Let through as a birth
-            // candidate. IMPORTANT: this is genuine, just-sampled position
-            // data (rc->X/rc->Y), not a substituted/stale one -
-            // TipDropApplied stays 0 so PTPCore.c reports this contact
-            // with Confidence=1.
-            //
-            // BUG FIX: this previously set TipDropApplied=1, which made
-            // every soft (below tip-size threshold) tap's very first
-            // (DOWN) report go out with Confidence=0. Windows' PTP stack
-            // treats Confidence=0 as "not a real/trustworthy touch" and
-            // routinely fails to recognize the tap for click/gesture
-            // purposes - it only worked when ambient pressure noise
-            // happened to push the very first sample above the tip
-            // threshold (AmtMatchCandidateTip), which is rare and random,
-            // matching the observed "soft tap maybe works 1-in-10" symptom.
-            // Hard taps bypass this whole branch entirely (handled above
-            // by AmtMatchCandidateTip) and were never affected - matching
-            // "hard tap always works".
+            // No anchor = brand-new contact below tip threshold.
+            // Pass through as full-confidence birth candidate.
+            // TipDropApplied=0: real sampled position, Confidence=1.
+            // See the long comment in the original code for why this is
+            // correct and NOT noise.
             cand.X              = rc->X;
             cand.Y              = rc->Y;
             cand.TipDropApplied = 0;
@@ -116,23 +108,41 @@ AmtMatchBuildCandidates(
         }
 
         if (Pool[bestPoolIdx].TipDropCount < TIP_DROP_DEBOUNCE_FRAMES) {
-            cand.X              = Pool[bestPoolIdx].ReportX;
-            cand.Y              = Pool[bestPoolIdx].ReportY;
+            // FIX (#1 - Issue #1): coordinate selection for debounce bridge.
+            //
+            // OLD behavior: always use stale anchor coords (ReportX/Y).
+            // Problem: a soft tap that moves slightly gets Confidence=0 AND
+            // stale (wrong) coordinates. Windows PTP stack sees a contact
+            // that is both unconfident AND not where the finger actually is.
+            //
+            // NEW behavior: use REAL coords if finger has moved more than
+            // TIP_DROP_STATIONARY_DELTA; use anchor only if truly stationary.
+            //
+            // This means a soft moving contact still gets TipDropApplied
+            // (Confidence=0 on that frame) because pressure is low, but
+            // at least the position is accurate. A stationary soft contact
+            // (e.g. finger resting lightly) gets bridged to anchor as before.
+            //
+            // The key invariant: TipDropApplied=0 iff X/Y is genuine sampled
+            // data. Here TipDropApplied > 0 always (debounce is active), but
+            // we now pick real vs stale coords based on movement.
+            INT dxMove = (INT)rc->X - (INT)Pool[bestPoolIdx].ReportX;
+            INT dyMove = (INT)rc->Y - (INT)Pool[bestPoolIdx].ReportY;
+            if (dxMove < 0) dxMove = -dxMove;
+            if (dyMove < 0) dyMove = -dyMove;
+
+            BOOLEAN isStationary = (dxMove <= TIP_DROP_STATIONARY_DELTA) &&
+                                   (dyMove <= TIP_DROP_STATIONARY_DELTA);
+
+            cand.X              = isStationary ? Pool[bestPoolIdx].ReportX : rc->X;
+            cand.Y              = isStationary ? Pool[bestPoolIdx].ReportY : rc->Y;
             cand.TipDropApplied = (UCHAR)(Pool[bestPoolIdx].TipDropCount + 1);
             OutCandidates->Candidates[OutCandidates->Count++] = cand;
         }
         // else: debounce exhausted with anchor - drop candidate (noise).
-        //
-        // BUG FIX: this branch was previously unreachable in practice -
-        // ACTIVE_CONTACT.TipDropCount was set to 0 at birth and never
-        // incremented anywhere in the codebase, so the condition above
-        // was always "0 < 2" = true. A contact whose pressure sagged
-        // below the tip threshold would bridge to its last good position
-        // (with Confidence=0) forever, instead of eventually either
-        // recovering or being dropped as noise after
-        // TIP_DROP_DEBOUNCE_FRAMES. PTPCore.c (Phase C) now writes
-        // cand->TipDropApplied back into ActiveContacts[p].TipDropCount
-        // every frame, so this debounce counter is real again.
+        // TipDropCount >= TIP_DROP_DEBOUNCE_FRAMES means the pressure has
+        // been below threshold for 2+ frames with a known anchor - treat
+        // as noise and let the contact lift naturally.
     }
 }
 
