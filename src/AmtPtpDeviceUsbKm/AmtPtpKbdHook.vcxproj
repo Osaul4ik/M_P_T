@@ -19,7 +19,6 @@
     <TemplateGuid>{8c0e3d8b-df43-455b-815a-4a0e72973bc6}</TemplateGuid>
     <RootNamespace>AmtPtpKbdHook</RootNamespace>
     <InfVerif>false</InfVerif>
-    <Inf2Cat>false</Inf2Cat>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
@@ -72,5 +71,11 @@
   <ItemGroup>
     <ClInclude Include="*.h" />
   </ItemGroup>
+  <ItemGroup>
+    <Inf Include="AmtPtpKbdHook.inf" />
+  </ItemGroup>
+  <PropertyGroup>
+    <SignMode>TestSign</SignMode>
+  </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>

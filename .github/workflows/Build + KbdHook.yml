@@ -75,12 +75,10 @@ jobs:
 
     - name: Build and sign Keyboard Filter Driver
       run: |
-        $thumbprint = if ($env:KBDHOOK_CERT_THUMBPRINT) { $env:KBDHOOK_CERT_THUMBPRINT } else { "WDKTestCert" }
         msbuild src/AmtPtpDeviceUsbKm/AmtPtpKbdHook.vcxproj `
           /p:Configuration=Release `
           /p:Platform=x64 `
-          /p:WindowsTargetPlatformVersion=10.0.26100.0 `
-          /p:TestCertificateThumbprint=$thumbprint
+          /p:WindowsTargetPlatformVersion=10.0.26100.0
       shell: powershell
     # ============================================================
 
