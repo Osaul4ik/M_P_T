@@ -17,7 +17,7 @@
 //                        |--(gesture lift)--> GRACE --(expire)--> FREE
 //
 // ContactID never reused while warm (monotonic counter). Smooth re-tap
-// via PendingFirstSample bypass, not ContactID reuse.
+// via EMA baseline seeding in BirthWithRetapSmoothing, not ContactID reuse.
 //
 // ---------------------------------------------------------------------
 // Frame determinism rule
@@ -63,7 +63,8 @@ typedef struct _ACTIVE_CONTACT
     // Causes EMA skip on first solo frame (aliveCountIsOne).
     BOOLEAN WasInGesture;
 
-    // TRUE on first frame after birth. Bypasses deadzone+EMA.
+    // TRUE on first frame after birth. Bypasses deadzone+EMA so first
+    // DOWN report always carries the real finger position.
     BOOLEAN PendingFirstSample;
 
     // Reported last frame? Drives Phase A lift-off detection.
@@ -73,19 +74,20 @@ typedef struct _ACTIVE_CONTACT
     USHORT   LastSlotHint;    // hw slot matched to last frame; speeds up matching
     LONGLONG LastSeenQpc;     // QPC of last successful match; grace/retap timing
 
-    // FIX (Task 4.2): frames alive since birth. Used by Phase A to hold
-    // a too-fresh solo contact alive for MIN_CONTACT_LIFETIME_FRAMES so
-    // Windows' gesture recognizer sees DOWN before UP. NOT identity,
-    // NOT a matching hint.
+    // Frames alive since birth. Used by Phase A to hold the last finger
+    // of a gesture session alive for MIN_CONTACT_LIFETIME_FRAMES so
+    // Windows' gesture recognizer sees DOWN before UP.
+    // NOT used for solo tap deferral (Issue #2 fix).
+    // NOT identity, NOT a matching hint.
     UCHAR FramesAlive;
 } ACTIVE_CONTACT, *PACTIVE_CONTACT;
 
 #define MAX_CONTACTS PTP_MAX_CONTACT_POINTS  // pool capacity, not slot count
 
-// FIX (Task 4.2): min frames before Phase A can Kill an unmatched contact.
-// Below this, re-reports as MOVE at last position for one more frame.
-// 2 frames @ ~8ms = ~16ms, below human tap perception, enough for Windows
-// gesture recognizer. Does NOT apply to WasInGesture/EnterGrace path.
+// Min frames before Phase A defers kill on the last finger of a gesture
+// session. Applied ONLY when WasInGesture=TRUE && aliveCount==0.
+// Solo contacts are killed immediately regardless of FramesAlive.
+// See PTPCore.c Phase A for the full gating logic.
 #define MIN_CONTACT_LIFETIME_FRAMES 2
 
 // Zero/FREE-initialise the whole pool. Call at device creation and D0Entry.
@@ -108,8 +110,20 @@ AmtContactBirth(
     _In_    USHORT          slotHint
 );
 
-// Like AmtContactBirth but seeds baseline to RecentLiftX/Y with
-// PendingFirstSample=FALSE, so first sample EMA-blends against lift pos.
+// Like AmtContactBirth but seeds HystX/Y and ReportX/Y to RecentLiftX/Y
+// so EMA blends smoothly from the lift position on subsequent MOVE frames
+// (cursor continuity on re-tap).
+//
+// PendingFirstSample=TRUE: the first AmtContactUpdate call bypasses
+// deadzone+EMA and reports the REAL current finger position for DOWN.
+// The lift baseline (RecentLiftX/Y) is only used as EMA seed from
+// frame N+1 onward - it never appears as the reported DOWN coordinate.
+//
+// FIX (Issue #3): previously PendingFirstSample was FALSE here, causing
+// the DOWN report to emit a stale/blended position (old lift pos mixed
+// with new pos via EMA). This broke double-tap spatial matching in
+// Windows: the reported DOWN position was slightly off from where the
+// finger actually landed.
 VOID
 AmtContactBirthWithRetapSmoothing(
     _Inout_ PACTIVE_CONTACT Pool,
