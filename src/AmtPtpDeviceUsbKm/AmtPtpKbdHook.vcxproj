@@ -15,7 +15,7 @@
     </ProjectConfiguration>
   </ItemGroup>
   <PropertyGroup Label="Globals">
-    <ProjectGuid>{ВАШ_GUID}</ProjectGuid>
+    <ProjectGuid>c3b2a80a-f506-43e5-be62-5a0633e0ab72</ProjectGuid> <!-- ЗМІНІТЬ НА СВІЙ GUID -->
     <TemplateGuid>{8c0e3d8b-df43-455b-815a-4a0e72973bc6}</TemplateGuid>
     <RootNamespace>AmtPtpKbdHook</RootNamespace>
   </PropertyGroup>
