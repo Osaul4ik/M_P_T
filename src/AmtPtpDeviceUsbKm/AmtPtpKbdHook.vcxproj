@@ -18,6 +18,8 @@
     <ProjectGuid>c3b2a80a-f506-43e5-be62-5a0633e0ab72</ProjectGuid>
     <TemplateGuid>{8c0e3d8b-df43-455b-815a-4a0e72973bc6}</TemplateGuid>
     <RootNamespace>AmtPtpKbdHook</RootNamespace>
+    <InfVerif>false</InfVerif>
+    <Inf2Cat>false</Inf2Cat>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
@@ -31,7 +33,6 @@
     <DriverType>KMDF</DriverType>
     <PlatformToolset>WindowsKernelModeDriver10.0</PlatformToolset>
     <TargetVersion>Windows10</TargetVersion>
-    <InfVerif>false</InfVerif>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='ReleaseSigned|x64'" Label="Configuration">
     <ConfigurationType>Driver</ConfigurationType>
@@ -71,13 +72,5 @@
   <ItemGroup>
     <ClInclude Include="*.h" />
   </ItemGroup>
-  <!-- INF включено, файл має існувати в тій самій папці -->
-  <ItemGroup>
-    <Inf Include="AmtPtpKbdHook.inf" />
-  </ItemGroup>
-  <!-- Копіюємо INF у вихідну папку після збірки -->
-  <Target Name="CopyInfToOutDir" AfterTargets="Build">
-    <Copy SourceFiles="@(Inf)" DestinationFolder="$(OutDir)" />
-  </Target>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>
