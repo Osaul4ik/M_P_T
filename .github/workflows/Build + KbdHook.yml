@@ -26,13 +26,6 @@ jobs:
         Start-Process -FilePath $wdkInstaller -ArgumentList "/quiet /norestart" -Wait
       shell: powershell
 
-    - name: Build SPI Driver
-      run: |
-        msbuild src/AmtPtpDeviceSpiKm/AmtPtpDeviceSpiKm.vcxproj `
-          /p:Configuration=Release `
-          /p:Platform=x64 `
-          /p:WindowsTargetPlatformVersion=10.0.26100.0
-      shell: powershell
 
     - name: Build USB KM Driver
       run: |
@@ -42,21 +35,6 @@ jobs:
           /p:WindowsTargetPlatformVersion=10.0.26100.0
       shell: powershell
 
-    - name: Build USB UM (User-mode) Driver
-      run: |
-        msbuild src/AmtPtpDeviceUsbUm/MagicTrackpad2PtpDevice.vcxproj `
-          /p:Configuration=Release `
-          /p:Platform=x64 `
-          /p:WindowsTargetPlatformVersion=10.0.26100.0
-      shell: powershell
-
-    - name: Build HID Filter Driver
-      run: |
-        msbuild src/AmtPtpHidFilter/AmtPtpHidFilter.vcxproj `
-          /p:Configuration=Release `
-          /p:Platform=x64 `
-          /p:WindowsTargetPlatformVersion=10.0.26100.0
-      shell: powershell
 
     # ============ КРОК ДЛЯ KEYBOARD FILTER ============
     - name: Generate test certificate for Keyboard Filter Driver
@@ -64,11 +42,9 @@ jobs:
         $cert = New-SelfSignedCertificate -Type CodeSigningCert -Subject "CN=AmtPtpKbdHookTestCert" -CertStoreLocation "Cert:\LocalMachine\My" -NotAfter (Get-Date).AddYears(3)
         $thumbprint = $cert.Thumbprint
         Write-Host "Generated certificate with thumbprint: $thumbprint"
-        # Export the .cer file for the artifact
         $cerPath = "$env:TEMP\AmtPtpKbdHookTestCert.cer"
         Export-Certificate -Cert $cert -FilePath $cerPath -Type CERT | Out-Null
         Write-Host "Certificate exported to $cerPath"
-        # Set output variable for later steps
         Add-Content -Path $env:GITHUB_ENV -Value "KBDHOOK_CERT_THUMBPRINT=$thumbprint"
         Add-Content -Path $env:GITHUB_ENV -Value "KBDHOOK_CERT_PATH=$cerPath"
       shell: powershell
@@ -78,18 +54,12 @@ jobs:
         msbuild src/AmtPtpDeviceUsbKm/AmtPtpKbdHook.vcxproj `
           /p:Configuration=Release `
           /p:Platform=x64 `
-          /p:WindowsTargetPlatformVersion=10.0.26100.0
+          /p:WindowsTargetPlatformVersion=10.0.26100.0 `
+          /p:RunInfVerif=false `
+          /p:Inf2Cat=false
       shell: powershell
     # ============================================================
 
-    - name: Upload SPI Driver artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: AmtPtpDeviceSpiKm-Release-x64
-        path: |
-          src/AmtPtpDeviceSpiKm/build/AmtPtpDeviceSpiKm/x64/Release/*.sys
-          src/AmtPtpDeviceSpiKm/build/AmtPtpDeviceSpiKm/x64/Release/*.inf
-          src/AmtPtpDeviceSpiKm/build/AmtPtpDeviceSpiKm/x64/Release/*.cat
 
     - name: Upload USB KM Driver artifact
       uses: actions/upload-artifact@v4
@@ -100,25 +70,7 @@ jobs:
           src/AmtPtpDeviceUsbKm/build/AmtPtpDeviceUsbKm/x64/Release/*.inf
           src/AmtPtpDeviceUsbKm/build/AmtPtpDeviceUsbKm/x64/Release/*.cat
 
-    - name: Upload USB UM (User-mode) artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: AmtPtpDeviceUsbUm-Release-x64
-        path: |
-          src/AmtPtpDeviceUsbUm/build/MagicTrackpad2PtpDevice/x64/Release/*.dll
-          src/AmtPtpDeviceUsbUm/build/MagicTrackpad2PtpDevice/x64/Release/*.sys
-          src/AmtPtpDeviceUsbUm/build/MagicTrackpad2PtpDevice/x64/Release/*.inf
-          src/AmtPtpDeviceUsbUm/build/MagicTrackpad2PtpDevice/x64/Release/*.cat
-
-    - name: Upload HID Filter artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: AmtPtpHidFilter-Release-x64
-        path: |
-          src/AmtPtpHidFilter/build/AmtPtpHidFilter/x64/Release/*.sys
-          src/AmtPtpHidFilter/build/AmtPtpHidFilter/x64/Release/*.inf
-          src/AmtPtpHidFilter/build/AmtPtpHidFilter/x64/Release/*.cat
-
+ 
     # ============ НОВИЙ АРТЕФАКТ ДЛЯ KEYBOARD FILTER ============
     - name: Upload Keyboard Filter Driver artifact
       uses: actions/upload-artifact@v4
