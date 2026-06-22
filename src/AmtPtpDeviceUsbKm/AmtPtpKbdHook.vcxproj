@@ -18,7 +18,7 @@
     <ProjectGuid>c3b2a80a-f506-43e5-be62-5a0633e0ab72</ProjectGuid>
     <TemplateGuid>{8c0e3d8b-df43-455b-815a-4a0e72973bc6}</TemplateGuid>
     <RootNamespace>AmtPtpKbdHook</RootNamespace>
-    <InfVerif>false</InfVerif>
+    <RunInfVerif>false</RunInfVerif>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
@@ -77,5 +77,8 @@
   <PropertyGroup>
     <SignMode>TestSign</SignMode>
   </PropertyGroup>
+  <Target Name="CopySysToPackageDir" BeforeTargets="Inf2Cat">
+    <Copy SourceFiles="$(OutDir)$(TargetFileName)" DestinationFolder="$(OutDir)$(ProjectName)" />
+  </Target>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>
