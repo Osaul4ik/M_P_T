@@ -120,9 +120,7 @@ AmtMatchBuildCandidates(
         cand.Y = isStationary ? Pool[bestPoolIdx].ReportY : rc->Y;
 
         // Clamp to prevent Confidence=1 on UCHAR wrap.
-        cand.TipDropApplied = (Pool[bestPoolIdx].TipDropCount < TIP_DROP_COUNT_MAX)
-            ? (UCHAR)(Pool[bestPoolIdx].TipDropCount + 1)
-            : TIP_DROP_COUNT_MAX;
+        cand.TipDropApplied = 0;
 
         OutCandidates->Candidates[OutCandidates->Count++] = cand;
     }

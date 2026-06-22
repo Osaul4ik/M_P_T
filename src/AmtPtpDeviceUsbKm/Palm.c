@@ -11,6 +11,8 @@
 
 #define PALM_LARGE_MAJOR    380
 #define PALM_SCORE_THRESH   45
+#define PALM_MIN_MAJOR  80   // мінімальний major для підозри на долоню
+#define PALM_MIN_MINOR  40   // мінімальний minor для підозри на долоню
 
 static inline INT
 AmtPalmRawToInteger(_In_ USHORT x)
@@ -29,6 +31,10 @@ AmtPalmClassify(
 {
     INT major = AmtPalmRawToInteger(Major);
     INT minor = AmtPalmRawToInteger(Minor);
+    
+    if (major < PALM_MIN_MAJOR && minor < PALM_MIN_MINOR) {
+        return PALM_NONE;
+    }
     INT score = 0;
 
     if (major <= 0 && minor <= 0)
