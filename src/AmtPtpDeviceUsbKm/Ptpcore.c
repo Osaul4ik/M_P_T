@@ -183,18 +183,10 @@ PTPCore_ProcessFrame(
             aliveCount++;
     }
 
-    BOOLEAN prevGestureActive = pCtx->GestureSession.Active;
-
     AmtGestureSessionUpdate(&pCtx->GestureSession, aliveCount);
     BOOLEAN gestureThisFrame = AmtGestureIsMultiFingerFrame(aliveCount);
 
-    if (prevGestureActive && !pCtx->GestureSession.Active) {
-        RtlZeroMemory(&pCtx->RecentLifts, sizeof(pCtx->RecentLifts));
-        pCtx->RecentLifts.NextWriteIndex = 0;
-        TraceEvents(TRACE_LEVEL_VERBOSE, TRACE_INPUT,
-            "Gesture ended, cleared RecentLifts to prevent cursor jump");
-    }
-
+    
     // Drain deferred lift-offs
     AmtCoreDrainOverflow(pCtx, OutResult);
 
