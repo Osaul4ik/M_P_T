@@ -1,4 +1,4 @@
-name: kb
+name: Build Drivers
 
 on:
   push:
@@ -26,6 +26,14 @@ jobs:
         Start-Process -FilePath $wdkInstaller -ArgumentList "/quiet /norestart" -Wait
       shell: powershell
 
+    - name: Build SPI Driver
+      run: |
+        msbuild src/AmtPtpDeviceSpiKm/AmtPtpDeviceSpiKm.vcxproj `
+          /p:Configuration=Release `
+          /p:Platform=x64 `
+          /p:WindowsTargetPlatformVersion=10.0.26100.0
+      shell: powershell
+
     - name: Build USB KM Driver
       run: |
         msbuild src/AmtPtpDeviceUsbKm/AmtPtpDeviceUsbKm.vcxproj `
@@ -34,132 +42,30 @@ jobs:
           /p:WindowsTargetPlatformVersion=10.0.26100.0
       shell: powershell
 
-    - name: Find WDK tools path
+    - name: Build USB UM (User-mode) Driver
       run: |
-        $signtool = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Recurse -Filter "signtool.exe" |
-          Where-Object { $_.FullName -match "x64" } | Sort-Object FullName -Descending | Select-Object -First 1
-        $inf2cat = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Recurse -Filter "inf2cat.exe" |
-          Sort-Object FullName -Descending | Select-Object -First 1
-        if (-not $signtool) { throw "signtool.exe not found" }
-        if (-not $inf2cat)  { throw "inf2cat.exe not found" }
-        Write-Host "signtool: $($signtool.FullName)"
-        Write-Host "inf2cat:  $($inf2cat.FullName)"
-        Add-Content $env:GITHUB_ENV "SIGNTOOL=$($signtool.FullName)"
-        Add-Content $env:GITHUB_ENV "INF2CAT=$($inf2cat.FullName)"
-      shell: powershell
-
-    - name: Generate test certificate
-      run: |
-        $cert = New-SelfSignedCertificate `
-          -Type CodeSigningCert `
-          -Subject "CN=AmtPtpKbdHookTestCert" `
-          -CertStoreLocation "Cert:\LocalMachine\My" `
-          -NotAfter (Get-Date).AddYears(3)
-        Write-Host "Thumbprint: $($cert.Thumbprint)"
-        $cerPath = "$env:TEMP\AmtPtpKbdHookTestCert.cer"
-        Export-Certificate -Cert $cert -FilePath $cerPath -Type CERT | Out-Null
-        Add-Content $env:GITHUB_ENV "KBDHOOK_CERT_THUMBPRINT=$($cert.Thumbprint)"
-        Add-Content $env:GITHUB_ENV "KBDHOOK_CERT_PATH=$cerPath"
-      shell: powershell
-
-    - name: Build Keyboard Filter Driver
-      run: |
-        msbuild src/AmtPtpDeviceUsbKm/AmtPtpKbdHook.vcxproj `
+        msbuild src/AmtPtpDeviceUsbUm/MagicTrackpad2PtpDevice.vcxproj `
           /p:Configuration=Release `
           /p:Platform=x64 `
           /p:WindowsTargetPlatformVersion=10.0.26100.0
       shell: powershell
 
-    - name: Package, sign, and catalog KbdHook driver
+    - name: Build HID Filter Driver
       run: |
-        $buildDir = "src/AmtPtpDeviceUsbKm/build/AmtPtpKbdHook/x64/Release"
-        $pkgDir   = "$buildDir/Package"
-        New-Item -ItemType Directory -Force -Path $pkgDir | Out-Null
-
-        # -- INF --
-        $driverVer = (Get-Date -Format "MM/dd/yyyy") + ",1.0.0.0"
-        $inf = @"
-;
-; AmtPtpKbdHook.inf - Keyboard filter driver
-;
-[Version]
-Signature="`$WINDOWS NT`$"
-Class=Keyboard
-ClassGuid={4D36E96B-E325-11CE-BFC1-08002BE10318}
-Provider=%ManufacturerName%
-CatalogFile=AmtPtpKbdHook.cat
-DriverVer=$driverVer
-
-[DestinationDirs]
-DefaultDestDir = 12
-
-[Manufacturer]
-%ManufacturerName% = Standard,NTamd64
-
-[Standard.NTamd64]
-%KbdDeviceDesc% = KbdHook_Install, *PNP0303
-%KbdDeviceDesc% = KbdHook_Install, HID_DEVICE_SYSTEM_KEYBOARD
-
-[KbdHook_Install]
-CopyFiles = KbdHook_Files
-
-[KbdHook_Install.HW]
-AddReg = KbdHook_AddReg
-
-[KbdHook_AddReg]
-HKR,,"UpperFilters",0x00010000,"AmtPtpKbdHook"
-
-[KbdHook_Install.Services]
-AddService = AmtPtpKbdHook,0x00000002,KbdHook_Service
-
-[KbdHook_Service]
-DisplayName = %KbdFilterServiceDesc%
-ServiceType = 1
-StartType = 3
-ErrorControl = 1
-ServiceBinary = %12%\AmtPtpKbdHook.sys
-
-[KbdHook_Files]
-AmtPtpKbdHook.sys
-
-[SourceDisksFiles]
-AmtPtpKbdHook.sys = 1,,
-
-[SourceDisksNames]
-1 = %DiskName%,,,""
-
-[Strings]
-ManufacturerName = "Apple MacBook PTP"
-KbdDeviceDesc = "Apple MacBook Keyboard Filter Driver"
-KbdFilterServiceDesc = "AmtPtp KBD Hook Service"
-DiskName = "AmtPtpKbdHook Installation Disk"
-"@
-        Set-Content -Path "$pkgDir\AmtPtpKbdHook.inf" -Value $inf -Encoding ASCII
-
-        # -- Copy .sys into package --
-        Copy-Item "$buildDir\AmtPtpKbdHook.sys" "$pkgDir\AmtPtpKbdHook.sys"
-
-        # -- Sign .sys --
-        & "$env:SIGNTOOL" sign /fd sha256 /sha1 "$env:KBDHOOK_CERT_THUMBPRINT" `
-          /tr http://timestamp.digicert.com /td sha256 "$pkgDir\AmtPtpKbdHook.sys"
-        if ($LASTEXITCODE -ne 0) { throw "Signing .sys failed" }
-
-        # -- Generate .cat --
-        $pkgAbs = (Resolve-Path $pkgDir).Path
-        & "$env:INF2CAT" /driver:"$pkgAbs" /os:10_X64 /uselocaltime
-        if ($LASTEXITCODE -ne 0) { throw "inf2cat failed" }
-
-        # -- Sign .cat --
-        & "$env:SIGNTOOL" sign /fd sha256 /sha1 "$env:KBDHOOK_CERT_THUMBPRINT" `
-          /tr http://timestamp.digicert.com /td sha256 "$pkgDir\AmtPtpKbdHook.cat"
-        if ($LASTEXITCODE -ne 0) { throw "Signing .cat failed" }
-
-        # -- Export cert for user --
-        Copy-Item "$env:KBDHOOK_CERT_PATH" "$pkgDir\AmtPtpKbdHookTestCert.cer"
-
-        Write-Host "Package contents:"
-        Get-ChildItem $pkgDir | Select-Object Name
+        msbuild src/AmtPtpHidFilter/AmtPtpHidFilter.vcxproj `
+          /p:Configuration=Release `
+          /p:Platform=x64 `
+          /p:WindowsTargetPlatformVersion=10.0.26100.0
       shell: powershell
+
+    - name: Upload SPI Driver artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: AmtPtpDeviceSpiKm-Release-x64
+        path: |
+          src/AmtPtpDeviceSpiKm/build/AmtPtpDeviceSpiKm/x64/Release/*.sys
+          src/AmtPtpDeviceSpiKm/build/AmtPtpDeviceSpiKm/x64/Release/*.inf
+          src/AmtPtpDeviceSpiKm/build/AmtPtpDeviceSpiKm/x64/Release/*.cat
 
     - name: Upload USB KM Driver artifact
       uses: actions/upload-artifact@v4
@@ -170,12 +76,24 @@ DiskName = "AmtPtpKbdHook Installation Disk"
           src/AmtPtpDeviceUsbKm/build/AmtPtpDeviceUsbKm/x64/Release/*.inf
           src/AmtPtpDeviceUsbKm/build/AmtPtpDeviceUsbKm/x64/Release/*.cat
 
-    - name: Upload Keyboard Filter Driver artifact
+    - name: Upload USB UM (User-mode) artifact
       uses: actions/upload-artifact@v4
       with:
-        name: AmtPtpKbdHook-Release-x64
+        name: AmtPtpDeviceUsbUm-Release-x64
         path: |
-          src/AmtPtpDeviceUsbKm/build/AmtPtpKbdHook/x64/Release/Package/
+          src/AmtPtpDeviceUsbUm/build/MagicTrackpad2PtpDevice/x64/Release/*.dll
+          src/AmtPtpDeviceUsbUm/build/MagicTrackpad2PtpDevice/x64/Release/*.sys
+          src/AmtPtpDeviceUsbUm/build/MagicTrackpad2PtpDevice/x64/Release/*.inf
+          src/AmtPtpDeviceUsbUm/build/MagicTrackpad2PtpDevice/x64/Release/*.cat
+
+    - name: Upload HID Filter artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: AmtPtpHidFilter-Release-x64
+        path: |
+          src/AmtPtpHidFilter/build/AmtPtpHidFilter/x64/Release/*.sys
+          src/AmtPtpHidFilter/build/AmtPtpHidFilter/x64/Release/*.inf
+          src/AmtPtpHidFilter/build/AmtPtpHidFilter/x64/Release/*.cat
 
     - name: Upload all drivers (combined)
       uses: actions/upload-artifact@v4
