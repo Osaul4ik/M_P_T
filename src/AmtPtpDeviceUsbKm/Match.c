@@ -4,12 +4,30 @@
 #include "Match.h"
 #include "Palm.h"
 
-#define TIP_DROP_DEBOUNCE_FRAMES        2
-#define TIP_DROP_MAX_REPOSITION_DELTA   300
-
 // Spatial sanity: ~20% of pad width (~20000 units). No finger teleports
-// this far in one USB polling interval.
+// this far in one USB polling interval. Used both for the real identity
+// matcher (AmtMatchCorrespond) AND, as of the fix below, as the SAME
+// radius used by the debounce-anchor search in AmtMatchBuildCandidates -
+// see TIP_DROP_MAX_REPOSITION_DELTA comment for why these two radii must
+// agree.
 #define MATCH_MAX_CONTINUATION_DELTA 4000
+
+// FIX (Soft-drift confidence bug): this used to be a much smaller,
+// independent constant (300). Problem: AmtMatchBuildCandidates used it
+// to decide "did I find a continuing low-pressure contact, or is this a
+// brand-new touch?" - and answered "brand-new" (TipDropApplied=0,
+// Confidence=1) whenever a single frame's movement exceeded 300 units,
+// even though the touch pressure was still genuinely below the tip-size
+// threshold. Meanwhile AmtMatchCorrespond (the actual identity matcher,
+// called right after) used MATCH_MAX_CONTINUATION_DELTA=4000 and WOULD
+// still match that same contact as a continuation. Net effect: a fast
+// but light drag/swipe (300 < per-frame delta < 4000) got a spurious
+// one-frame Confidence=1 + a spurious reset of TipDropCount, even
+// though the finger never left the pad and pressure never crossed the
+// tip threshold. Using the SAME radius as the real matcher here removes
+// the contradiction: "anchor found" and "AmtMatchCorrespond will treat
+// this as the same contact" are now the same condition.
+#define TIP_DROP_MAX_REPOSITION_DELTA MATCH_MAX_CONTINUATION_DELTA
 
 // Matching-cost tuning. Cost is dominated by spatial distance. Slot-hint
 // is used ONLY to break near-ties (MATCH_TIE_EPSILON_SQ) - never a fixed
@@ -22,6 +40,31 @@
 // If finger IS moving, use real coords even when below tip threshold.
 // This prevents Confidence=0 + moving stale position on soft taps.
 #define TIP_DROP_STATIONARY_DELTA       3
+
+// FIX (Soft-tap phantom-cycle bug): previously, a candidate that stayed
+// below tip threshold for >= a fixed frame count (with a known anchor)
+// was DROPPED as "noise". That silently un-matched the pool entry every
+// couple of frames, causing PTPCore Phase A to LIFT it even though the
+// finger never physically left the pad - then the very next frame, with
+// no anchor left in the pool, the same finger was re-born as a BRAND
+// NEW contact (new ContactID). Net effect on any sustained light/soft
+// touch: an infinite DOWN->MOVE->MOVE->UP->DOWN->... cycle, roughly
+// every 3-4 frames, instead of one continuous contact. This also
+// corrupted RecentLifts (each phantom UP got recorded), which could
+// make a genuine second tap of a soft double-tap retap-smooth against a
+// PHANTOM lift from the first tap instead of (or as well as) the real
+// one, confusing tap/double-tap timing.
+//
+// Real lift-off detection does NOT need a frame counter here at all:
+// Input.c already drops a finger from RAW_FRAME entirely once
+// major<=0 && minor<=0 (true contact loss). So once a candidate has a
+// valid anchor, it keeps being reported (Confidence=0) for as long as
+// RAW_FRAME keeps reporting *some* contact at that slot - never
+// auto-dropped purely because of frame count. TIP_DROP_COUNT_MAX below
+// only protects the UCHAR counter from wrapping (which would otherwise
+// transiently fake Confidence=1 every 256 frames of sustained soft
+// touch); it does not gate whether the candidate is reported.
+#define TIP_DROP_COUNT_MAX 255
 
 static UCHAR
 AmtMatchCandidateTip(_In_ USHORT major, _In_ USHORT minor)
@@ -75,7 +118,19 @@ AmtMatchBuildCandidates(
 
         // Below tip threshold - debounce. Find pool entry by LastSlotHint
         // (hint only, never direct index) and bridge to last good position.
-        size_t bestPoolIdx = MAX_CONTACTS;
+        //
+        // FIX (Soft-drift confidence bug, part 2): scan ALL pool entries
+        // sharing this slot hint and keep the NEAREST one within
+        // TIP_DROP_MAX_REPOSITION_DELTA, instead of stopping at the
+        // first one found. This matters now that the radius equals
+        // MATCH_MAX_CONTINUATION_DELTA (4000, much wider than the old
+        // 300): with a wide radius, picking the first match instead of
+        // the closest one would risk bridging coordinates against a
+        // stale/unrelated contact that happens to share an old
+        // LastSlotHint value, producing a wrong one-frame coordinate.
+        size_t bestPoolIdx  = MAX_CONTACTS;
+        LONG   bestDistSq   = -1;
+
         for (size_t p = 0; p < MAX_CONTACTS; p++) {
             if (Pool[p].State != CONTACT_ACTIVE)
                 continue;
@@ -87,10 +142,14 @@ AmtMatchBuildCandidates(
             INT dyAbs = (INT)rc->Y - (INT)Pool[p].ReportY;
             if (dyAbs < 0) dyAbs = -dyAbs;
 
-            if (dxAbs <= TIP_DROP_MAX_REPOSITION_DELTA &&
-                dyAbs <= TIP_DROP_MAX_REPOSITION_DELTA) {
+            if (dxAbs > TIP_DROP_MAX_REPOSITION_DELTA ||
+                dyAbs > TIP_DROP_MAX_REPOSITION_DELTA)
+                continue;
+
+            LONG distSq = (LONG)dxAbs * dxAbs + (LONG)dyAbs * dyAbs;
+            if (bestPoolIdx == MAX_CONTACTS || distSq < bestDistSq) {
                 bestPoolIdx = p;
-                break;
+                bestDistSq  = distSq;
             }
         }
 
@@ -107,42 +166,41 @@ AmtMatchBuildCandidates(
             continue;
         }
 
-        if (Pool[bestPoolIdx].TipDropCount < TIP_DROP_DEBOUNCE_FRAMES) {
-            // FIX (#1 - Issue #1): coordinate selection for debounce bridge.
-            //
-            // OLD behavior: always use stale anchor coords (ReportX/Y).
-            // Problem: a soft tap that moves slightly gets Confidence=0 AND
-            // stale (wrong) coordinates. Windows PTP stack sees a contact
-            // that is both unconfident AND not where the finger actually is.
-            //
-            // NEW behavior: use REAL coords if finger has moved more than
-            // TIP_DROP_STATIONARY_DELTA; use anchor only if truly stationary.
-            //
-            // This means a soft moving contact still gets TipDropApplied
-            // (Confidence=0 on that frame) because pressure is low, but
-            // at least the position is accurate. A stationary soft contact
-            // (e.g. finger resting lightly) gets bridged to anchor as before.
-            //
-            // The key invariant: TipDropApplied=0 iff X/Y is genuine sampled
-            // data. Here TipDropApplied > 0 always (debounce is active), but
-            // we now pick real vs stale coords based on movement.
-            INT dxMove = (INT)rc->X - (INT)Pool[bestPoolIdx].ReportX;
-            INT dyMove = (INT)rc->Y - (INT)Pool[bestPoolIdx].ReportY;
-            if (dxMove < 0) dxMove = -dxMove;
-            if (dyMove < 0) dyMove = -dyMove;
+        // FIX (Soft-tap phantom-cycle bug): always bridge the candidate
+        // through while an anchor exists - never drop it purely because
+        // TipDropCount crossed a fixed frame threshold (see
+        // TIP_DROP_COUNT_MAX comment above for why the old "drop as
+        // noise after N frames" behavior caused an infinite phantom
+        // DOWN/UP cycle on sustained soft touches).
+        //
+        // FIX (#1 - Issue #1): coordinate selection for debounce bridge.
+        //
+        // OLD behavior: always use stale anchor coords (ReportX/Y).
+        // Problem: a soft tap that moves slightly gets Confidence=0 AND
+        // stale (wrong) coordinates. Windows PTP stack sees a contact
+        // that is both unconfident AND not where the finger actually is.
+        //
+        // NEW behavior: use REAL coords if finger has moved more than
+        // TIP_DROP_STATIONARY_DELTA; use anchor only if truly stationary.
+        INT dxMove = (INT)rc->X - (INT)Pool[bestPoolIdx].ReportX;
+        INT dyMove = (INT)rc->Y - (INT)Pool[bestPoolIdx].ReportY;
+        if (dxMove < 0) dxMove = -dxMove;
+        if (dyMove < 0) dyMove = -dyMove;
 
-            BOOLEAN isStationary = (dxMove <= TIP_DROP_STATIONARY_DELTA) &&
-                                   (dyMove <= TIP_DROP_STATIONARY_DELTA);
+        BOOLEAN isStationary = (dxMove <= TIP_DROP_STATIONARY_DELTA) &&
+                               (dyMove <= TIP_DROP_STATIONARY_DELTA);
 
-            cand.X              = isStationary ? Pool[bestPoolIdx].ReportX : rc->X;
-            cand.Y              = isStationary ? Pool[bestPoolIdx].ReportY : rc->Y;
-            cand.TipDropApplied = (UCHAR)(Pool[bestPoolIdx].TipDropCount + 1);
-            OutCandidates->Candidates[OutCandidates->Count++] = cand;
-        }
-        // else: debounce exhausted with anchor - drop candidate (noise).
-        // TipDropCount >= TIP_DROP_DEBOUNCE_FRAMES means the pressure has
-        // been below threshold for 2+ frames with a known anchor - treat
-        // as noise and let the contact lift naturally.
+        cand.X = isStationary ? Pool[bestPoolIdx].ReportX : rc->X;
+        cand.Y = isStationary ? Pool[bestPoolIdx].ReportY : rc->Y;
+
+        // Clamp instead of letting a UCHAR wrap back to 0 (which would
+        // transiently and incorrectly read as Confidence=1 one frame
+        // every 256 frames of sustained soft touch).
+        cand.TipDropApplied = (Pool[bestPoolIdx].TipDropCount < TIP_DROP_COUNT_MAX)
+            ? (UCHAR)(Pool[bestPoolIdx].TipDropCount + 1)
+            : TIP_DROP_COUNT_MAX;
+
+        OutCandidates->Candidates[OutCandidates->Count++] = cand;
     }
 }
 
