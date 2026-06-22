@@ -54,7 +54,7 @@
       <WppRecorderEnabled>true</WppRecorderEnabled>
       <WppScanConfigurationData Condition="'%(ClCompile.ScanConfigurationData)' == ''">trace.h</WppScanConfigurationData>
       <WppKernelMode>true</WppKernelMode>
-      <!-- _KERNEL_MODE вже визначено автоматично через /kernel, тому видаляємо його -->
+      <!-- _KERNEL_MODE вже визначено автоматично через /kernel, тому не додаємо його -->
       <DisableSpecificWarnings>4214;%(DisableSpecificWarnings)</DisableSpecificWarnings>
     </ClCompile>
     <Link>
@@ -67,9 +67,11 @@
   <ItemGroup>
     <ClInclude Include="*.h" />
   </ItemGroup>
+  <!-- INF включено, файл має існувати в тій самій папці -->
   <ItemGroup>
     <Inf Include="AmtPtpKbdHook.inf" />
   </ItemGroup>
+  <!-- Копіюємо INF у вихідну папку після збірки -->
   <Target Name="CopyInfToOutDir" AfterTargets="Build">
     <Copy SourceFiles="@(Inf)" DestinationFolder="$(OutDir)" />
   </Target>
