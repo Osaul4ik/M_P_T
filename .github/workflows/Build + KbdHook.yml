@@ -67,7 +67,8 @@ jobs:
         msbuild src/AmtPtpDeviceUsbKm/AmtPtpKbdHook.vcxproj `
           /p:Configuration=Release `
           /p:Platform=x64 `
-          /p:WindowsTargetPlatformVersion=10.0.26100.0
+          /p:WindowsTargetPlatformVersion=10.0.26100.0 `
+          /p:SignMode=Off
       shell: powershell
 
     - name: Package, sign, and catalog KbdHook driver
