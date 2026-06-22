@@ -26,7 +26,6 @@ jobs:
         Start-Process -FilePath $wdkInstaller -ArgumentList "/quiet /norestart" -Wait
       shell: powershell
 
-
     - name: Build USB KM Driver
       run: |
         msbuild src/AmtPtpDeviceUsbKm/AmtPtpDeviceUsbKm.vcxproj `
@@ -34,7 +33,6 @@ jobs:
           /p:Platform=x64 `
           /p:WindowsTargetPlatformVersion=10.0.26100.0
       shell: powershell
-
 
     # ============ КРОК ДЛЯ KEYBOARD FILTER ============
     - name: Generate test certificate for Keyboard Filter Driver
@@ -49,17 +47,102 @@ jobs:
         Add-Content -Path $env:GITHUB_ENV -Value "KBDHOOK_CERT_PATH=$cerPath"
       shell: powershell
 
-    - name: Build and sign Keyboard Filter Driver
+    - name: Build Keyboard Filter Driver (.sys only)
       run: |
         msbuild src/AmtPtpDeviceUsbKm/AmtPtpKbdHook.vcxproj `
           /p:Configuration=Release `
           /p:Platform=x64 `
-          /p:WindowsTargetPlatformVersion=10.0.26100.0 `
-          /p:RunInfVerif=false `
-          /p:Inf2Cat=false
+          /p:WindowsTargetPlatformVersion=10.0.26100.0
+      shell: powershell
+
+    - name: Generate INF, sign, and package keyboard filter driver
+      run: |
+        $buildDir = "src/AmtPtpDeviceUsbKm/build/AmtPtpKbdHook/x64/Release"
+        $sysPath = "$buildDir/AmtPtpKbdHook.sys"
+        $packageDir = "$buildDir/AmtPtpKbdHookPackage"
+        New-Item -ItemType Directory -Force -Path $packageDir | Out-Null
+
+        # Copy .sys to package dir
+        Copy-Item $sysPath $packageDir
+
+        # Generate INF with correct DriverVer
+        $infContent = @"
+;
+; AmtPtpKbdHook.inf - Keyboard filter driver
+;
+
+[Version]
+Signature="`$WINDOWS NT`$"
+Class=Keyboard
+ClassGuid={4D36E96B-E325-11CE-BFC1-08002BE10318}
+Provider=%ManufacturerName%
+CatalogFile=AmtPtpKbdHook.cat
+DriverVer=$(Get-Date -Format "MM/dd/yyyy"),1.0.0.0
+
+[DestinationDirs]
+DefaultDestDir = 12
+
+[Manufacturer]
+%ManufacturerName% = Standard,NTamd64
+
+[Standard.NTamd64]
+%KbdDeviceDesc% = KbdHook_Install, *PNP0303
+%KbdDeviceDesc% = KbdHook_Install, HID_DEVICE_SYSTEM_KEYBOARD
+
+[KbdHook_Install]
+CopyFiles = KbdHook_Files
+
+[KbdHook_Install.HW]
+AddReg = KbdHook_AddReg
+
+[KbdHook_AddReg]
+HKR,,"UpperFilters",0x00010000,"AmtPtpKbdHook"
+
+[KbdHook_Install.Services]
+AddService = AmtPtpKbdHook,0x00000002,KbdHook_Service
+
+[KbdHook_Service]
+DisplayName = %KbdFilterServiceDesc%
+ServiceType = 1
+StartType = 3
+ErrorControl = 1
+ServiceBinary = %12%\AmtPtpKbdHook.sys
+
+[KbdHook_Files]
+AmtPtpKbdHook.sys
+
+[SourceDisksFiles]
+AmtPtpKbdHook.sys = 1,,
+
+[SourceDisksNames]
+1 = %DiskName%,,,""
+
+[Strings]
+ManufacturerName = "Apple MacBook PTP"
+KbdDeviceDesc = "Apple MacBook Keyboard Filter Driver"
+KbdFilterServiceDesc = "AmtPtp KBD Hook Service"
+DiskName = "AmtPtpKbdHook Installation Disk"
+"@
+        $infPath = "$packageDir/AmtPtpKbdHook.inf"
+        Set-Content -Path $infPath -Value $infContent -Encoding ASCII
+        Write-Host "INF generated at $infPath"
+
+        # Sign the .sys with test certificate
+        & "C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x86\signtool.exe" sign /ph /fd sha256 /sha1 "$env:KBDHOOK_CERT_THUMBPRINT" /tr http://timestamp.digicert.com /td sha256 /fd sha256 $sysPath
+        if ($LASTEXITCODE -ne 0) { throw "Signing .sys failed" }
+        Write-Host "Signed: $sysPath"
+
+        # Export certificate
+        $cerPath = "$packageDir/AmtPtpKbdHook.cer"
+        Copy-Item "$env:TEMP\AmtPtpKbdHookTestCert.cer" $cerPath
+
+        # Copy package to build root for artifact collection
+        Copy-Item "$packageDir/*" $buildDir
+
+        Write-Host "Package contents:"
+        Get-ChildItem $packageDir | Select-Object Name
       shell: powershell
     # ============================================================
-
 
     - name: Upload USB KM Driver artifact
       uses: actions/upload-artifact@v4
@@ -70,7 +153,6 @@ jobs:
           src/AmtPtpDeviceUsbKm/build/AmtPtpDeviceUsbKm/x64/Release/*.inf
           src/AmtPtpDeviceUsbKm/build/AmtPtpDeviceUsbKm/x64/Release/*.cat
 
- 
     # ============ НОВИЙ АРТЕФАКТ ДЛЯ KEYBOARD FILTER ============
     - name: Upload Keyboard Filter Driver artifact
       uses: actions/upload-artifact@v4
@@ -79,7 +161,7 @@ jobs:
         path: |
           src/AmtPtpDeviceUsbKm/build/AmtPtpKbdHook/x64/Release/*.sys
           src/AmtPtpDeviceUsbKm/build/AmtPtpKbdHook/x64/Release/*.inf
-          src/AmtPtpDeviceUsbKm/build/AmtPtpKbdHook/x64/Release/*.cat
+          src/AmtPtpDeviceUsbKm/build/AmtPtpKbdHook/x64/Release/*.cer
     # ============================================================
 
     - name: Upload all drivers (combined)
