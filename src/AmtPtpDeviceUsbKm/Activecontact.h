@@ -64,8 +64,30 @@ typedef struct _ACTIVE_CONTACT
     BOOLEAN WasInGesture;
 
     // TRUE on first frame after birth. Bypasses deadzone+EMA so first
-    // DOWN report always carries the real finger position.
+    // DOWN report always carries the real finger position - UNLESS
+    // RetapSeeded is also TRUE (see below), in which case the seeded
+    // Hyst/Report baseline from BirthWithRetapSmoothing is preserved
+    // and the deadzone+EMA path runs normally on this first sample.
     BOOLEAN PendingFirstSample;
+
+    // BUG FIX: previously AmtContactUpdate() unconditionally overwrote
+    // HystX/Y with the raw just-sampled position whenever
+    // PendingFirstSample was TRUE, and AmtContactCommitSample()
+    // unconditionally skipped EMA in that case too. That meant the
+    // EMA-seed baseline written by AmtContactBirthWithRetapSmoothing
+    // (RecentLiftX/Y) was clobbered by the very first AmtContactUpdate
+    // call in the SAME frame, before it was ever read - making
+    // AmtContactBirthWithRetapSmoothing behaviorally identical to a
+    // plain AmtContactBirth. Retap smoothing never actually smoothed
+    // anything.
+    //
+    // RetapSeeded distinguishes "first sample after a fresh birth"
+    // (HystX/Y should be reset to the real finger position) from
+    // "first sample after a retap-smoothed birth" (HystX/Y already
+    // hold a deliberate seed and must be evaluated/blended normally,
+    // not reset). Cleared together with PendingFirstSample once the
+    // first sample has been committed.
+    BOOLEAN RetapSeeded;
 
     // Reported last frame? Drives Phase A lift-off detection.
     BOOLEAN ReportedLastFrame;
@@ -114,16 +136,14 @@ AmtContactBirth(
 // so EMA blends smoothly from the lift position on subsequent MOVE frames
 // (cursor continuity on re-tap).
 //
-// PendingFirstSample=TRUE: the first AmtContactUpdate call bypasses
-// deadzone+EMA and reports the REAL current finger position for DOWN.
-// The lift baseline (RecentLiftX/Y) is only used as EMA seed from
-// frame N+1 onward - it never appears as the reported DOWN coordinate.
-//
-// FIX (Issue #3): previously PendingFirstSample was FALSE here, causing
-// the DOWN report to emit a stale/blended position (old lift pos mixed
-// with new pos via EMA). This broke double-tap spatial matching in
-// Windows: the reported DOWN position was slightly off from where the
-// finger actually landed.
+// Sets RetapSeeded=TRUE (see ACTIVE_CONTACT.RetapSeeded above) so the
+// FIRST AmtContactUpdate call after this birth does NOT clobber the
+// seeded HystX/Y with the raw touch-down position - it instead runs the
+// normal deadzone+EMA path against the seeded baseline, which is what
+// actually produces the intended smooth-cursor-continuity-on-retap
+// behavior. (Previously RetapSeeded did not exist and the seed was
+// overwritten before ever being used - see the FIX comment on
+// RetapSeeded in ActiveContact.h.)
 VOID
 AmtContactBirthWithRetapSmoothing(
     _Inout_ PACTIVE_CONTACT Pool,
@@ -185,7 +205,10 @@ AmtContactEvaluateDeadzone(
 );
 
 // Per-frame ACTIVE contact update (Phase C). Deadzone + EMA (skipped on
-// PendingFirstSample and first solo post-gesture). Updates matching hints
+// PendingFirstSample for a plain birth, and on first solo post-gesture
+// frame). For a retap-seeded birth (RetapSeeded==TRUE), the first sample
+// runs deadzone+EMA normally against the seeded baseline instead of
+// bypassing it - see ACTIVE_CONTACT.RetapSeeded. Updates matching hints
 // and increments FramesAlive.
 VOID
 AmtContactUpdate(

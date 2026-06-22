@@ -521,6 +521,21 @@ AmtPtpSetFeatures(
 					}
 					break;
 				}
+				default:
+				{
+					// FIX: previously no default case here. An unknown
+					// Mode value fell through the switch doing nothing,
+					// while status remained STATUS_SUCCESS (set earlier)
+					// and the code below logged "is fulfilled" - silently
+					// claiming success for a request that was never
+					// actually handled.
+					TraceEvents(
+						TRACE_LEVEL_WARNING, TRACE_DRIVER,
+						"%!FUNC! Report REPORTID_REPORTMODE requested unknown Mode=%d",
+						devInputMode->Mode
+					);
+					break;
+				}
 			}
 
 			TraceEvents(
@@ -544,6 +559,20 @@ AmtPtpSetFeatures(
 				secInput->ButtonReport,
 				secInput->SurfaceReport
 			);
+
+			// BUG FIX (REPORTID_FUNCSWITCH no-op): the requested
+			// Button/Surface report-enable bits were previously only
+			// traced, never applied. Windows' "Mouse Properties ->
+			// touchpad settings" (and any app sending this selective
+			// report-mode feature report) had zero effect on the
+			// driver - PtpReportButton/PtpReportTouch stayed whatever
+			// AmtPtpDeviceUsbKmCreateDevice/EvtDevicePrepareHardware
+			// last set them to (always TRUE), regardless of what the
+			// host actually asked for. Apply the requested bits to the
+			// device context so AmtPtpEvtUsbInterruptPipeReadComplete
+			// (Interrupt.c) actually honors them.
+			pDeviceContext->PtpReportButton = (BOOLEAN)secInput->ButtonReport;
+			pDeviceContext->PtpReportTouch  = (BOOLEAN)secInput->SurfaceReport;
 
 			TraceEvents(
 				TRACE_LEVEL_INFORMATION, TRACE_DRIVER,

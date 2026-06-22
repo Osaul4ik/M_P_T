@@ -1,5 +1,6 @@
 // ActiveContact.c - Contact lifecycle FSM. See ActiveContact.h for design
-// rationale (pool position != identity, LastSlotHint vs identity test).
+// rationale (pool position != identity, LastSlotHint vs identity test,
+// and the RetapSeeded fix note).
 
 #include "Driver.h"
 #include "ActiveContact.h"
@@ -65,6 +66,7 @@ AmtContactBirth(
     c->TipDropCount       = 0;
     c->WasInGesture       = FALSE;
     c->PendingFirstSample = TRUE;
+    c->RetapSeeded        = FALSE; // plain birth - no seeded baseline to preserve
     c->ReportedLastFrame  = FALSE;
     c->LastSlotHint        = slotHint;
     c->LastSeenQpc         = 0; // set by first AmtContactUpdate call
@@ -75,17 +77,25 @@ AmtContactBirth(
 // re-tap. PendingFirstSample=TRUE so the first AmtContactUpdate reports
 // the REAL current finger position for DOWN, then EMA blends from there.
 //
-// FIX (Issue #3): PendingFirstSample was previously FALSE here, which
-// caused the first DOWN report to use stale lift coordinates blended with
-// EMA instead of the actual touch-down position. This broke double-tap
-// detection: Windows saw DOWN at a slightly wrong position (old lift pos
-// blended with new pos), potentially outside its spatial cluster threshold.
+// FIX (Issue #3, original): PendingFirstSample was previously FALSE
+// here, which caused the first DOWN report to use stale lift coordinates
+// blended with EMA instead of the actual touch-down position.
 //
-// With PendingFirstSample=TRUE:
-//   - Frame N (DOWN):  reports real finger position (no EMA, no deadzone)
-//   - Frame N+1 (MOVE): EMA blends from real pos toward real pos -> smooth
-//   - The lift baseline (RecentLift X/Y) is stored in HystX/Y only, used
-//     as EMA seed for frame N+1 onward, never as the reported DOWN position.
+// FIX (RetapSeeded, this revision): setting PendingFirstSample=TRUE
+// alone was NOT sufficient to make the seed useful. AmtContactUpdate()
+// treats PendingFirstSample as "reset Hyst to the raw sample and bypass
+// EMA", which silently overwrote HystX/Y (the very thing this function
+// just seeded with RecentLiftX/Y) before it was ever read - on the SAME
+// frame, since Phase B (birth) and Phase C (update) both run within one
+// PTPCore_ProcessFrame() call. Net effect: this function behaved
+// identically to AmtContactBirth(); the seed never influenced anything.
+//
+// RetapSeeded=TRUE now tells AmtContactUpdate() to leave HystX/Y alone
+// on the first sample and run deadzone+EMA normally against the seeded
+// baseline instead of resetting/bypassing it. The seed is consumed
+// exactly once (RetapSeeded is cleared together with PendingFirstSample
+// after the first AmtContactUpdate call), so behavior on the SECOND and
+// later frames is identical to a normal contact.
 VOID
 AmtContactBirthWithRetapSmoothing(
     _Inout_ PACTIVE_CONTACT Pool,
@@ -105,16 +115,18 @@ AmtContactBirthWithRetapSmoothing(
     c->State             = CONTACT_ACTIVE;
     c->ContactID          = AmtContactAssignId(NextContactId);
     // Seed EMA baseline with lift position for smooth cursor continuity
-    // on subsequent MOVE frames, but report real position on first DOWN.
+    // on subsequent MOVE frames.
     c->ReportX            = RecentLiftX;
     c->ReportY            = RecentLiftY;
     c->HystX              = RecentLiftX;
     c->HystY              = RecentLiftY;
     c->TipDropCount       = 0;
     c->WasInGesture       = FALSE;
-    // FIX (Issue #3): TRUE so first Update bypasses deadzone+EMA and
-    // reports the real finger position for the DOWN event.
     c->PendingFirstSample = TRUE;
+    // FIX: tells AmtContactUpdate to preserve this seed on the first
+    // sample instead of clobbering it - see comment above and in
+    // ActiveContact.h.
+    c->RetapSeeded        = TRUE;
     c->ReportedLastFrame  = FALSE;
     c->LastSlotHint        = slotHint;
     c->LastSeenQpc         = 0;
@@ -233,6 +245,12 @@ AmtContactEvaluateDeadzone(
 #endif
 }
 
+// commitIsRetapSeededFirstSample: TRUE only on the first sample of a
+// retap-seeded birth. In that case EMA must NOT be skipped - the whole
+// point of the seed is to blend the real touch-down position with the
+// seeded lift baseline (HystX/Y), exactly like a normal post-deadzone
+// sample. Skipping EMA here (as plain-birth first-samples correctly do)
+// would report the raw position and discard the seed just as before.
 static inline VOID
 AmtContactCommitSample(
     _Inout_ PACTIVE_CONTACT Contact,
@@ -240,6 +258,7 @@ AmtContactCommitSample(
     _In_    USHORT          candY,
     _In_    BOOLEAN         passedDeadzone,
     _In_    BOOLEAN         aliveCountIsOne,
+    _In_    BOOLEAN         commitIsRetapSeededFirstSample,
     _Out_   USHORT*         OutX,
     _Out_   USHORT*         OutY
 )
@@ -253,8 +272,9 @@ AmtContactCommitSample(
         Contact->HystX = candX;
         Contact->HystY = candY;
 
-        BOOLEAN skipEma = Contact->PendingFirstSample ||
-                          (Contact->WasInGesture && aliveCountIsOne);
+        BOOLEAN skipEma =
+            (Contact->PendingFirstSample && !commitIsRetapSeededFirstSample) ||
+            (Contact->WasInGesture && aliveCountIsOne);
 
         if (skipEma) {
             repX = candX;
@@ -272,6 +292,7 @@ AmtContactCommitSample(
     Contact->ReportX = repX;
     Contact->ReportY = repY;
     Contact->PendingFirstSample = FALSE;
+    Contact->RetapSeeded        = FALSE; // seed consumed exactly once
 
     *OutX = repX;
     *OutY = repY;
@@ -294,16 +315,27 @@ AmtContactUpdate(
 #endif
 
     BOOLEAN passed;
+    BOOLEAN retapSeededFirstSample =
+        Contact->PendingFirstSample && Contact->RetapSeeded;
 
     if (Contact->PendingFirstSample) {
-        Contact->HystX = rawX;
-        Contact->HystY = rawY;
-        passed = TRUE;
+        if (retapSeededFirstSample) {
+            // FIX: do NOT reset HystX/Y here - they already hold the
+            // deliberate seed from AmtContactBirthWithRetapSmoothing.
+            // Evaluate the deadzone normally against that seed instead
+            // of unconditionally treating this sample as "passed".
+            passed = AmtContactEvaluateDeadzone(Contact, rawX, rawY);
+        } else {
+            Contact->HystX = rawX;
+            Contact->HystY = rawY;
+            passed = TRUE;
+        }
     } else {
         passed = AmtContactEvaluateDeadzone(Contact, rawX, rawY);
     }
 
-    AmtContactCommitSample(Contact, rawX, rawY, passed, aliveCountIsOne, OutX, OutY);
+    AmtContactCommitSample(Contact, rawX, rawY, passed, aliveCountIsOne,
+                           retapSeededFirstSample, OutX, OutY);
 
     Contact->LastSlotHint = slotHint;
     Contact->LastSeenQpc  = nowQpc;
@@ -321,6 +353,7 @@ AmtContactPoolCheckInvariants(_In_reads_(MAX_CONTACTS) const ACTIVE_CONTACT* Poo
 
         if (c->State == CONTACT_FREE) {
             NT_ASSERT(!c->PendingFirstSample);
+            NT_ASSERT(!c->RetapSeeded);
             NT_ASSERT(!c->WasInGesture);
             NT_ASSERT(c->ContactID == 0);
             continue;

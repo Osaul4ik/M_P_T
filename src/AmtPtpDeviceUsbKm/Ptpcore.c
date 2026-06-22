@@ -166,15 +166,36 @@ PTPCore_ProcessFrame(
                             &candidates, &largePalm);
 
     // ---- Palm session orchestration ----
+    //
+    // BUG FIX: track whether THIS frame's candidate set was forcibly
+    // blanked because of a palm event (either a brand-new PALM_LARGE
+    // this frame, or an ongoing PalmDetected latch suppressing
+    // already-down fingers). Previously, any real ACTIVE contact that
+    // got unmatched as a side effect of this blanking was killed in
+    // Phase A exactly like a genuine, organic finger lift-off -
+    // including being recorded into RecentLifts for retap-smoothing
+    // (AmtRecentLiftRecord). That is wrong: a palm touching the pad and
+    // "stealing"/suppressing real fingers does not mean those fingers
+    // were deliberately lifted at that X/Y - it's an artifact of palm
+    // rejection, not a meaningful "last tap position". Recording it
+    // let a later, genuinely new tap get incorrectly retap-smoothed
+    // (and, depending on timing, get an EMA seed) against a phantom
+    // palm-induced lift instead of - or in addition to - a real one.
+    // This mirrors the existing, intentional exclusion already applied
+    // to gesture lifts (Issue #4 fix) below.
+    BOOLEAN palmSuppressedFrame = FALSE;
+
     if (largePalm) {
         pCtx->PalmDetected = TRUE;
         OutResult->LargePalmBlanked = TRUE;
+        palmSuppressedFrame = TRUE;
     } else if (pCtx->PalmDetected) {
         BOOLEAN anyContact = (candidates.Count > 0);
         if (!anyContact) {
             pCtx->PalmDetected = FALSE;
         } else {
             candidates.Count = 0; // still palm-adjacent - suppress all
+            palmSuppressedFrame = TRUE;
         }
     }
 
@@ -270,8 +291,13 @@ PTPCore_ProcessFrame(
             // Clean DOWN -> UP is what Windows needs for tap recognition.
             AmtContactKill(pCtx->ActiveContacts, p, &oldId, &oldX, &oldY);
 
-            // Solo lift: record for retap smoothing (cursor continuity).
-            AmtRecentLiftRecord(&pCtx->RecentLifts, NowQpc, oldX, oldY);
+            // Solo lift: record for retap smoothing (cursor continuity) -
+            // but ONLY if this lift is a genuine finger-up, not an
+            // artifact of palm rejection blanking the whole candidate
+            // set this frame (see palmSuppressedFrame comment above).
+            if (!palmSuppressedFrame) {
+                AmtRecentLiftRecord(&pCtx->RecentLifts, NowQpc, oldX, oldY);
+            }
             AmtCoreEmitLift(pCtx, OutResult, oldId, oldX, oldY);
         }
     }
@@ -291,6 +317,12 @@ PTPCore_ProcessFrame(
             // FIX (Issue #4): gesture lift not recorded in RecentLifts.
         } else {
             AmtContactKill(pCtx->ActiveContacts, p, &oldId, &oldX, &oldY);
+            // This path runs over `candidates` (post palm-suppression),
+            // so candidates.Count would already be 0 here whenever
+            // palmSuppressedFrame is TRUE - this loop body simply won't
+            // execute in that case. No additional guard needed, but the
+            // intent (no palm-artifact lifts in RecentLifts) is the same
+            // as the Phase A fix above.
             AmtRecentLiftRecord(&pCtx->RecentLifts, NowQpc, oldX, oldY);
         }
 
@@ -322,11 +354,15 @@ PTPCore_ProcessFrame(
                                     cand->X, cand->Y, &liftX, &liftY);
 
         if (looksLikeRetap) {
-            // FIX (Issue #3): BirthWithRetapSmoothing now sets
-            // PendingFirstSample=TRUE, so first DOWN reports real
-            // finger position, not the old lift position. The lift
-            // coords (liftX/Y) are stored only as EMA seed baseline
-            // (HystX/Y, ReportX/Y) for subsequent MOVE smoothing.
+            // FIX (RetapSeeded): BirthWithRetapSmoothing now sets
+            // RetapSeeded=TRUE so the seeded HystX/Y baseline (liftX/Y)
+            // survives the first AmtContactUpdate call in Phase C below
+            // instead of being immediately overwritten - see the FIX
+            // comments in ActiveContact.c/.h. The first DOWN report
+            // still reflects the real finger position whenever it has
+            // moved outside the deadzone from the seed; if the finger
+            // landed essentially on top of the lift position, DOWN is
+            // reported at the (effectively identical) seeded position.
             AmtContactBirthWithRetapSmoothing(
                 pCtx->ActiveContacts, freeIdx, &pCtx->NextContactId,
                 liftX, liftY, cand->SlotIndex);
