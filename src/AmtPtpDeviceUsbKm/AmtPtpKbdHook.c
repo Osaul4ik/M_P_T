@@ -1,14 +1,13 @@
-/ AmtPtpKbdHook.c - Keyboard upper-filter driver. Fires
+// AmtPtpKbdHook.c - Keyboard upper-filter driver. Fires
 // \Callback\AmtPtpKbdActivity on key-down for 500 ms touchpad suppression.
 
 #include <ntddk.h>
 #include <wdf.h>
 #include <ntddkbd.h>     // KEYBOARD_INPUT_DATA, KEY_BREAK
 
-// ============ ДОДАНО ДЛЯ WPP ============
-#include "trace.h"               // визначення WPP_CONTROL_GUIDS та флагів
-#include "AmtPtpKbdHook.tmh"     // згенерований код трасування
-// ========================================
+// WPP tracing
+#include "trace.h"
+#include "AmtPtpKbdHook.tmh"
 
 #define CALLBACK_OBJECT_NAME L"\\Callback\\AmtPtpKbdActivity"
 #define POOL_TAG_KBD         'KBDH'
@@ -24,8 +23,9 @@ EVT_WDF_IO_QUEUE_IO_READ            KbdHookEvtIoRead;
 EVT_WDF_REQUEST_COMPLETION_ROUTINE  KbdHookReadCompletion;
 EVT_WDF_OBJECT_CONTEXT_CLEANUP      KbdHookEvtDeviceContextCleanup;
 
+// ---------------------------------------------------------------------
 // DriverEntry
-
+// ---------------------------------------------------------------------
 NTSTATUS
 DriverEntry(
     _In_ PDRIVER_OBJECT  DriverObject,
@@ -37,8 +37,9 @@ DriverEntry(
                            WDF_NO_OBJECT_ATTRIBUTES, &config, WDF_NO_HANDLE);
 }
 
-// Releases the callback object.
-
+// ---------------------------------------------------------------------
+// Cleanup callback (releases callback object)
+// ---------------------------------------------------------------------
 VOID
 KbdHookEvtDeviceContextCleanup(_In_ WDFOBJECT Device)
 {
@@ -49,8 +50,9 @@ KbdHookEvtDeviceContextCleanup(_In_ WDFOBJECT Device)
     }
 }
 
-// KbdHookEvtDeviceAdd
-
+// ---------------------------------------------------------------------
+// AddDevice
+// ---------------------------------------------------------------------
 NTSTATUS
 KbdHookEvtDeviceAdd(
     _In_    WDFDRIVER       Driver,
@@ -100,8 +102,9 @@ KbdHookEvtDeviceAdd(
     return status;
 }
 
-// Forward read IRP to lower driver.
-
+// ---------------------------------------------------------------------
+// Forward read IRP to lower driver
+// ---------------------------------------------------------------------
 VOID
 KbdHookEvtIoRead(
     _In_ WDFQUEUE   Queue,
@@ -118,7 +121,6 @@ KbdHookEvtIoRead(
 
     sent = WdfRequestSend(Request, WdfDeviceGetIoTarget(device), WDF_NO_SEND_OPTIONS);
 
-    // Handle WdfRequestSend failure to avoid stalling keyboard queue.
     if (!sent) {
         NTSTATUS status = WdfRequestGetStatus(Request);
         TraceEvents(TRACE_LEVEL_ERROR, TRACE_DRIVER,
@@ -127,9 +129,9 @@ KbdHookEvtIoRead(
     }
 }
 
-// Fire callback only on key-down events. Skip KEY_BREAK flags to avoid
-// doubling the suppression window. Called at DISPATCH_LEVEL.
-
+// ---------------------------------------------------------------------
+// Completion routine: fire callback only on key-down events
+// ---------------------------------------------------------------------
 VOID
 KbdHookReadCompletion(
     _In_ WDFREQUEST                     Request,
@@ -144,7 +146,6 @@ KbdHookReadCompletion(
 
     if (NT_SUCCESS(status) && pCtx->CallbackObject != NULL)
     {
-        // Fire callback once per key-down batch.
         ULONG_PTR bytesTransferred =
             Params->Parameters.Read.Length;  // actual bytes returned
 
@@ -159,11 +160,11 @@ KbdHookReadCompletion(
 
             for (ULONG k = 0; k < recordCount; k++)
             {
-                // Skip key-up to avoid extending suppression.
+                // Skip key-up to avoid extending suppression window
                 if (kbdData[k].Flags & KEY_BREAK)
                     continue;
 
-                // At least one key-down: fire once per read.
+                // At least one key-down: fire once per read
                 ExNotifyCallback(pCtx->CallbackObject, NULL, NULL);
                 break;
             }
