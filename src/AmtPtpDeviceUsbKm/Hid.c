@@ -560,20 +560,34 @@ AmtPtpSetFeatures(
 				secInput->SurfaceReport
 			);
 
-			// BUG FIX (REPORTID_FUNCSWITCH no-op): the requested
-			// Button/Surface report-enable bits were previously only
-			// traced, never applied. Windows' "Mouse Properties ->
-			// touchpad settings" (and any app sending this selective
-			// report-mode feature report) had zero effect on the
-			// driver - PtpReportButton/PtpReportTouch stayed whatever
-			// AmtPtpDeviceUsbKmCreateDevice/EvtDevicePrepareHardware
-			// last set them to (always TRUE), regardless of what the
-			// host actually asked for. Apply the requested bits to the
-			// device context so AmtPtpEvtUsbInterruptPipeReadComplete
-			// (Interrupt.c) actually honors them.
-			pDeviceContext->PtpReportButton = (BOOLEAN)secInput->ButtonReport;
-			pDeviceContext->PtpReportTouch  = (BOOLEAN)secInput->SurfaceReport;
-
+			// REVERTED: an earlier revision of this function applied
+			// secInput->ButtonReport/SurfaceReport directly to
+			// pDeviceContext->PtpReportButton/PtpReportTouch. That is
+			// the technically "correct" reading of the Selective
+			// Report Mode feature report per the PTP/HID spec, but it
+			// regressed real hardware: Windows (or its HID class
+			// driver stack) sends this report during normal operation
+			// with SurfaceReport==0 under conditions this driver does
+			// not currently disambiguate (e.g. capability negotiation,
+			// mouse-emulation fallback windows). The moment that
+			// happens, PtpReportTouch latches FALSE and stays FALSE
+			// (see DEVICE_CONTEXT.PtpReportTouch / Interrupt.c, which
+			// has no other path to re-enable it outside of a full
+			// D0Exit/D0Entry power cycle) - Interrupt.c then
+			// deliberately builds an EMPTY RAW_FRAME every interrupt,
+			// so PTPCore_ProcessFrame lifts every active contact and
+			// the pad appears to stop responding to movement entirely,
+			// even though the USB pipe and core pipeline are still
+			// running normally.
+			//
+			// Until this driver can reliably distinguish "Windows
+			// wants touch suppressed for a real reason" from "Windows
+			// sent a stale/negotiation SetFeature", honoring this
+			// report for surface/button gating does more harm than
+			// good. Left as trace-only (matching the original,
+			// long-standing behavior) - PtpReportButton/PtpReportTouch
+			// remain driven only by AmtPtpDeviceUsbKmCreateDevice /
+			// AmtPtpDeviceUsbKmEvtDevicePrepareHardware (always TRUE).
 			TraceEvents(
 				TRACE_LEVEL_INFORMATION, TRACE_DRIVER,
 				"%!FUNC! Report REPORTID_FUNCSWITCH is fulfilled"
