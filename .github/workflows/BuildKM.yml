@@ -1,0 +1,55 @@
+name: Build Drivers
+
+on:
+  push:
+    branches: [ master ]
+  workflow_dispatch:
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  build:
+    runs-on: windows-2022
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Add MSBuild to PATH
+      uses: microsoft/setup-msbuild@v2
+
+    - name: Install WDK
+      run: |
+        $wdkUrl = "https://go.microsoft.com/fwlink/?linkid=2085767"
+        $wdkInstaller = "$env:TEMP\wdksetup.exe"
+        Invoke-WebRequest -Uri $wdkUrl -OutFile $wdkInstaller
+        Start-Process -FilePath $wdkInstaller -ArgumentList "/quiet /norestart" -Wait
+      shell: powershell
+
+
+    - name: Build USB KM Driver
+      run: |
+        msbuild src/AmtPtpDeviceUsbKm/AmtPtpDeviceUsbKm.vcxproj `
+          /p:Configuration=Release `
+          /p:Platform=x64 `
+          /p:WindowsTargetPlatformVersion=10.0.26100.0
+      shell: powershell
+
+
+    - name: Upload USB KM Driver artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: AmtPtpDeviceUsbKm-Release-x64
+        path: |
+          src/AmtPtpDeviceUsbKm/build/AmtPtpDeviceUsbKm/x64/Release/*.sys
+          src/AmtPtpDeviceUsbKm/build/AmtPtpDeviceUsbKm/x64/Release/*.inf
+          src/AmtPtpDeviceUsbKm/build/AmtPtpDeviceUsbKm/x64/Release/*.cat
+
+
+
+    - name: Upload all drivers (combined)
+      uses: actions/upload-artifact@v4
+      with:
+        name: AmtPtp-AllDrivers-Release-x64
+        path: |
+          src/**/build/**/x64/Release/*.*
