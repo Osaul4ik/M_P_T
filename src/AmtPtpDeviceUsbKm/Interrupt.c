@@ -173,25 +173,12 @@ AmtPtpEvtUsbInterruptPipeReadComplete(
     BOOLEAN buttonSnapshot =
         pCtx->PtpReportButton && TouchBuffer[pCtx->DeviceInfo->tp_button];
 
-    // Typing suppression gate (not a PTPCore decision).
-    BOOLEAN suppressingTyping = FALSE;
-    {
-        LONGLONG suppressUntil = InterlockedCompareExchange64(
-            &pCtx->TypingSuppressUntil, 0, 0);
-        suppressingTyping = (suppressUntil > Now.QuadPart);
-
-        if (suppressingTyping && AmtHotPathTraceGate(pCtx, Now.QuadPart)) {
-            TraceEvents(TRACE_LEVEL_VERBOSE, TRACE_INPUT,
-                "%!FUNC! Typing suppression active");
-        }
-    }
-
     // RawFrame construction (InputAdapter - no decisions)
     RAW_FRAME rawFrame;
     RtlZeroMemory(&rawFrame, sizeof(rawFrame));
     rawFrame.TimestampQpc = Now.QuadPart;
 
-    if (pCtx->PtpReportTouch && !suppressingTyping) {
+    if (pCtx->PtpReportTouch) {
         raw_n = (NumBytesTransferred - headerSize) / fingerSize;
         if (raw_n > PTP_MAX_CONTACT_POINTS) raw_n = PTP_MAX_CONTACT_POINTS;
 

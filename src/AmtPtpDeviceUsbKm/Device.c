@@ -8,14 +8,6 @@
 #pragma alloc_text (PAGE, AmtPtpDeviceUsbKmEvtDevicePrepareHardware)
 #endif
 
-// Forward declarations
-static VOID
-AmtPtpKeyboardNotifyCallback(
-    _In_ PVOID CallbackContext,
-    _In_ PVOID Argument1,
-    _In_ PVOID Argument2
-);
-
 // AmtPtpGetDeviceConfig
 //
 // AUDIT FIX (#7): takes the descriptor by pointer instead of by value -
@@ -205,8 +197,6 @@ AmtPtpEvtDeviceD0Entry(
     }
     isTargetStarted = TRUE;
 
-    AmtPtpRegisterKeyboardNotification(pDeviceContext);
-
 end:
     if (!NT_SUCCESS(status) && isTargetStarted) {
         WdfIoTargetStop(
@@ -234,8 +224,6 @@ AmtPtpEvtDeviceD0Exit(
 
     TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DRIVER,
         "%!FUNC! --> moving to %s", DbgDevicePowerString(TargetState));
-
-    AmtPtpUnregisterKeyboardNotification(pDeviceContext);
 
     WdfIoTargetStop(
         WdfUsbTargetPipeGetIoTarget(pDeviceContext->InterruptPipe),
@@ -391,167 +379,4 @@ cleanup:
     }
     TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DRIVER, "%!FUNC! Exit");
     return status;
-}
-
-// ---------------------------------------------------------------------
-// Keyboard notification / typing suppression
-//
-// AUDIT FIX (#1, CRITICAL): the original implementation called
-// ExCreateCallback()/ExRegisterCallback() - PASSIVE_LEVEL-only APIs -
-// while holding a KSPIN_LOCK, which unconditionally raises IRQL to
-// DISPATCH_LEVEL. That is an IRQL contract violation on every single
-// registration, with a real risk of a bug-check (or, on some build
-// configurations, silently undefined behavior) the very first time a
-// device is powered up. Fixed by switching the serialization primitive
-// from KSPIN_LOCK to a FAST_MUTEX. A fast mutex only raises IRQL to
-// APC_LEVEL (never DISPATCH_LEVEL) and is the standard WDM primitive for
-// guarding PASSIVE_LEVEL-only object-manager calls like this one.
-//
-// AUDIT FIX (#6): the lazy one-shot initialisation of the lock itself is
-// now a proper atomic check-and-set (InterlockedCompareExchange) instead
-// of a bare "if (!flag) { init(); flag = TRUE; }", which was a classic
-// unsynchronized double-checked-init data race if two device instances
-// ever reached AmtPtpRegisterKeyboardNotification concurrently.
-// ---------------------------------------------------------------------
-
-#define CALLBACK_OBJECT_NAME L"\\Callback\\AmtPtpKbdActivity"
-
-static PCALLBACK_OBJECT g_KbdCallbackObject   = NULL;
-static LONG             g_KbdCallbackRefCount = 0;
-static FAST_MUTEX       g_KbdCallbackMutex;
-static LONG             g_KbdCallbackLockInitState = 0; // 0 = not init, 1 = init done
-
-VOID
-AmtPtpInitKeyboardNotificationLock(VOID)
-{
-    // Atomic one-shot init: only the thread that transitions the state
-    // from 0 -> 1 performs ExInitializeFastMutex; every other caller
-    // (including ones that lose the race) simply returns, exactly as
-    // intended by the original (but unsynchronized) lazy-init pattern.
-    if (InterlockedCompareExchange(&g_KbdCallbackLockInitState, 1, 0) == 0) {
-        ExInitializeFastMutex(&g_KbdCallbackMutex);
-    }
-}
-
-static VOID
-AmtPtpKeyboardNotifyCallback(
-    _In_ PVOID CallbackContext,
-    _In_ PVOID Argument1,
-    _In_ PVOID Argument2)
-{
-    PDEVICE_CONTEXT pCtx = (PDEVICE_CONTEXT)CallbackContext;
-    LARGE_INTEGER   now;
-
-    UNREFERENCED_PARAMETER(Argument1);
-    UNREFERENCED_PARAMETER(Argument2);
-
-    KeQueryPerformanceCounter(&now);
-
-    if (pCtx->PerfFrequency.QuadPart == 0)
-        return;
-
-    LONGLONG ticksPer100ns = pCtx->PerfFrequency.QuadPart / 10000000LL;
-    if (ticksPer100ns == 0) ticksPer100ns = 1;
-    LONGLONG suppressUntil = now.QuadPart +
-        ticksPer100ns * TYPING_SUPPRESS_DURATION_100NS;
-
-    InterlockedExchange64(&pCtx->TypingSuppressUntil, suppressUntil);
-
-    TraceEvents(TRACE_LEVEL_VERBOSE, TRACE_INPUT,
-        "%!FUNC! Keyboard activity - suppressing touchpad");
-}
-
-VOID
-AmtPtpRegisterKeyboardNotification(_In_ PDEVICE_CONTEXT DeviceContext)
-{
-    NTSTATUS          status;
-    OBJECT_ATTRIBUTES oa;
-    UNICODE_STRING    callbackName;
-    PCALLBACK_OBJECT  openedObject;
-    LONG              newCount;
-
-    if (DeviceContext->KbdNotifyHandle != NULL)
-        return;
-
-    AmtPtpInitKeyboardNotificationLock();
-
-    RtlInitUnicodeString(&callbackName, CALLBACK_OBJECT_NAME);
-    InitializeObjectAttributes(&oa, &callbackName,
-                               OBJ_CASE_INSENSITIVE | OBJ_PERMANENT, NULL, NULL);
-
-    // AUDIT FIX (#1): ExAcquireFastMutex only raises IRQL to APC_LEVEL -
-    // safe for the PASSIVE_LEVEL-only ExCreateCallback() calls below,
-    // unlike the spinlock previously used here.
-    ExAcquireFastMutex(&g_KbdCallbackMutex);
-
-    newCount = InterlockedIncrement(&g_KbdCallbackRefCount);
-
-    if (newCount == 1) {
-        status = ExCreateCallback(
-            &g_KbdCallbackObject, &oa, TRUE, TRUE);
-        if (!NT_SUCCESS(status)) {
-            TraceEvents(TRACE_LEVEL_WARNING, TRACE_DRIVER,
-                "%!FUNC! ExCreateCallback failed %!STATUS! - typing suppression inactive",
-                status);
-            InterlockedDecrement(&g_KbdCallbackRefCount);
-            ExReleaseFastMutex(&g_KbdCallbackMutex);
-            return;
-        }
-    } else {
-        openedObject = NULL;
-        status = ExCreateCallback(&openedObject, &oa, FALSE, TRUE);
-        if (!NT_SUCCESS(status)) {
-            TraceEvents(TRACE_LEVEL_WARNING, TRACE_DRIVER,
-                "%!FUNC! ExCreateCallback (open) failed %!STATUS!", status);
-            InterlockedDecrement(&g_KbdCallbackRefCount);
-            ExReleaseFastMutex(&g_KbdCallbackMutex);
-            return;
-        }
-        ObDereferenceObject(openedObject);
-    }
-
-    ExReleaseFastMutex(&g_KbdCallbackMutex);
-
-    DeviceContext->KbdNotifyHandle = ExRegisterCallback(
-        g_KbdCallbackObject,
-        AmtPtpKeyboardNotifyCallback,
-        DeviceContext);
-
-    if (DeviceContext->KbdNotifyHandle == NULL) {
-        TraceEvents(TRACE_LEVEL_WARNING, TRACE_DRIVER,
-            "%!FUNC! ExRegisterCallback returned NULL - typing suppression inactive");
-
-        ExAcquireFastMutex(&g_KbdCallbackMutex);
-        if (InterlockedDecrement(&g_KbdCallbackRefCount) == 0) {
-            ObDereferenceObject(g_KbdCallbackObject);
-            g_KbdCallbackObject = NULL;
-        }
-        ExReleaseFastMutex(&g_KbdCallbackMutex);
-    } else {
-        TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DRIVER,
-            "%!FUNC! Keyboard notification registered");
-    }
-}
-
-VOID
-AmtPtpUnregisterKeyboardNotification(_In_ PDEVICE_CONTEXT DeviceContext)
-{
-    if (DeviceContext->KbdNotifyHandle != NULL) {
-        ExUnregisterCallback(DeviceContext->KbdNotifyHandle);
-        DeviceContext->KbdNotifyHandle = NULL;
-    } else {
-        return;
-    }
-
-    // AUDIT FIX (#1): fast mutex instead of spinlock - ObDereferenceObject
-    // is also not guaranteed-safe at DISPATCH_LEVEL in all configurations,
-    // so this path benefits from the same fix.
-    ExAcquireFastMutex(&g_KbdCallbackMutex);
-    if (InterlockedDecrement(&g_KbdCallbackRefCount) == 0) {
-        if (g_KbdCallbackObject != NULL) {
-            ObDereferenceObject(g_KbdCallbackObject);
-            g_KbdCallbackObject = NULL;
-        }
-    }
-    ExReleaseFastMutex(&g_KbdCallbackMutex);
 }

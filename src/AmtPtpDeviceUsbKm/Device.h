@@ -49,12 +49,6 @@ typedef struct _DEVICE_CONTEXT
     // is SET FROM this by PTPCore.c, never the reverse.
     GESTURE_SESSION GestureSession;
 
-    // Typing suppression deadline in QPC ticks (0 = inactive).
-    volatile LONGLONG TypingSuppressUntil;
-
-    // Keyboard callback handle
-    PVOID KbdNotifyHandle;
-
     // QPC frequency cached at D0Entry
     LARGE_INTEGER PerfFrequency;
 
@@ -83,9 +77,6 @@ typedef struct _DEVICE_CONTEXT
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(DEVICE_CONTEXT, DeviceGetContext)
 
 #define POOL_TAG_PTP_CONTROL    'PTPC'
-#define POOL_TAG_KBD_NOTIFY     'KBDN'
-
-#define TYPING_SUPPRESS_DURATION_100NS  (500LL * 10000LL)
 
 NTSTATUS
 AmtPtpDeviceUsbKmCreateDevice(
@@ -117,8 +108,6 @@ AmtPtpSetWellspringMode(
     _In_ BOOLEAN IsWellspringModeOn
 );
 
-VOID AmtPtpRegisterKeyboardNotification(_In_ PDEVICE_CONTEXT DeviceContext);
-VOID AmtPtpUnregisterKeyboardNotification(_In_ PDEVICE_CONTEXT DeviceContext);
 
 _IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS AmtPtpGetHidDescriptor(_In_ WDFDEVICE Device, _In_ WDFREQUEST Request);
