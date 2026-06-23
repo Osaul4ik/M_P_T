@@ -108,7 +108,6 @@ AmtPtpSetWellspringMode(
     _In_ BOOLEAN IsWellspringModeOn
 );
 
-
 _IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS AmtPtpGetHidDescriptor(_In_ WDFDEVICE Device, _In_ WDFREQUEST Request);
 
