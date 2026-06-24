@@ -1,5 +1,7 @@
 // Driver entry points and callbacks. Kernel-mode Driver Framework
 
+#define INITGUID
+#include <initguid.h>
 #include "driver.h"
 #include "driver.tmh"
 
@@ -15,19 +17,18 @@ DriverEntry(
     _In_ PDRIVER_OBJECT  DriverObject,
     _In_ PUNICODE_STRING RegistryPath
     )
-// DriverEntry — called after driver load. Initialises WPP tracing and
-// registers EvtDevice callback.
+// Initialises WPP tracing and registers EvtDevice callback.
 {
     WDF_DRIVER_CONFIG config;
     NTSTATUS status;
     WDF_OBJECT_ATTRIBUTES attributes;
 
-    // Initialize WPP Tracing
+    // Init WPP
     WPP_INIT_TRACING( DriverObject, RegistryPath );
 
     TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DRIVER, "%!FUNC! Entry");
 
-    // Register cleanup callback for WPP_CLEANUP on driver unload.
+    // Register cleanup callback for WPP_CLEANUP.
     WDF_OBJECT_ATTRIBUTES_INIT(&attributes);
     attributes.EvtCleanupCallback = AmtPtpDeviceUsbKmEvtDriverContextCleanup;
 
@@ -58,8 +59,7 @@ AmtPtpDeviceUsbKmEvtDeviceAdd(
     _In_    WDFDRIVER       Driver,
     _Inout_ PWDFDEVICE_INIT DeviceInit
     )
-// EvtDeviceAdd — called by framework on AddDevice from PnP manager.
-// Creates and initialises a device object.
+// Called by framework on AddDevice. Creates and initialises device.
 {
     NTSTATUS status;
 
@@ -88,7 +88,7 @@ VOID
 AmtPtpDeviceUsbKmEvtDriverContextCleanup(
     _In_ WDFOBJECT DriverObject
     )
-// EvtDriverContextCleanup — frees resources allocated in DriverEntry.
+// Frees resources allocated in DriverEntry.
 {
     UNREFERENCED_PARAMETER(DriverObject);
 
@@ -96,7 +96,7 @@ AmtPtpDeviceUsbKmEvtDriverContextCleanup(
 
     TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DRIVER, "%!FUNC! Entry");
 
-    // Stop WPP Tracing
+    // Stop WPP
     WPP_CLEANUP( WdfDriverWdmGetDriverObject( (WDFDRIVER) DriverObject) );
 
 }

@@ -1,4 +1,6 @@
-// Public.h - Common declarations shared by driver and user applications.
+// Public.h - Shared declarations for driver and user apps.
+
+#pragma once
 
 // Device interface GUID for app communication.
 

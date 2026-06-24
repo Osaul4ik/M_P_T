@@ -1,4 +1,4 @@
-// HID descriptor and report handling. Kernel-mode Driver Framework
+// HID descriptor and report handling.
 
 #include "Driver.h"
 #include "hid.tmh"
@@ -61,6 +61,8 @@ AmtPtpGetHidDescriptor(
 		case USB_DEVICE_ID_APPLE_T2_7B:
 		case USB_DEVICE_ID_APPLE_T2_7C:
 		case USB_DEVICE_ID_APPLE_T2_7D:
+        // MacBookPro16,1 (2019)
+		case USB_DEVICE_ID_APPLE_T2_16:
 		{
 			szCopy = AmtPtpT2DefaultHidDescriptor.bLength;
 			status = WdfMemoryCopyFromBuffer(
@@ -204,6 +206,8 @@ AmtPtpGetReportDescriptor(
 		case USB_DEVICE_ID_APPLE_T2_7B:
 		case USB_DEVICE_ID_APPLE_T2_7C:
 		case USB_DEVICE_ID_APPLE_T2_7D:
+        // See AmtPtpGetHidDescriptor.
+		case USB_DEVICE_ID_APPLE_T2_16:
 		{
 
 			szCopy = AmtPtpT2DefaultHidDescriptor.DescriptorList[0].wReportLength;
@@ -388,9 +392,7 @@ AmtPtpReportFeatures(
 
 			PPTP_DEVICE_HQA_CERTIFICATION_REPORT certReport = (PPTP_DEVICE_HQA_CERTIFICATION_REPORT)pHidPacket->reportBuffer;
 
-			// FIX (HQA blob corruption): `*certReport->CertificationBlob =
-			// DEFAULT_PTP_HQA_BLOB;` evaluated as comma expression and only
-			// wrote the last byte (0xc2). Use memcpy instead.
+            // RtlCopyMemory (direct assignment was a comma-expression bug).
 			{
 				static const UCHAR HqaBlob[256] = { DEFAULT_PTP_HQA_BLOB };
 				C_ASSERT(sizeof(HqaBlob) == sizeof(certReport->CertificationBlob));
@@ -518,6 +520,16 @@ AmtPtpSetFeatures(
 					}
 					break;
 				}
+				default:
+				{
+                // Unknown Mode: previously fell through silently claiming success.
+					TraceEvents(
+						TRACE_LEVEL_WARNING, TRACE_DRIVER,
+						"%!FUNC! Report REPORTID_REPORTMODE requested unknown Mode=%d",
+						devInputMode->Mode
+					);
+					break;
+				}
 			}
 
 			TraceEvents(
@@ -542,6 +554,8 @@ AmtPtpSetFeatures(
 				secInput->SurfaceReport
 			);
 
+            // REVERTED: honoring SurfaceReport regressed real hardware
+            // (pad stops responding). Kept trace-only.
 			TraceEvents(
 				TRACE_LEVEL_INFORMATION, TRACE_DRIVER,
 				"%!FUNC! Report REPORTID_FUNCSWITCH is fulfilled"

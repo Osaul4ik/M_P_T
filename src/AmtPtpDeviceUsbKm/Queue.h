@@ -4,9 +4,7 @@ EXTERN_C_START
 
 // Per-queue context.
 typedef struct _QUEUE_CONTEXT {
-
-    ULONG PrivateDeviceData;  // just a placeholder
-
+    ULONG PrivateDeviceData;  // placeholder
 } QUEUE_CONTEXT, *PQUEUE_CONTEXT;
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(QUEUE_CONTEXT, QueueGetContext)

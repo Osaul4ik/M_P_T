@@ -2,6 +2,9 @@
 
 #include "public.h"
 #include <Hid.h>
+#include "ActiveContact.h"
+#include "Gesture.h"
+#include "PTPCore.h"
 
 EXTERN_C_START
 
@@ -27,55 +30,53 @@ typedef struct _DEVICE_CONTEXT
     // Scan time
     LARGE_INTEGER LastReportTime;
 
-    // Palm rejection
+    // Palm rejection - session-level latch (sticky "still palm-adjacent"
+    // state), owned by PTPCore_ProcessFrame. Per-sample classification
+    // lives in Palm.c.
     BOOLEAN PalmDetected;
 
-    // Per-slot smoothing (indexed by raw slot 0..PTP_MAX_CONTACT_POINTS-1)
-    USHORT  SmoothedX[PTP_MAX_CONTACT_POINTS];
-    USHORT  SmoothedY[PTP_MAX_CONTACT_POINTS];
-    USHORT  HystX[PTP_MAX_CONTACT_POINTS];
-    USHORT  HystY[PTP_MAX_CONTACT_POINTS];
-    BOOLEAN SlotActive[PTP_MAX_CONTACT_POINTS];
+    // Contact pool (PTPCore / ActiveContact). Pool POSITION is NOT
+    // identity - ContactID is. See ActiveContact.h for the full
+    // rationale (this replaces the old slot-indexed TRACK[] array).
+    // ---------------------------------------------------------------
+    ACTIVE_CONTACT ActiveContacts[MAX_CONTACTS];
 
-    // Tip-size debounce
-    UCHAR   TipDropCount[PTP_MAX_CONTACT_POINTS];
+    // Monotonic ContactID counter - never reuses an ID while "warm".
+    // Every lift-off advances it; reseeded at D0Entry.
+    ULONG   NextContactId;
 
-    // Lift-off tracking
-    BOOLEAN SlotReportedLastFrame[PTP_MAX_CONTACT_POINTS];
-
-    // Gesture taint tracking
-    BOOLEAN SlotWasInGesture[PTP_MAX_CONTACT_POINTS];
-
-    // FIX (cursor-jump after gesture + re-tap):
-    // Windows PTP tracks contacts by ContactID. A re-used slot with the same
-    // ContactID caused cursor correction. Fix: rotate ContactID per slot on
-    // lift-off so a fresh finger gets an ID Windows has never seen before.
-    // ContactIdForSlot[i] is bumped (mod CONTACT_ID_POOL) in AmtClearSlot.
-    // The lift-off report uses the old ID; the new one takes effect on next
-    // touch-down.
-    UCHAR   ContactIdForSlot[PTP_MAX_CONTACT_POINTS];
-
-    // Typing suppression deadline in QPC ticks (0 = inactive).
-    volatile LONGLONG TypingSuppressUntil;
-
-    // Keyboard callback handle
-    PVOID KbdNotifyHandle;
+    // GestureEngine session state (Gesture.h). ACTIVE_CONTACT.WasInGesture
+    // is SET FROM this by PTPCore.c, never the reverse.
+    GESTURE_SESSION GestureSession;
 
     // QPC frequency cached at D0Entry
     LARGE_INTEGER PerfFrequency;
+
+    // Hot-path trace rate limiting - QPC of last verbose trace emission.
+    LONGLONG LastHotPathTraceQpc;
+
+    // Overflow lift-off queue - when PTPCore_ProcessFrame produces more
+    // lift-offs than remaining PTP_CORE_FRAME capacity, deferred
+    // entries are drained at the front of the next frame. See
+    // AmtCoreEmitLift/AmtCoreDrainOverflow in PTPCore.c.
+    // ---------------------------------------------------------------
+    ULONG  OverflowContactID[PTP_MAX_CONTACT_POINTS];
+    USHORT OverflowX[PTP_MAX_CONTACT_POINTS];
+    USHORT OverflowY[PTP_MAX_CONTACT_POINTS];
+    UCHAR  OverflowCount;
+
+    // Recent-lift memory for retap smoothing (PTPCore.h /
+    // RECENT_LIFT_RING). Deliberately NOT slot-indexed - see PTPCore.h
+    // for why the old SlotLastLiftQpc/X/Y[PTP_MAX_CONTACT_POINTS]
+    // arrays were a slot-as-identity mistake.
+    // ---------------------------------------------------------------
+    RECENT_LIFT_RING RecentLifts;
 
 } DEVICE_CONTEXT, *PDEVICE_CONTEXT;
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(DEVICE_CONTEXT, DeviceGetContext)
 
 #define POOL_TAG_PTP_CONTROL    'PTPC'
-#define POOL_TAG_KBD_NOTIFY     'KBDN'
-
-#define TYPING_SUPPRESS_DURATION_100NS  (500LL * 10000LL)
-
-// ContactID rotation pool size (> PTP_MAX_CONTACT_POINTS to avoid collisions).
-// PTP_MAX_CONTACT_POINTS * 2 = 10 IDs for 5 max contacts.
-#define CONTACT_ID_POOL  (PTP_MAX_CONTACT_POINTS * 2)
 
 NTSTATUS
 AmtPtpDeviceUsbKmCreateDevice(
@@ -106,9 +107,6 @@ AmtPtpSetWellspringMode(
     _In_ PDEVICE_CONTEXT DeviceContext,
     _In_ BOOLEAN IsWellspringModeOn
 );
-
-VOID AmtPtpRegisterKeyboardNotification(_In_ PDEVICE_CONTEXT DeviceContext);
-VOID AmtPtpUnregisterKeyboardNotification(_In_ PDEVICE_CONTEXT DeviceContext);
 
 _IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS AmtPtpGetHidDescriptor(_In_ WDFDEVICE Device, _In_ WDFREQUEST Request);

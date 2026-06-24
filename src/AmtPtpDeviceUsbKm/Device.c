@@ -8,21 +8,16 @@
 #pragma alloc_text (PAGE, AmtPtpDeviceUsbKmEvtDevicePrepareHardware)
 #endif
 
-// Forward declarations
-static VOID
-AmtPtpKeyboardNotifyCallback(
-    _In_ PVOID CallbackContext,
-    _In_ PVOID Argument1,
-    _In_ PVOID Argument2
-);
-
 // AmtPtpGetDeviceConfig
+//
+// AUDIT FIX (#7): takes the descriptor by pointer instead of by value -
+// avoids an unnecessary full-struct copy onto the stack on every call.
 
 _IRQL_requires_(PASSIVE_LEVEL)
 static const struct BCM5974_CONFIG*
-AmtPtpGetDeviceConfig(_In_ USB_DEVICE_DESCRIPTOR deviceInfo)
+AmtPtpGetDeviceConfig(_In_ const PUSB_DEVICE_DESCRIPTOR DeviceDescriptor)
 {
-    USHORT id = deviceInfo.idProduct;
+    USHORT id = DeviceDescriptor->idProduct;
     const struct BCM5974_CONFIG* cfg;
 
     for (cfg = Bcm5974ConfigTable; cfg->identification; ++cfg) {
@@ -110,7 +105,7 @@ AmtPtpDeviceUsbKmEvtDevicePrepareHardware(
     WdfUsbTargetDeviceGetDeviceDescriptor(
         pDeviceContext->UsbDevice, &pDeviceContext->DeviceDescriptor);
 
-    pDeviceContext->DeviceInfo = AmtPtpGetDeviceConfig(pDeviceContext->DeviceDescriptor);
+    pDeviceContext->DeviceInfo = AmtPtpGetDeviceConfig(&pDeviceContext->DeviceDescriptor);
     if (pDeviceContext->DeviceInfo == NULL) {
         TraceEvents(TRACE_LEVEL_ERROR, TRACE_DEVICE,
             "AmtPtpGetDeviceConfig failed");
@@ -173,13 +168,18 @@ AmtPtpEvtDeviceD0Entry(
     pDeviceContext->LastReportTime =
         KeQueryPerformanceCounter(&pDeviceContext->PerfFrequency);
 
-    // FIX (cursor-jump after gesture + re-tap):
-    // Initialise ContactID rotation table. AmtClearSlot rotates each slot's ID
-    // via +PTP_MAX_CONTACT_POINTS on lift-off so a re-used slot never presents
-    // the same ContactID that Windows saw at a previous position.
-    for (ULONG s = 0; s < PTP_MAX_CONTACT_POINTS; s++) {
-        pDeviceContext->ContactIdForSlot[s] = (UCHAR)s;
-    }
+    // Reseed ContactID counter and reset the contact pool on D0Entry.
+    // Prevents stale ContactIDs from surviving sleep/wake cycles.
+    // NextContactId=0 reserved; first birth pre-increments to 1.
+    pDeviceContext->NextContactId        = 0;
+    AmtGestureSessionInit(&pDeviceContext->GestureSession);
+    pDeviceContext->LastHotPathTraceQpc  = 0;
+    pDeviceContext->OverflowCount        = 0;
+    AmtContactPoolInit(pDeviceContext->ActiveContacts);
+
+    // Zero RecentLifts on D0Entry to prevent stale retap-smoothing
+    // hints from a previous power session.
+    RtlZeroMemory(&pDeviceContext->RecentLifts, sizeof(pDeviceContext->RecentLifts));
 
     status = AmtPtpSetWellspringMode(pDeviceContext, TRUE);
     if (!NT_SUCCESS(status)) {
@@ -196,8 +196,6 @@ AmtPtpEvtDeviceD0Entry(
         goto end;
     }
     isTargetStarted = TRUE;
-
-    AmtPtpRegisterKeyboardNotification(pDeviceContext);
 
 end:
     if (!NT_SUCCESS(status) && isTargetStarted) {
@@ -226,8 +224,6 @@ AmtPtpEvtDeviceD0Exit(
 
     TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DRIVER,
         "%!FUNC! --> moving to %s", DbgDevicePowerString(TargetState));
-
-    AmtPtpUnregisterKeyboardNotification(pDeviceContext);
 
     WdfIoTargetStop(
         WdfUsbTargetPipeGetIoTarget(pDeviceContext->InterruptPipe),
@@ -383,141 +379,4 @@ cleanup:
     }
     TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DRIVER, "%!FUNC! Exit");
     return status;
-}
-
-// Keyboard notification / typing suppression
-
-#define CALLBACK_OBJECT_NAME L"\\Callback\\AmtPtpKbdActivity"
-
-static PCALLBACK_OBJECT g_KbdCallbackObject   = NULL;
-static LONG             g_KbdCallbackRefCount = 0;
-static KSPIN_LOCK       g_KbdCallbackLock;
-static BOOLEAN          g_KbdCallbackLockInit = FALSE;
-
-VOID
-AmtPtpInitKeyboardNotificationLock(VOID)
-{
-    if (!g_KbdCallbackLockInit) {
-        KeInitializeSpinLock(&g_KbdCallbackLock);
-        g_KbdCallbackLockInit = TRUE;
-    }
-}
-
-static VOID
-AmtPtpKeyboardNotifyCallback(
-    _In_ PVOID CallbackContext,
-    _In_ PVOID Argument1,
-    _In_ PVOID Argument2)
-{
-    PDEVICE_CONTEXT pCtx = (PDEVICE_CONTEXT)CallbackContext;
-    LARGE_INTEGER   now;
-
-    UNREFERENCED_PARAMETER(Argument1);
-    UNREFERENCED_PARAMETER(Argument2);
-
-    KeQueryPerformanceCounter(&now);
-
-    if (pCtx->PerfFrequency.QuadPart == 0)
-        return;
-
-    LONGLONG ticksPer100ns = pCtx->PerfFrequency.QuadPart / 10000000LL;
-    if (ticksPer100ns == 0) ticksPer100ns = 1;
-    LONGLONG suppressUntil = now.QuadPart +
-        ticksPer100ns * TYPING_SUPPRESS_DURATION_100NS;
-
-    InterlockedExchange64(&pCtx->TypingSuppressUntil, suppressUntil);
-
-    TraceEvents(TRACE_LEVEL_VERBOSE, TRACE_INPUT,
-        "%!FUNC! Keyboard activity — suppressing touchpad");
-}
-
-VOID
-AmtPtpRegisterKeyboardNotification(_In_ PDEVICE_CONTEXT DeviceContext)
-{
-    NTSTATUS          status;
-    OBJECT_ATTRIBUTES oa;
-    UNICODE_STRING    callbackName;
-    KIRQL             oldIrql;
-    PCALLBACK_OBJECT  openedObject;
-
-    if (DeviceContext->KbdNotifyHandle != NULL)
-        return;
-
-    AmtPtpInitKeyboardNotificationLock();
-
-    RtlInitUnicodeString(&callbackName, CALLBACK_OBJECT_NAME);
-    InitializeObjectAttributes(&oa, &callbackName,
-                               OBJ_CASE_INSENSITIVE | OBJ_PERMANENT, NULL, NULL);
-
-    KeAcquireSpinLock(&g_KbdCallbackLock, &oldIrql);
-
-    LONG newCount = InterlockedIncrement(&g_KbdCallbackRefCount);
-
-    if (newCount == 1) {
-        status = ExCreateCallback(
-            &g_KbdCallbackObject, &oa, TRUE, TRUE);
-        if (!NT_SUCCESS(status)) {
-            TraceEvents(TRACE_LEVEL_WARNING, TRACE_DRIVER,
-                "%!FUNC! ExCreateCallback failed %!STATUS! — typing suppression inactive",
-                status);
-            InterlockedDecrement(&g_KbdCallbackRefCount);
-            KeReleaseSpinLock(&g_KbdCallbackLock, oldIrql);
-            return;
-        }
-    } else {
-        openedObject = NULL;
-        status = ExCreateCallback(&openedObject, &oa, FALSE, TRUE);
-        if (!NT_SUCCESS(status)) {
-            TraceEvents(TRACE_LEVEL_WARNING, TRACE_DRIVER,
-                "%!FUNC! ExCreateCallback (open) failed %!STATUS!", status);
-            InterlockedDecrement(&g_KbdCallbackRefCount);
-            KeReleaseSpinLock(&g_KbdCallbackLock, oldIrql);
-            return;
-        }
-        ObDereferenceObject(openedObject);
-    }
-
-    KeReleaseSpinLock(&g_KbdCallbackLock, oldIrql);
-
-    DeviceContext->KbdNotifyHandle = ExRegisterCallback(
-        g_KbdCallbackObject,
-        AmtPtpKeyboardNotifyCallback,
-        DeviceContext);
-
-    if (DeviceContext->KbdNotifyHandle == NULL) {
-        TraceEvents(TRACE_LEVEL_WARNING, TRACE_DRIVER,
-            "%!FUNC! ExRegisterCallback returned NULL — typing suppression inactive");
-
-        KeAcquireSpinLock(&g_KbdCallbackLock, &oldIrql);
-        if (InterlockedDecrement(&g_KbdCallbackRefCount) == 0) {
-            ObDereferenceObject(g_KbdCallbackObject);
-            g_KbdCallbackObject = NULL;
-        }
-        KeReleaseSpinLock(&g_KbdCallbackLock, oldIrql);
-    } else {
-        TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DRIVER,
-            "%!FUNC! Keyboard notification registered");
-    }
-}
-
-VOID
-AmtPtpUnregisterKeyboardNotification(_In_ PDEVICE_CONTEXT DeviceContext)
-{
-    KIRQL oldIrql;
-
-    if (DeviceContext->KbdNotifyHandle != NULL) {
-        ExUnregisterCallback(DeviceContext->KbdNotifyHandle);
-        DeviceContext->KbdNotifyHandle = NULL;
-    } else {
-        return;
-    }
-
-    KeAcquireSpinLock(&g_KbdCallbackLock, &oldIrql);
-    if (InterlockedDecrement(&g_KbdCallbackRefCount) == 0) {
-        if (g_KbdCallbackObject != NULL) {
-            ObDereferenceObject(g_KbdCallbackObject);
-            g_KbdCallbackObject = NULL;
-        }
-    }
-    KeReleaseSpinLock(&g_KbdCallbackLock, oldIrql);
 }

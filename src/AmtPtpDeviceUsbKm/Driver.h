@@ -5,8 +5,6 @@
 #include <usb.h>
 #include <usbdlib.h>
 #include <wdfusb.h>
-#include <initguid.h>
-
 #include "device.h"
 #include "queue.h"
 #include "trace.h"
