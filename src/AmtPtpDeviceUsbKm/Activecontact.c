@@ -106,6 +106,45 @@ AmtContactBirthWithRetapSmoothing(
     c->FramesAlive         = 1;
 }
 
+// See ActiveContact.h. Same physical finger as the contact being replaced -
+// WasInGesture/FramesAlive are carried over explicitly by the caller rather
+// than reset, unlike every other birth path.
+VOID
+AmtContactBirthForButtonRebirth(
+    _Inout_ PACTIVE_CONTACT Pool,
+    _In_    size_t          index,
+    _Inout_ ULONG*          NextContactId,
+    _In_    USHORT          x,
+    _In_    USHORT          y,
+    _In_    USHORT          slotHint,
+    _In_    BOOLEAN         wasInGesture,
+    _In_    UCHAR           framesAlive
+)
+{
+    PACTIVE_CONTACT c = &Pool[index];
+
+#if DBG
+    NT_ASSERT(c->State == CONTACT_FREE);
+#endif
+
+    c->State              = CONTACT_ACTIVE;
+    c->ContactID          = AmtContactAssignId(NextContactId);
+    // Seed EMA baseline at the exact pre-swap position - no real movement
+    // happened, so there is nothing to smooth toward.
+    c->ReportX            = x;
+    c->ReportY            = y;
+    c->HystX              = x;
+    c->HystY              = y;
+    c->TipDropCount       = 0;
+    c->WasInGesture       = wasInGesture;   // carried over, not reset
+    c->PendingFirstSample = TRUE;
+    c->RetapSeeded        = TRUE;           // preserve seed on first update
+    c->ReportedLastFrame  = FALSE;
+    c->LastSlotHint        = slotHint;
+    c->LastSeenQpc         = 0;
+    c->FramesAlive         = framesAlive;   // carried over, not reset to 1
+}
+
 BOOLEAN
 AmtContactIsRecentLiftNearby(
     _In_ LONGLONG LiftQpc,

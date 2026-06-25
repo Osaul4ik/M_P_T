@@ -137,10 +137,22 @@ PTPCore_ProcessFrame(
     _Inout_ PDEVICE_CONTEXT  DeviceContext,
     _In_    const RAW_FRAME* RawFrame,
     _In_    LONGLONG         NowQpc,
+    _In_    BOOLEAN          ButtonDown,
     _Out_   PTP_CORE_FRAME*  OutResult
 )
 {
     PDEVICE_CONTEXT pCtx = DeviceContext;
+
+    // Click-edge detection for the button-rebirth workaround (Phase A.5
+    // below). Only the RISING edge (0->1) matters: that's the frame where
+    // Windows' PTP integrated-button anti-jitter logic would otherwise
+    // compare the live HID coordinate against the current cursor position
+    // and "snap" the click to the cursor if the delta looks like jitter.
+    // Forcing a real Kill->Birth of the live contact's ContactID at its
+    // own current position routes this click through the ordinary
+    // soft-tap TipSwitch path instead, which isn't subject to that snap.
+    BOOLEAN buttonClickEdge = ButtonDown && !pCtx->PrevButtonClicked;
+    pCtx->PrevButtonClicked = ButtonDown;
 
     RtlZeroMemory(OutResult, sizeof(PTP_CORE_FRAME));
     OutResult->TimestampQpc = NowQpc;
@@ -260,6 +272,57 @@ PTPCore_ProcessFrame(
         AmtCoreEmitLift(pCtx, OutResult, oldId, oldX, oldY);
 
         matchResult.CorrespondingPoolIndex[ci] = MATCH_NO_CORRESPONDENCE;
+    }
+
+    AmtContactPoolCheckInvariants(pCtx->ActiveContacts);
+
+    // Phase A.5 (button-click forced rebirth): on the rising edge of the
+    // integrated button, force a REAL Kill->Birth of every still-live,
+    // pre-existing matched contact, at its own current position. This is
+    // the only sanctioned way to mint a new ContactID (ActiveContact.h:
+    // "ContactID monotonic... the only permitted NEW_IDENTITY path is
+    // Kill->Birth") - there is deliberately no separate in-place identity
+    // mutation here. WasInGesture/FramesAlive are carried across the swap
+    // via AmtContactBirthForButtonRebirth, since the same physical finger
+    // never actually left the pad. Pre-existing == LastSeenQpc != 0: a
+    // contact birthed earlier in THIS frame (NewIdentity path above, or a
+    // genuinely new touch in Phase B below) has no "old" cursor-latched
+    // identity for Windows to be snapping against yet, so it's skipped.
+    if (buttonClickEdge) {
+        for (UCHAR ci = 0; ci < candidates.Count; ci++) {
+            if (candidates.Candidates[ci].PalmLocal) continue;
+
+            size_t p = matchResult.CorrespondingPoolIndex[ci];
+            if (p == MATCH_NO_CORRESPONDENCE) continue;
+            if (pCtx->ActiveContacts[p].LastSeenQpc == 0) continue; // born this frame
+
+            BOOLEAN wasInGesture = pCtx->ActiveContacts[p].WasInGesture;
+            UCHAR   framesAlive  = pCtx->ActiveContacts[p].FramesAlive;
+
+            ULONG  oldId; USHORT oldX, oldY;
+            AmtContactKill(pCtx->ActiveContacts, p, &oldId, &oldX, &oldY);
+            AmtCoreEmitLift(pCtx, OutResult, oldId, oldX, oldY);
+            // Deliberately NOT AmtRecentLiftRecord'd - this isn't a real
+            // lift and must not seed retap-smoothing for unrelated future
+            // taps in the same area.
+
+            size_t freeIdx = AmtContactPoolFindFree(pCtx->ActiveContacts);
+            if (freeIdx == MAX_CONTACTS) {
+                // Pool exhausted re-acquiring our own just-freed slot
+                // should not happen (we just killed one), but fail safe:
+                // leave this candidate unmatched: Phase B will treat it
+                // as a fresh untainted touch instead of dropping it.
+                matchResult.CorrespondingPoolIndex[ci] = MATCH_NO_CORRESPONDENCE;
+                continue;
+            }
+
+            AmtContactBirthForButtonRebirth(
+                pCtx->ActiveContacts, freeIdx, &pCtx->NextContactId,
+                oldX, oldY, candidates.Candidates[ci].SlotIndex,
+                wasInGesture, framesAlive);
+
+            matchResult.CorrespondingPoolIndex[ci] = freeIdx;
+        }
     }
 
     AmtContactPoolCheckInvariants(pCtx->ActiveContacts);
