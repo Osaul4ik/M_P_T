@@ -57,6 +57,15 @@ typedef struct _ACTIVE_CONTACT
     // Reported last frame? Drives Phase A lift-off detection.
     BOOLEAN ReportedLastFrame;
 
+    // TRUE once this contact has passed the deadzone at least once while
+    // ACTIVE (i.e. it actually moved, as opposed to a stationary tap/hold).
+    // Used to gate the gesture-end lift deferral in PTPCore.c: a contact
+    // that was moving (drag/scroll) must report its real final position
+    // on lift-off with no frozen-position filler frame, or Windows'
+    // Precision Touchpad inertia calculation sees a zero-velocity sample
+    // right before ContactCount drops to 0 and never starts the fling.
+    BOOLEAN HadRecentMotion;
+
     // ---- Matching-hint fields. NOT identity. ----
     USHORT   LastSlotHint;    // hw slot matched to last frame; speeds up matching
     LONGLONG LastSeenQpc;     // QPC of last successful match; grace/retap timing
@@ -71,15 +80,18 @@ typedef struct _ACTIVE_CONTACT
 #define MIN_CONTACT_LIFETIME_FRAMES 4
 
 // Zero/FREE-initialise the whole pool. Call at device creation and D0Entry.
+_IRQL_requires_max_(DISPATCH_LEVEL)
 VOID
 AmtContactPoolInit(_Out_writes_(MAX_CONTACTS) PACTIVE_CONTACT Pool);
 
 // Finds a FREE pool entry. Returns index or MAX_CONTACTS if full.
+_IRQL_requires_max_(DISPATCH_LEVEL)
 size_t
 AmtContactPoolFindFree(_In_reads_(MAX_CONTACTS) const ACTIVE_CONTACT* Pool);
 
 // FREE -> ACTIVE. Assigns fresh ContactID, seeds baseline.
 // Precondition: Pool[index].State == CONTACT_FREE.
+_IRQL_requires_max_(DISPATCH_LEVEL)
 VOID
 AmtContactBirth(
     _Inout_ PACTIVE_CONTACT Pool,
@@ -91,6 +103,7 @@ AmtContactBirth(
 );
 
 // AmtContactBirth + EMA baseline seed from lift position + RetapSeeded=TRUE.
+_IRQL_requires_max_(DISPATCH_LEVEL)
 VOID
 AmtContactBirthWithRetapSmoothing(
     _Inout_ PACTIVE_CONTACT Pool,
@@ -107,6 +120,7 @@ AmtContactBirthWithRetapSmoothing(
 // NOT a real re-tap: the same physical finger never left the pad, so the
 // gesture/lifetime bookkeeping that a real Kill->Birth would discard must
 // be carried across the identity swap instead.
+_IRQL_requires_max_(DISPATCH_LEVEL)
 VOID
 AmtContactBirthForButtonRebirth(
     _Inout_ PACTIVE_CONTACT Pool,
@@ -116,7 +130,8 @@ AmtContactBirthForButtonRebirth(
     _In_    USHORT          y,
     _In_    USHORT          slotHint,
     _In_    BOOLEAN         wasInGesture,
-    _In_    UCHAR           framesAlive
+    _In_    UCHAR           framesAlive,
+    _In_    BOOLEAN         hadRecentMotion
 );
 
 // Is touch-down near a recent lift in time (RETAP_WINDOW_100NS) AND space
@@ -124,6 +139,7 @@ AmtContactBirthForButtonRebirth(
 #define RETAP_WINDOW_100NS      (700LL * 10000LL)  // 700 ms
 #define RETAP_MAX_DISTANCE      600                // normalized units
 
+_IRQL_requires_max_(DISPATCH_LEVEL)
 BOOLEAN
 AmtContactIsRecentLiftNearby(
     _In_ LONGLONG LiftQpc,
@@ -136,6 +152,7 @@ AmtContactIsRecentLiftNearby(
 );
 
 // ACTIVE/GRACE -> FREE. Returns old ContactID/X/Y for lift-off report.
+_IRQL_requires_max_(DISPATCH_LEVEL)
 VOID
 AmtContactKill(
     _Inout_ PACTIVE_CONTACT Pool,
@@ -147,6 +164,7 @@ AmtContactKill(
 
 // ACTIVE -> GRACE. Used when WasInGesture at lift-off.
 // Same-frame quarantine only - never re-binds ContactID.
+_IRQL_requires_max_(DISPATCH_LEVEL)
 VOID
 AmtContactEnterGrace(
     _Inout_ PACTIVE_CONTACT Pool,
@@ -157,11 +175,13 @@ AmtContactEnterGrace(
 );
 
 // GRACE -> FREE. Called same frame after EnterGrace. No report emitted.
+_IRQL_requires_max_(DISPATCH_LEVEL)
 VOID
 AmtContactExpireGrace(_Inout_ PACTIVE_CONTACT Pool, _In_ size_t index);
 
 // 2-pass deadzone evaluator. Pass 1: read-only check vs HystX/Y.
 // Pass 2 (in AmtContactUpdate): commits HystX/Y, then EMA blends.
+_IRQL_requires_max_(DISPATCH_LEVEL)
 BOOLEAN
 AmtContactEvaluateDeadzone(
     _In_ const ACTIVE_CONTACT* Contact,
@@ -170,6 +190,7 @@ AmtContactEvaluateDeadzone(
 );
 
 // Per-frame ACTIVE contact update (Phase C). Deadzone + EMA.
+_IRQL_requires_max_(DISPATCH_LEVEL)
 VOID
 AmtContactUpdate(
     _Inout_ PACTIVE_CONTACT Contact,

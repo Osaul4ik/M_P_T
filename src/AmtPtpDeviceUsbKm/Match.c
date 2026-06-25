@@ -119,8 +119,14 @@ AmtMatchBuildCandidates(
         cand.X = isStationary ? Pool[bestPoolIdx].ReportX : rc->X;
         cand.Y = isStationary ? Pool[bestPoolIdx].ReportY : rc->Y;
 
-        // Clamp to prevent Confidence=1 on UCHAR wrap.
-        cand.TipDropApplied = 0;
+        // Non-zero: this candidate's X/Y is bridged through a debounce
+        // anchor (below tip-size threshold), so Confidence must read 0.
+        // Clamp to prevent UCHAR wrap (TIP_DROP_COUNT_MAX never auto-drops
+        // a below-tip contact with a valid anchor - the counter only
+        // tracks debounce state, it never forces a lift).
+        cand.TipDropApplied = (Pool[bestPoolIdx].TipDropCount < TIP_DROP_COUNT_MAX)
+            ? (UCHAR)(Pool[bestPoolIdx].TipDropCount + 1)
+            : TIP_DROP_COUNT_MAX;
 
         OutCandidates->Candidates[OutCandidates->Count++] = cand;
     }

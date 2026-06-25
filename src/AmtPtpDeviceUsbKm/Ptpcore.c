@@ -211,9 +211,15 @@ PTPCore_ProcessFrame(
         ULONG  oldId; USHORT oldX, oldY;
 
         if (pCtx->ActiveContacts[p].WasInGesture) {
-            // Gesture-tainted: defer if fresh and last finger.
+            // Gesture-tainted: defer if fresh, last finger, AND never moved.
+            // A contact that actually moved (drag/scroll) must report its
+            // true final position on lift-off with no frozen filler frame -
+            // otherwise Windows' Precision Touchpad inertia calculation
+            // sees a zero-velocity sample right before ContactCount drops
+            // to 0 and never starts the fling (no scroll momentum).
             if (pCtx->ActiveContacts[p].FramesAlive < MIN_CONTACT_LIFETIME_FRAMES
-                && aliveCount == 0)
+                && aliveCount == 0
+                && !pCtx->ActiveContacts[p].HadRecentMotion)
             {
                 // Defer one frame for gesture recognizer.
                 pCtx->ActiveContacts[p].FramesAlive++;
@@ -296,8 +302,9 @@ PTPCore_ProcessFrame(
             if (p == MATCH_NO_CORRESPONDENCE) continue;
             if (pCtx->ActiveContacts[p].LastSeenQpc == 0) continue; // born this frame
 
-            BOOLEAN wasInGesture = pCtx->ActiveContacts[p].WasInGesture;
-            UCHAR   framesAlive  = pCtx->ActiveContacts[p].FramesAlive;
+            BOOLEAN wasInGesture    = pCtx->ActiveContacts[p].WasInGesture;
+            UCHAR   framesAlive     = pCtx->ActiveContacts[p].FramesAlive;
+            BOOLEAN hadRecentMotion = pCtx->ActiveContacts[p].HadRecentMotion;
 
             ULONG  oldId; USHORT oldX, oldY;
             AmtContactKill(pCtx->ActiveContacts, p, &oldId, &oldX, &oldY);
@@ -319,7 +326,7 @@ PTPCore_ProcessFrame(
             AmtContactBirthForButtonRebirth(
                 pCtx->ActiveContacts, freeIdx, &pCtx->NextContactId,
                 oldX, oldY, candidates.Candidates[ci].SlotIndex,
-                wasInGesture, framesAlive);
+                wasInGesture, framesAlive, hadRecentMotion);
 
             matchResult.CorrespondingPoolIndex[ci] = freeIdx;
         }

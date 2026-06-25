@@ -63,6 +63,7 @@ typedef struct _PTP_CORE_FRAME
 
 struct _DEVICE_CONTEXT; // fwd decl, defined in Device.h
 
+_IRQL_requires_max_(DISPATCH_LEVEL)
 VOID
 PTPCore_ProcessFrame(
     _Inout_ struct _DEVICE_CONTEXT* DeviceContext,

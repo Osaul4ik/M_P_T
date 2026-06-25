@@ -44,6 +44,7 @@ typedef struct _MATCH_RESULT
 
 // Build candidate set: palm classification + tip-size debounce.
 // Below-tip with no anchor = full-confidence birth candidate.
+_IRQL_requires_max_(DISPATCH_LEVEL)
 VOID
 AmtMatchBuildCandidates(
     _In_  const RAW_FRAME*                        RawFrame,
@@ -57,6 +58,7 @@ AmtMatchBuildCandidates(
 #define MATCH_MAX_TIME_DELTA_100NS (150LL * 10000LL)
 
 // Cost-based correspondence. Greedy min-cost, N,M<=5. Rejected on spatial/time gap or IdentityBreak.
+_IRQL_requires_max_(DISPATCH_LEVEL)
 VOID
 AmtMatchCorrespond(
     _In_  const MATCH_CANDIDATE_SET*               Candidates,

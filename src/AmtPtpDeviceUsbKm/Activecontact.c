@@ -66,6 +66,7 @@ AmtContactBirth(
     c->PendingFirstSample = TRUE;
     c->RetapSeeded        = FALSE; // plain birth - no seeded baseline to preserve
     c->ReportedLastFrame  = FALSE;
+    c->HadRecentMotion    = FALSE;
     c->LastSlotHint        = slotHint;
     c->LastSeenQpc         = 0; // set by first AmtContactUpdate call
     c->FramesAlive         = 1; // birth frame counts as 1
@@ -101,6 +102,7 @@ AmtContactBirthWithRetapSmoothing(
     c->PendingFirstSample = TRUE;
     c->RetapSeeded        = TRUE; // preserve seed on first update
     c->ReportedLastFrame  = FALSE;
+    c->HadRecentMotion    = FALSE;
     c->LastSlotHint        = slotHint;
     c->LastSeenQpc         = 0;
     c->FramesAlive         = 1;
@@ -118,7 +120,8 @@ AmtContactBirthForButtonRebirth(
     _In_    USHORT          y,
     _In_    USHORT          slotHint,
     _In_    BOOLEAN         wasInGesture,
-    _In_    UCHAR           framesAlive
+    _In_    UCHAR           framesAlive,
+    _In_    BOOLEAN         hadRecentMotion
 )
 {
     PACTIVE_CONTACT c = &Pool[index];
@@ -140,6 +143,7 @@ AmtContactBirthForButtonRebirth(
     c->PendingFirstSample = TRUE;
     c->RetapSeeded        = TRUE;           // preserve seed on first update
     c->ReportedLastFrame  = FALSE;
+    c->HadRecentMotion    = hadRecentMotion; // carried over - same physical finger
     c->LastSlotHint        = slotHint;
     c->LastSeenQpc         = 0;
     c->FramesAlive         = framesAlive;   // carried over, not reset to 1
@@ -278,6 +282,7 @@ AmtContactCommitSample(
     } else {
         Contact->HystX = candX;
         Contact->HystY = candY;
+        Contact->HadRecentMotion = TRUE; // real movement past hysteresis
 
         BOOLEAN skipEma =
             (Contact->PendingFirstSample && !commitIsRetapSeededFirstSample) ||
