@@ -119,14 +119,17 @@ AmtMatchBuildCandidates(
         cand.X = isStationary ? Pool[bestPoolIdx].ReportX : rc->X;
         cand.Y = isStationary ? Pool[bestPoolIdx].ReportY : rc->Y;
 
-        // Non-zero: this candidate's X/Y is bridged through a debounce
-        // anchor (below tip-size threshold), so Confidence must read 0.
-        // Clamp to prevent UCHAR wrap (TIP_DROP_COUNT_MAX never auto-drops
-        // a below-tip contact with a valid anchor - the counter only
-        // tracks debounce state, it never forces a lift).
-        cand.TipDropApplied = (Pool[bestPoolIdx].TipDropCount < TIP_DROP_COUNT_MAX)
-            ? (UCHAR)(Pool[bestPoolIdx].TipDropCount + 1)
-            : TIP_DROP_COUNT_MAX;
+        // Deliberately 0, NOT incremented from Pool[bestPoolIdx].TipDropCount.
+        // Confidence = (TipDropApplied == 0), and Windows' Precision
+        // Touchpad stack drops Confidence=0 contacts entirely from tap/
+        // click/cursor processing (still occupies a contact slot, but no
+        // input is generated). Reporting non-zero here for every soft/
+        // debounce-bridged tap reintroduces the soft-tap-loss bug: Windows
+        // would silently ignore light taps that dip below the tip-size
+        // threshold. Functional tap behavior takes priority over strict
+        // HID Confidence-field semantics here - do not "fix" this back to
+        // non-zero without re-validating soft tap on hardware first.
+        cand.TipDropApplied = 0;
 
         OutCandidates->Candidates[OutCandidates->Count++] = cand;
     }
