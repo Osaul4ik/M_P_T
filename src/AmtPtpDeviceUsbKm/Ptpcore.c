@@ -358,7 +358,7 @@ PTPCore_ProcessFrame(
                 cand->X, cand->Y, cand->SlotIndex);
         }
 
-        if (pCtx->GestureSession.Active || gestureThisFrame) {
+        if (gestureThisFrame) {
             pCtx->ActiveContacts[freeIdx].WasInGesture = TRUE;
         }
 
