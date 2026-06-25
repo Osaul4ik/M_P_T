@@ -23,10 +23,13 @@ See also [here](https://magicutilities.net/magic-trackpad/help/mac-precision-tou
 
 - [x] Add palm detection for MBP2019
 - [x] Fix scroll for MBP2019
-- [ ] Fix cursor jump after gestures
+- [x] Fix cursor jump after gestures
 - [ ] Add palm detection for MBA 2015
 - [ ] Fix ghost tap for MBA 2015
-- [ ] Adjust palm detection & scroll sensivity
+- [?] Adjust palm detection & scroll sensivity (Little More)
+- [ ] Code review
+- [ ] Optimization
+- [ ] Sign?
 
 ## Main Project
 [mac-precision-touchpad](https://github.com/imbushuo/mac-precision-touchpad)
