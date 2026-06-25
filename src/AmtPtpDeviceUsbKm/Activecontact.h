@@ -101,6 +101,24 @@ AmtContactBirthWithRetapSmoothing(
     _In_    USHORT          slotHint
 );
 
+// Birth a fresh ContactID seeded from an explicit prior position, carrying
+// over WasInGesture/FramesAlive instead of resetting them. Used ONLY for
+// the click-edge synthetic-rebirth path (PTPCore.c Phase A.5/B) - this is
+// NOT a real re-tap: the same physical finger never left the pad, so the
+// gesture/lifetime bookkeeping that a real Kill->Birth would discard must
+// be carried across the identity swap instead.
+VOID
+AmtContactBirthForButtonRebirth(
+    _Inout_ PACTIVE_CONTACT Pool,
+    _In_    size_t          index,
+    _Inout_ ULONG*          NextContactId,
+    _In_    USHORT          x,
+    _In_    USHORT          y,
+    _In_    USHORT          slotHint,
+    _In_    BOOLEAN         wasInGesture,
+    _In_    UCHAR           framesAlive
+);
+
 // Is touch-down near a recent lift in time (RETAP_WINDOW_100NS) AND space
 // (RETAP_MAX_DISTANCE)? FALSE -> raw unsmoothed birth (always correct).
 #define RETAP_WINDOW_100NS      (700LL * 10000LL)  // 700 ms

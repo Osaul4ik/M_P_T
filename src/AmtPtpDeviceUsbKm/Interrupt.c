@@ -197,7 +197,7 @@ AmtPtpEvtUsbInterruptPipeReadComplete(
 
     // PTPCore orchestration
     PTP_CORE_FRAME coreFrame;
-    PTPCore_ProcessFrame(pCtx, &rawFrame, Now.QuadPart, &coreFrame);
+    PTPCore_ProcessFrame(pCtx, &rawFrame, Now.QuadPart, buttonSnapshot, &coreFrame);
 
     // Serialize to PTP_REPORT
     AmtSerializeCoreFrameToReport(&coreFrame, &Report);
