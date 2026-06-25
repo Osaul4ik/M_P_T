@@ -27,6 +27,11 @@ typedef struct _DEVICE_CONTEXT
     BOOLEAN PtpReportTouch;
     BOOLEAN PtpReportButton;
 
+    // Previous frame's physical integrated-button state. Compared against
+    // the current frame in PTPCore.c to detect the 0->1 click edge that
+    // drives the synthetic-rebirth anti-jitter-snap workaround.
+    BOOLEAN PrevButtonClicked;
+
     // Scan time
     LARGE_INTEGER LastReportTime;
 

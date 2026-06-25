@@ -162,6 +162,29 @@ AmtContactKill(
     RtlZeroMemory(c, sizeof(ACTIVE_CONTACT));
 }
 
+// Button-click synthetic rebirth (Windows PTP anti-jitter snap workaround).
+// Deliberately the narrowest possible state change: only ContactID moves.
+// State stays CONTACT_ACTIVE, position/Hyst/EMA baseline/WasInGesture/
+// FramesAlive/RetapSeeded/LastSlotHint/LastSeenQpc are all untouched, so
+// the contact's smoothing continuity is unaffected by the identity swap.
+VOID
+AmtContactRebindIdentity(
+    _Inout_ PACTIVE_CONTACT Pool,
+    _In_    size_t          index,
+    _Inout_ ULONG*          NextContactId,
+    _Out_   ULONG*          OldContactID
+)
+{
+    PACTIVE_CONTACT c = &Pool[index];
+
+#if DBG
+    NT_ASSERT(c->State == CONTACT_ACTIVE);
+#endif
+
+    *OldContactID = c->ContactID;
+    c->ContactID  = AmtContactAssignId(NextContactId);
+}
+
 VOID
 AmtContactEnterGrace(
     _Inout_ PACTIVE_CONTACT Pool,

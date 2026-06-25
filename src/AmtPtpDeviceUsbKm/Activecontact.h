@@ -90,6 +90,21 @@ AmtContactBirth(
     _In_    USHORT          slotHint
 );
 
+// Re-binds an ACTIVE contact to a fresh ContactID in place, without
+// touching position/EMA/hysteresis/gesture-taint state. Used only for
+// the button-click synthetic rebirth workaround (see PTPCore.c) - it
+// is NOT a birth: PendingFirstSample/RetapSeeded/FramesAlive/WasInGesture
+// are deliberately left untouched so smoothing continuity survives the
+// identity swap. Returns the OLD ContactID for the synthetic lift-off.
+// Precondition: Pool[index].State == CONTACT_ACTIVE.
+VOID
+AmtContactRebindIdentity(
+    _Inout_ PACTIVE_CONTACT Pool,
+    _In_    size_t          index,
+    _Inout_ ULONG*          NextContactId,
+    _Out_   ULONG*          OldContactID
+);
+
 // AmtContactBirth + EMA baseline seed from lift position + RetapSeeded=TRUE.
 VOID
 AmtContactBirthWithRetapSmoothing(
