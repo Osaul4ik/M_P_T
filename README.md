@@ -26,7 +26,7 @@ See also [here](https://magicutilities.net/magic-trackpad/help/mac-precision-tou
 - [x] Fix cursor jump after gestures
 - [ ] Add palm detection for MBA 2015
 - [ ] Fix ghost tap for MBA 2015
-- [?] Adjust palm detection & scroll sensivity (Little More)
+- [x] Adjust palm detection & scroll sensivity (Little More)
 - [ ] Code review
 - [ ] Optimization
 - [ ] Sign?
