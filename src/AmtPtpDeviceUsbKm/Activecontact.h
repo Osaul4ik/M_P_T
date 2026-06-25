@@ -68,7 +68,7 @@ typedef struct _ACTIVE_CONTACT
 #define MAX_CONTACTS PTP_MAX_CONTACT_POINTS  // pool capacity, not slot count
 
 // Gesture-last-finger kill deferral. Solo contacts killed immediately.
-#define MIN_CONTACT_LIFETIME_FRAMES 4
+#define MIN_CONTACT_LIFETIME_FRAMES 5
 
 // Zero/FREE-initialise the whole pool. Call at device creation and D0Entry.
 VOID
