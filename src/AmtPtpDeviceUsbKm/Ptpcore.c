@@ -39,7 +39,7 @@ AmtRecentLiftFindNearby(
     if (PerfFrequencyHz <= 0)
         return FALSE;
 
-    LONGLONG windowTicks = (RETAP_WINDOW_100NS * PerfFrequencyHz) / 10000000LL;
+    LONGLONG windowTicks = AmtPeriodToTicks(RETAP_WINDOW_100NS, PerfFrequencyHz);
 
     LONG     bestDistSq = -1;
     BOOLEAN  found       = FALSE;

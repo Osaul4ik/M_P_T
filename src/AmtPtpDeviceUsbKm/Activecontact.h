@@ -134,23 +134,6 @@ AmtContactBirthForButtonRebirth(
     _In_    BOOLEAN         hadRecentMotion
 );
 
-// Is touch-down near a recent lift in time (RETAP_WINDOW_100NS) AND space
-// (RETAP_MAX_DISTANCE)? FALSE -> raw unsmoothed birth (always correct).
-#define RETAP_WINDOW_100NS      (700LL * 10000LL)  // 700 ms
-#define RETAP_MAX_DISTANCE      600                // normalized units
-
-_IRQL_requires_max_(DISPATCH_LEVEL)
-BOOLEAN
-AmtContactIsRecentLiftNearby(
-    _In_ LONGLONG LiftQpc,
-    _In_ USHORT   LiftX,
-    _In_ USHORT   LiftY,
-    _In_ LONGLONG NowQpc,
-    _In_ LONGLONG PerfFrequencyHz,
-    _In_ USHORT   CandX,
-    _In_ USHORT   CandY
-);
-
 // ACTIVE/GRACE -> FREE. Returns old ContactID/X/Y for lift-off report.
 _IRQL_requires_max_(DISPATCH_LEVEL)
 VOID

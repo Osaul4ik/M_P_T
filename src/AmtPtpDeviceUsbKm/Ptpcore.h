@@ -79,6 +79,18 @@ AmtHotPathTraceGate(_Inout_ struct _DEVICE_CONTEXT* pCtx, _In_ LONGLONG NowQpc10
 
 // Recent-lift ring buffer for retap smoothing.
 
+// Time/space window for retap-smoothing decisions.
+#define RETAP_WINDOW_100NS  (700LL * 10000LL)  // 700 ms in 100ns units
+#define RETAP_MAX_DISTANCE  600                // normalized device units
+
+// Convert a 100ns-unit period to clock ticks at PerfFrequencyHz.
+// Both Match.c and PTPCore.c use this; centralised here to avoid drift.
+static inline LONGLONG
+AmtPeriodToTicks(_In_ LONGLONG period100ns, _In_ LONGLONG freqHz)
+{
+    return (period100ns * freqHz) / 10000000LL;
+}
+
 #define RECENT_LIFT_CAPACITY PTP_MAX_CONTACT_POINTS
 
 typedef struct _RECENT_LIFT

@@ -21,6 +21,14 @@
 // DOWN/UP cycle on sustained soft touches). Counter only prevents wrap.
 #define TIP_DROP_COUNT_MAX 255
 
+// Compute |a - b| for two USHORT coords. Used for axis-aligned box tests.
+static inline INT
+AbsAxisDelta(_In_ USHORT a, _In_ USHORT b)
+{
+    INT d = (INT)a - (INT)b;
+    return d < 0 ? -d : d;
+}
+
 static UCHAR
 AmtMatchCandidateTip(_In_ USHORT major, _In_ USHORT minor)
 {
@@ -82,10 +90,8 @@ AmtMatchBuildCandidates(
             if (Pool[p].LastSlotHint != rc->SlotIndex)
                 continue;
 
-            INT dxAbs = (INT)rc->X - (INT)Pool[p].ReportX;
-            if (dxAbs < 0) dxAbs = -dxAbs;
-            INT dyAbs = (INT)rc->Y - (INT)Pool[p].ReportY;
-            if (dyAbs < 0) dyAbs = -dyAbs;
+            INT dxAbs = AbsAxisDelta(rc->X, (USHORT)Pool[p].ReportX);
+            INT dyAbs = AbsAxisDelta(rc->Y, (USHORT)Pool[p].ReportY);
 
             if (dxAbs > TIP_DROP_MAX_REPOSITION_DELTA ||
                 dyAbs > TIP_DROP_MAX_REPOSITION_DELTA)
@@ -108,10 +114,8 @@ AmtMatchBuildCandidates(
         }
 
         // Bridge candidate through; real coords if moving, anchor if stationary.
-        INT dxMove = (INT)rc->X - (INT)Pool[bestPoolIdx].ReportX;
-        INT dyMove = (INT)rc->Y - (INT)Pool[bestPoolIdx].ReportY;
-        if (dxMove < 0) dxMove = -dxMove;
-        if (dyMove < 0) dyMove = -dyMove;
+        INT dxMove = AbsAxisDelta(rc->X, (USHORT)Pool[bestPoolIdx].ReportX);
+        INT dyMove = AbsAxisDelta(rc->Y, (USHORT)Pool[bestPoolIdx].ReportY);
 
         BOOLEAN isStationary = (dxMove <= TIP_DROP_STATIONARY_DELTA) &&
                                (dyMove <= TIP_DROP_STATIONARY_DELTA);
@@ -234,7 +238,7 @@ AmtMatchCorrespond(
         BOOLEAN timeReject = FALSE;
         if (Pool[p].LastSeenQpc != 0 && PerfFrequencyHz > 0) {
             LONGLONG deltaTicks = NowQpc - Pool[p].LastSeenQpc;
-            LONGLONG maxTicks   = (MATCH_MAX_TIME_DELTA_100NS * PerfFrequencyHz) / 10000000LL;
+            LONGLONG maxTicks   = AmtPeriodToTicks(MATCH_MAX_TIME_DELTA_100NS, PerfFrequencyHz);
             timeReject = (NowQpc < Pool[p].LastSeenQpc) || (deltaTicks > maxTicks);
         }
 

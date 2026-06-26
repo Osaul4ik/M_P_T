@@ -149,40 +149,6 @@ AmtContactBirthForButtonRebirth(
     c->FramesAlive         = framesAlive;   // carried over, not reset to 1
 }
 
-BOOLEAN
-AmtContactIsRecentLiftNearby(
-    _In_ LONGLONG LiftQpc,
-    _In_ USHORT   LiftX,
-    _In_ USHORT   LiftY,
-    _In_ LONGLONG NowQpc,
-    _In_ LONGLONG PerfFrequencyHz,
-    _In_ USHORT   CandX,
-    _In_ USHORT   CandY
-)
-{
-    if (LiftQpc == 0)
-        return FALSE; // no recent lift recorded
-
-    if (NowQpc < LiftQpc)
-        return FALSE; // QPC must be monotonic
-
-    if (PerfFrequencyHz <= 0)
-        return FALSE; // no usable clock - fail closed
-
-    LONGLONG deltaTicks  = NowQpc - LiftQpc;
-    LONGLONG windowTicks = (RETAP_WINDOW_100NS * PerfFrequencyHz) / 10000000LL;
-
-    if (deltaTicks > windowTicks)
-        return FALSE;
-
-    INT dx = (INT)CandX - (INT)LiftX;
-    if (dx < 0) dx = -dx;
-    INT dy = (INT)CandY - (INT)LiftY;
-    if (dy < 0) dy = -dy;
-
-    return (dx <= RETAP_MAX_DISTANCE) && (dy <= RETAP_MAX_DISTANCE);
-}
-
 VOID
 AmtContactKill(
     _Inout_ PACTIVE_CONTACT Pool,
