@@ -35,6 +35,34 @@ AmtMatchCandidateTip(_In_ USHORT major, _In_ USHORT minor)
     return (UCHAR)(((INT)major << 1) >= 200 || ((INT)minor << 1) >= 150);
 }
 
+// Minimum consecutive frames a pool entry must have survived to be
+// trusted as a real, settled finger rather than a brand-new touch.
+#define PALM_ESTABLISHED_MIN_FRAMES 3
+
+// TRUE if some ACTIVE pool entry last matched to this raw hardware slot
+// has been alive long enough to be trusted. Used to distinguish a real
+// palm (large from frame 1, no established anchor) from a transient
+// touch_major/minor spike on an already-settled finger - e.g. at
+// lift-off, where firmware briefly reports an inflated contact size for
+// one frame. Without this, that single spike misclassifies as PALM_LARGE
+// and blanks the entire pad (kills every other finger down at the time).
+static BOOLEAN
+AmtMatchFindEstablishedAnchor(
+    _In_reads_(MAX_CONTACTS) const ACTIVE_CONTACT* Pool,
+    _In_ USHORT                                    SlotIndex
+)
+{
+    for (size_t p = 0; p < MAX_CONTACTS; p++) {
+        if (Pool[p].State != CONTACT_ACTIVE)
+            continue;
+        if (Pool[p].LastSlotHint != SlotIndex)
+            continue;
+        if (Pool[p].FramesAlive >= PALM_ESTABLISHED_MIN_FRAMES)
+            return TRUE;
+    }
+    return FALSE;
+}
+
 VOID
 AmtMatchBuildCandidates(
     _In_  const RAW_FRAME*                        RawFrame,
@@ -54,9 +82,18 @@ AmtMatchBuildCandidates(
                                           (INT)rc->X, (INT)rc->Y);
 
         if (palm == PALM_LARGE) {
-            *LargePalmDetected = TRUE;
-            OutCandidates->Count = 0; // blank whole pad
-            return;
+            // Real palms are large from the very first frame - they have
+            // no established anchor yet (nothing to anchor to: the palm
+            // itself only just touched down). A spike on a finger that's
+            // already been tracked for a while is firmware noise, not a
+            // palm - fall through and let the tip/debounce path below
+            // handle it like any other contact instead of blanking.
+            if (!AmtMatchFindEstablishedAnchor(Pool, rc->SlotIndex)) {
+                *LargePalmDetected = TRUE;
+                OutCandidates->Count = 0; // blank whole pad
+                return;
+            }
+            palm = PALM_NONE;
         }
 
         MATCH_CANDIDATE cand;

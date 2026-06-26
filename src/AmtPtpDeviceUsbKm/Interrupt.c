@@ -180,7 +180,17 @@ AmtPtpEvtUsbInterruptPipeReadComplete(
 
     if (pCtx->PtpReportTouch) {
         raw_n = (NumBytesTransferred - headerSize) / fingerSize;
-        if (raw_n > PTP_MAX_CONTACT_POINTS) raw_n = PTP_MAX_CONTACT_POINTS;
+
+        // Bound to the actual continuous-reader allocation (MAX_FINGERS
+        // raw firmware slots), NOT to PTP_MAX_CONTACT_POINTS. The PTP
+        // report can only carry 5 contacts, but a valid touch can sit in
+        // any raw slot up to MAX_FINGERS-1 (slot index is not reassigned
+        // just because fewer than 5 fingers are down). Pre-truncating
+        // here to 5 silently dropped real touches whenever their raw
+        // slot index was >= PTP_MAX_CONTACT_POINTS. AmtInputParseFrame
+        // now scans every slot up to raw_n and is itself responsible for
+        // bounding emitted (valid) contacts to PTP_MAX_CONTACT_POINTS.
+        if (raw_n > MAX_FINGERS) raw_n = MAX_FINGERS;
 
         if (raw_n * fingerSize > (NumBytesTransferred - headerSize)) {
             TraceEvents(TRACE_LEVEL_ERROR, TRACE_DRIVER,

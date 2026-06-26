@@ -12,7 +12,7 @@ EXTERN_C_START
 
 typedef struct _RAW_CONTACT
 {
-    USHORT SlotIndex;   // raw hardware slot index (0..PTP_MAX_CONTACT_POINTS-1)
+    USHORT SlotIndex;   // raw hardware firmware slot index (0..MAX_FINGERS-1)
     USHORT X;            // normalized device units (post AmtClampCoord)
     USHORT Y;
     USHORT Major;        // touch_major, raw

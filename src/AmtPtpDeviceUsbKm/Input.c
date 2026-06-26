@@ -10,6 +10,7 @@
 
 #include "Driver.h"
 #include "Input.h"
+#include "Input.tmh"
 
 static inline INT
 AmtInputRawToInteger(_In_ USHORT x)
@@ -39,9 +40,15 @@ AmtInputParseFrame(
     RtlZeroMemory(OutFrame, sizeof(RAW_FRAME));
     OutFrame->TimestampQpc = TimestampQpc;
 
-    if (RawContactCount > PTP_MAX_CONTACT_POINTS)
-        RawContactCount = PTP_MAX_CONTACT_POINTS;
-
+    // Deliberately NOT capping RawContactCount to PTP_MAX_CONTACT_POINTS
+    // here. The caller bounds RawContactCount to MAX_FINGERS (the real
+    // raw firmware slot count); a valid touch's slot index is not
+    // reassigned just because fewer than 5 fingers are currently down,
+    // so a slot index >= PTP_MAX_CONTACT_POINTS can still hold a real,
+    // currently-the-only touch. We must look at every transmitted slot
+    // before deciding which ones are valid. Only the OUTPUT (emitted)
+    // count is bounded to PTP_MAX_CONTACT_POINTS below, since that's the
+    // actual fixed-size limit of RAW_FRAME::Contacts / the PTP report.
     UCHAR emitted = 0;
 
     for (size_t i = 0; i < RawContactCount; i++) {
@@ -55,6 +62,17 @@ AmtInputParseFrame(
         // downstream layer with track history may choose to bridge it.
         if (major <= 0 && minor <= 0)
             continue;
+
+        if (emitted >= PTP_MAX_CONTACT_POINTS) {
+            // Genuine overload: more than PTP_MAX_CONTACT_POINTS valid
+            // touches in one frame. The PTP report has no room for more;
+            // drop the excess (lowest-priority: encountered last in raw
+            // slot order) rather than overwrite an already-emitted one.
+            TraceEvents(TRACE_LEVEL_WARNING, TRACE_INPUT,
+                "%!FUNC! valid touch count exceeds PTP_MAX_CONTACT_POINTS - slot %llu dropped",
+                (ULONG64)i);
+            continue;
+        }
 
         INT nx = (INT)AmtInputClampCoord(
             AmtInputRawToInteger(f->abs_x), DevInfo->x.min, DevInfo->x.max);
