@@ -173,7 +173,7 @@ AmtPtpEvtDeviceD0Entry(
     // completion, 60-125+ Hz) and needs no separate frequency query.
     pDeviceContext->PerfFrequency.QuadPart = 10000000LL;
     pDeviceContext->LastReportTime.QuadPart =
-        (LONGLONG)KeQueryInterruptTimeToPrecise(NULL);
+        (LONGLONG)KeQueryInterruptTimePrecise(NULL);
 
     // Reseed ContactID counter and reset the contact pool on D0Entry.
     // Prevents stale ContactIDs from surviving sleep/wake cycles.
