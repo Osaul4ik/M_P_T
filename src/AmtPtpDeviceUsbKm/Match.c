@@ -189,6 +189,13 @@ AmtMatchCorrespond(
     BOOLEAN candClaimed[PTP_MAX_CONTACT_POINTS];
     RtlZeroMemory(candClaimed, sizeof(candClaimed));
 
+    // Loop-invariant: depends only on PerfFrequencyHz, not on pick/p/ci.
+    // Was being recomputed up to pairCount (<=25) times per frame inside
+    // the pick loop below for no reason - hoisted out.
+    LONGLONG matchMaxTicks = (PerfFrequencyHz > 0)
+        ? AmtPeriodToTicks(MATCH_MAX_TIME_DELTA_100NS, PerfFrequencyHz)
+        : 0;
+
     for (UCHAR pick = 0; pick < pairCount; pick++) {
         LONG    bestCost          = -1;
         UCHAR   bestIdx           = 0;
@@ -238,8 +245,7 @@ AmtMatchCorrespond(
         BOOLEAN timeReject = FALSE;
         if (Pool[p].LastSeenQpc != 0 && PerfFrequencyHz > 0) {
             LONGLONG deltaTicks = NowQpc - Pool[p].LastSeenQpc;
-            LONGLONG maxTicks   = AmtPeriodToTicks(MATCH_MAX_TIME_DELTA_100NS, PerfFrequencyHz);
-            timeReject = (NowQpc < Pool[p].LastSeenQpc) || (deltaTicks > maxTicks);
+            timeReject = (NowQpc < Pool[p].LastSeenQpc) || (deltaTicks > matchMaxTicks);
         }
 
         if (spatialReject || timeReject) {
