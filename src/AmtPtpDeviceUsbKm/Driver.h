@@ -27,6 +27,13 @@
 // Для HID використовуйте hidport.h замість Hid.h
 #include <hidport.h>
 
+NTSYSAPI
+ULONGLONG
+NTAPI
+KeQueryInterruptTimeToPrecise(
+    _Out_opt_ PULONGLONG TimeSinceInterrupt
+);
+
 EXTERN_C_START
 
 // WDFDRIVER Events
