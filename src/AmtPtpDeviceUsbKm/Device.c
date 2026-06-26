@@ -165,15 +165,8 @@ AmtPtpEvtDeviceD0Entry(
     TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DRIVER,
         "%!FUNC! --> coming from %s", DbgDevicePowerString(PreviousState));
 
-    // KeQueryInterruptTimePrecise: fixed-frequency (10 MHz) interrupt-time
-    // clock, no external HW timer read, cheaper on the hot path than QPC.
-    // QpcTimeStamp is _Out_ non-optional - must pass a real buffer, not NULL.
-    pDeviceContext->PerfFrequency.QuadPart = 10000000LL;
-    {
-        ULONG64 unusedQpc;
-        pDeviceContext->LastReportTime.QuadPart =
-            (LONGLONG)KeQueryInterruptTimePrecise(&unusedQpc);
-    }
+    pDeviceContext->LastReportTime =
+        KeQueryPerformanceCounter(&pDeviceContext->PerfFrequency);
 
     // Reseed ContactID counter and reset the contact pool on D0Entry.
     // Prevents stale ContactIDs from surviving sleep/wake cycles.

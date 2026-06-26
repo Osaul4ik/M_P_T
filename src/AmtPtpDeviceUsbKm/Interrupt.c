@@ -159,10 +159,7 @@ AmtPtpEvtUsbInterruptPipeReadComplete(
     RtlZeroMemory(&Report, sizeof(PTP_REPORT));
     Report.ReportID = REPORTID_MULTITOUCH;
 
-    {
-        ULONG64 unusedQpc;
-        Now.QuadPart = (LONGLONG)KeQueryInterruptTimePrecise(&unusedQpc);
-    }
+    KeQueryPerformanceCounter(&Now);
     PerfDelta = Now.QuadPart - pCtx->LastReportTime.QuadPart;
     if (pCtx->PerfFrequency.QuadPart > 0)
         PerfDelta = PerfDelta * 10000LL / pCtx->PerfFrequency.QuadPart;
