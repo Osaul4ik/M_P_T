@@ -165,16 +165,8 @@ AmtPtpEvtDeviceD0Entry(
     TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DRIVER,
         "%!FUNC! --> coming from %s", DbgDevicePowerString(PreviousState));
 
-    // KeQueryInterruptTimeToPrecise: fixed 100ns-unit interrupt-time clock
-    // (10,000,000 Hz by definition), unlike KeQueryPerformanceCounter whose
-    // backing HW frequency varies by platform and can involve an external
-    // timer read (ACPI/HPET port I/O) on older chipsets. Cheaper per call
-    // on the hot path (Interrupt.c fires this every USB interrupt
-    // completion, 60-125+ Hz) and needs no separate frequency query.
-    pDeviceContext->PerfFrequency.QuadPart = 10000000LL;
-    ULONG64 _unusedQpc;
-    pDeviceContext->LastReportTime.QuadPart =
-    (LONGLONG)KeQueryInterruptTimePrecise(&_unusedQpc);
+    pDeviceContext->LastReportTime =
+        KeQueryPerformanceCounter(&pDeviceContext->PerfFrequency);
 
     // Reseed ContactID counter and reset the contact pool on D0Entry.
     // Prevents stale ContactIDs from surviving sleep/wake cycles.
