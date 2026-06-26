@@ -159,7 +159,13 @@ AmtPtpEvtUsbInterruptPipeReadComplete(
     RtlZeroMemory(&Report, sizeof(PTP_REPORT));
     Report.ReportID = REPORTID_MULTITOUCH;
 
-    KeQueryPerformanceCounter(&Now);
+    // KeQueryInterruptTimeToPrecise instead of KeQueryPerformanceCounter:
+    // same role (monotonic timestamp for ScanTime + matcher time windows),
+    // lower overhead on this hot path - see AmtPtpEvtDeviceD0Entry comment
+    // in Device.c. The PerfDelta formula below is unchanged: it's already
+    // frequency-generic (works for any PerfFrequency.QuadPart), so the
+    // fixed 10,000,000 Hz set at D0Entry flows through correctly.
+    Now.QuadPart = (LONGLONG)KeQueryInterruptTimeToPrecise(NULL);
     PerfDelta = Now.QuadPart - pCtx->LastReportTime.QuadPart;
     if (pCtx->PerfFrequency.QuadPart > 0)
         PerfDelta = PerfDelta * 10000LL / pCtx->PerfFrequency.QuadPart;
