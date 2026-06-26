@@ -165,7 +165,8 @@ AmtPtpEvtUsbInterruptPipeReadComplete(
     // in Device.c. The PerfDelta formula below is unchanged: it's already
     // frequency-generic (works for any PerfFrequency.QuadPart), so the
     // fixed 10,000,000 Hz set at D0Entry flows through correctly.
-    Now.QuadPart = (LONGLONG)KeQueryInterruptTimePrecise(NULL);
+    ULONG64 _unusedQpc;
+    Now.QuadPart = (LONGLONG)KeQueryInterruptTimePrecise(&_unusedQpc);
     PerfDelta = Now.QuadPart - pCtx->LastReportTime.QuadPart;
     if (pCtx->PerfFrequency.QuadPart > 0)
         PerfDelta = PerfDelta * 10000LL / pCtx->PerfFrequency.QuadPart;

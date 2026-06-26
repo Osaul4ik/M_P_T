@@ -172,8 +172,9 @@ AmtPtpEvtDeviceD0Entry(
     // on the hot path (Interrupt.c fires this every USB interrupt
     // completion, 60-125+ Hz) and needs no separate frequency query.
     pDeviceContext->PerfFrequency.QuadPart = 10000000LL;
+    ULONG64 _unusedQpc;
     pDeviceContext->LastReportTime.QuadPart =
-        (LONGLONG)KeQueryInterruptTimePrecise(NULL);
+    (LONGLONG)KeQueryInterruptTimePrecise(&_unusedQpc);
 
     // Reseed ContactID counter and reset the contact pool on D0Entry.
     // Prevents stale ContactIDs from surviving sleep/wake cycles.
