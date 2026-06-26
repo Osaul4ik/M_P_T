@@ -1,4 +1,5 @@
 // Driver definitions. Kernel-mode Driver Framework
+#define _KERNEL_MODE 1
 
 #include <ntddk.h>
 #include <wdf.h>
