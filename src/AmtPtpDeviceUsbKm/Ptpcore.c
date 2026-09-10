@@ -394,19 +394,24 @@ PTPCore_ProcessFrame(
 
         ULONG  oldId; USHORT oldX, oldY;
 
-        // BUG FIX (spurious tap-click on 2nd-finger touchdown): WasInGesture
-        // alone is the *previous* frame's taint - stale the instant a second
+        // FIX (RecentLifts/retap-smoothing bookkeeping): WasInGesture alone
+        // is the *previous* frame's taint - stale the instant a second
         // finger lands in the SAME frame a firmware identity-break (Origin==0)
         // fires for the finger already moving. That race used to fall into
-        // the "else" branch below: a real, RecentLifts-recorded UP for the
-        // old ID, emitted in the very same report as the fresh DOWNs for the
-        // rebirthed contact and the new second finger. Windows' PTP stack
-        // reads that UP+DOWN+DOWN combo as a quick tap-then-2-finger-gesture
-        // and fires a click, even though the finger never left the pad.
+        // the "else" branch below: a real, solo-kill lift, recorded into
+        // RecentLifts as if this finger had genuinely left the pad - even
+        // though it's still down and mid-gesture. That could bias where a
+        // LATER, unrelated re-touch near this spot gets its retap-smoothing
+        // seed from. NOTE: this does NOT change what Windows receives here -
+        // AmtCoreEmitContact(..., TRUE) and the CorrespondingPoolIndex reset
+        // below run unconditionally either way, so the UP+DOWN(+DOWN) report
+        // shape to Windows is identical regardless of this branch; this is
+        // purely an internal bookkeeping correctness fix, unrelated to any
+        // tap/click behavior Windows itself decides on.
         // gestureThisFrame (already known at this point - computed above from
         // this frame's own candidate set) is the same signal Phase C uses for
-        // its taint decision (see shouldTaint); using it here too closes the
-        // gap instead of only patching the symptom downstream.
+        // its taint decision (see shouldTaint); using it here too keeps the
+        // two decisions consistent instead of one reading stale state.
         if (pCtx->ActiveContacts[p].WasInGesture || gestureThisFrame) {
             AmtContactEnterGrace(pCtx->ActiveContacts, p, &oldId, &oldX, &oldY);
             AmtContactExpireGrace(pCtx->ActiveContacts, p);
