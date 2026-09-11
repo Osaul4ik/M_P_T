@@ -23,6 +23,17 @@ namespace AmtPtpConfigGui.Native
         public uint SmallContactRejectionEnabled;
         public uint SmallContactRejectionStrict;
 
+        // GUI-tunable "M" (Major axis) cutoff for the gate above
+        // (non-Force-Touch devices). Minor keeps its fixed floor.
+        public uint SmallContactMajorThreshold;
+
+        // Same small-contact size gate, mirrored for Force-Touch-capable
+        // devices (normally ignored there - Force Touch relies on the
+        // pressure gate instead). Off by default.
+        public uint ForceTouchSmallContactRejectionEnabled;
+        public uint ForceTouchSmallContactRejectionStrict;
+        public uint ForceTouchSmallContactMajorThreshold;
+
         // Software Force Touch emulation (non-Force-Touch trackpads only -
         // see the matching AMT_POINTER_CONFIG fields in Public.h).
         public uint ForceTouchEmulationEnabled;
@@ -34,7 +45,7 @@ namespace AmtPtpConfigGui.Native
         public uint ForceTapDragLockoutDistance;
         public uint ForceTouchEmulationDragLockoutDistance;
 
-        public const uint CurrentVersion = 9;
+        public const uint CurrentVersion = 10;
         public const uint ActionContextMenu = 0;
         public const uint ActionMiddleClick = 1;
         public const uint ActionDoubleClick = 2;
@@ -47,6 +58,11 @@ namespace AmtPtpConfigGui.Native
         public const uint DragLockoutDistanceMin = 40;
         public const uint DragLockoutDistanceMax = 400;
         public const uint DragLockoutDistanceStep = 10;
+
+        // "M" (Major axis) small-contact cutoff range - shared by the
+        // non-Force-Touch and Force-Touch sliders.
+        public const uint SmallContactMajorMin = 10;
+        public const uint SmallContactMajorMax = 150;
 
         public static PointerConfig Default => new PointerConfig
         {
@@ -67,6 +83,10 @@ namespace AmtPtpConfigGui.Native
             SmoothingAlphaNumSlow = 3,
             SmallContactRejectionEnabled = 1,
             SmallContactRejectionStrict = 0,
+            SmallContactMajorThreshold = 50,
+            ForceTouchSmallContactRejectionEnabled = 0,
+            ForceTouchSmallContactRejectionStrict = 0,
+            ForceTouchSmallContactMajorThreshold = 50,
             ForceTouchEmulationEnabled = 1,
             ForceTouchEmulationAction = ActionContextMenu,
             ForceTouchEmulationHoldMs = 300,
@@ -87,6 +107,13 @@ namespace AmtPtpConfigGui.Native
             c.SmallContactRejectionStrict = c.SmallContactRejectionStrict != 0 ? 1u : 0u;
             if (c.SmallContactRejectionEnabled == 0)
                 c.SmallContactRejectionStrict = 0;
+            c.SmallContactMajorThreshold = Clamp(c.SmallContactMajorThreshold, SmallContactMajorMin, SmallContactMajorMax);
+
+            c.ForceTouchSmallContactRejectionEnabled = c.ForceTouchSmallContactRejectionEnabled != 0 ? 1u : 0u;
+            c.ForceTouchSmallContactRejectionStrict = c.ForceTouchSmallContactRejectionStrict != 0 ? 1u : 0u;
+            if (c.ForceTouchSmallContactRejectionEnabled == 0)
+                c.ForceTouchSmallContactRejectionStrict = 0;
+            c.ForceTouchSmallContactMajorThreshold = Clamp(c.ForceTouchSmallContactMajorThreshold, SmallContactMajorMin, SmallContactMajorMax);
             c.CursorSmoothingPercent = Clamp(c.CursorSmoothingPercent, 0, 100);
             c.CursorSpeedPercent = Clamp(c.CursorSpeedPercent, 50, 200);
             c.CursorDeadzone = Clamp(c.CursorDeadzone, 0, 8);

@@ -97,12 +97,33 @@ AmtMatchBuildCandidates(
         // threshold. When either falls below the threshold, this frame is
         // treated as if the contact were absent; the normal contact FSM then
         // emits the proper UP for the old identity and a later qualifying
-        // frame can create a fresh DOWN.
+        // frame can create a fresh DOWN. Major ("M") threshold is
+        // GUI-tunable (PointerConfig->SmallContactMajorThreshold); Minor
+        // keeps its fixed floor (AMT_SMALL_CONTACT_MINOR_THRESHOLD).
         if (!SupportsForceTouch &&
             PointerConfig != NULL &&
             PointerConfig->SmallContactRejectionEnabled &&
             PointerConfig->SmallContactRejectionStrict &&
-            (rc->Major < 50 || rc->Minor < 30))
+            (rc->Major < PointerConfig->SmallContactMajorThreshold ||
+             rc->Minor < AMT_SMALL_CONTACT_MINOR_THRESHOLD))
+        {
+            continue;
+        }
+
+        // Same size gate, mirrored for Force-Touch-capable devices. Normally
+        // Force Touch hardware relies on the pressure gate above instead,
+        // but some contacts (light/ambiguous touches before pressure ramps
+        // up) can still benefit from a Major/Minor floor. Off by default
+        // (ForceTouchSmallContactRejectionEnabled = 0); when enabled with
+        // Strict, applies every frame just like the non-Force-Touch gate,
+        // using its own GUI-tunable "M" threshold
+        // (PointerConfig->ForceTouchSmallContactMajorThreshold).
+        if (SupportsForceTouch &&
+            PointerConfig != NULL &&
+            PointerConfig->ForceTouchSmallContactRejectionEnabled &&
+            PointerConfig->ForceTouchSmallContactRejectionStrict &&
+            (rc->Major < PointerConfig->ForceTouchSmallContactMajorThreshold ||
+             rc->Minor < AMT_SMALL_CONTACT_MINOR_THRESHOLD))
         {
             continue;
         }

@@ -1530,6 +1530,8 @@ namespace AmtPtpConfigGui
 
             if (ForceTouchGroup != null)
                 ForceTouchGroup.Visibility = _forceTouchSupported ? Visibility.Visible : Visibility.Collapsed;
+            if (ForceTouchSmallContactRejectionGroup != null)
+                ForceTouchSmallContactRejectionGroup.Visibility = _forceTouchSupported ? Visibility.Visible : Visibility.Collapsed;
             if (ForceTouchEmulationGroup != null)
                 ForceTouchEmulationGroup.Visibility = _forceTouchSupported ? Visibility.Collapsed : Visibility.Visible;
             if (SmallContactRejectionGroup != null)
@@ -2321,6 +2323,10 @@ namespace AmtPtpConfigGui
                 ChkRequirePressureContinuously.IsChecked = cfg.RequirePressureContinuously != 0;
                 ChkSmallContactRejection.IsChecked = cfg.SmallContactRejectionEnabled != 0;
                 ChkSmallContactRejectionStrict.IsChecked = cfg.SmallContactRejectionStrict != 0;
+                SlSmallContactMajorThreshold.Value = cfg.SmallContactMajorThreshold;
+                ChkForceTouchSmallContactRejection.IsChecked = cfg.ForceTouchSmallContactRejectionEnabled != 0;
+                ChkForceTouchSmallContactRejectionStrict.IsChecked = cfg.ForceTouchSmallContactRejectionStrict != 0;
+                SlForceTouchSmallContactMajorThreshold.Value = cfg.ForceTouchSmallContactMajorThreshold;
                 ChkRequirePressure.IsEnabled = cfg.ForceTouchEnabled != 0;
                 ChkRequirePressureContinuously.Visibility = cfg.ForceTouchEnabled != 0 ? Visibility.Visible : Visibility.Collapsed;
                 ChkRequirePressureContinuously.IsEnabled = cfg.ForceTouchEnabled != 0;
@@ -2328,6 +2334,20 @@ namespace AmtPtpConfigGui
                     cfg.SmallContactRejectionEnabled != 0
                         ? Visibility.Visible
                         : Visibility.Collapsed;
+                SmallContactMajorRow.Visibility =
+                    (cfg.SmallContactRejectionEnabled != 0 && cfg.SmallContactRejectionStrict != 0)
+                        ? Visibility.Visible
+                        : Visibility.Collapsed;
+                SlSmallContactMajorThreshold.Visibility = SmallContactMajorRow.Visibility;
+                ChkForceTouchSmallContactRejectionStrict.Visibility =
+                    cfg.ForceTouchSmallContactRejectionEnabled != 0
+                        ? Visibility.Visible
+                        : Visibility.Collapsed;
+                ForceTouchSmallContactMajorRow.Visibility =
+                    (cfg.ForceTouchSmallContactRejectionEnabled != 0 && cfg.ForceTouchSmallContactRejectionStrict != 0)
+                        ? Visibility.Visible
+                        : Visibility.Collapsed;
+                SlForceTouchSmallContactMajorThreshold.Visibility = ForceTouchSmallContactMajorRow.Visibility;
                 SlCursorSmoothing.Value = cfg.CursorSmoothingPercent;
                 SlCursorSpeed.Value = cfg.CursorSpeedPercent;
                 SlCursorDeadzone.Value = cfg.CursorDeadzone;
@@ -2382,6 +2402,12 @@ namespace AmtPtpConfigGui
             c.SmallContactRejectionStrict =
                 (ChkSmallContactRejection.IsChecked == true &&
                  ChkSmallContactRejectionStrict.IsChecked == true) ? 1u : 0u;
+            c.SmallContactMajorThreshold = (uint)SlSmallContactMajorThreshold.Value;
+            c.ForceTouchSmallContactRejectionEnabled = ChkForceTouchSmallContactRejection.IsChecked == true ? 1u : 0u;
+            c.ForceTouchSmallContactRejectionStrict =
+                (ChkForceTouchSmallContactRejection.IsChecked == true &&
+                 ChkForceTouchSmallContactRejectionStrict.IsChecked == true) ? 1u : 0u;
+            c.ForceTouchSmallContactMajorThreshold = (uint)SlForceTouchSmallContactMajorThreshold.Value;
             c.CursorSmoothingPercent = (uint)SlCursorSmoothing.Value;
             c.CursorSpeedPercent = (uint)SlCursorSpeed.Value;
             c.CursorDeadzone = (uint)SlCursorDeadzone.Value;
@@ -2419,6 +2445,8 @@ namespace AmtPtpConfigGui
             LblCursorFastVelocity.Text = $"{SlCursorFastVelocity.Value:0}";
             LblSmoothingAlphaDen.Text = $"{SlSmoothingAlphaDen.Value:0}";
             LblSmoothingAlphaNumSlow.Text = $"{SlSmoothingAlphaNumSlow.Value:0}";
+            LblSmallContactMajorThreshold.Text = $"{SlSmallContactMajorThreshold.Value:0}";
+            LblForceTouchSmallContactMajorThreshold.Text = $"{SlForceTouchSmallContactMajorThreshold.Value:0}";
             LblForceTouchEmulationHoldMs.Text = $"{SlForceTouchEmulationHoldMs.Value / 1000.0:0.00} s";
             LblForceTouchEmulationDragLockoutDistance.Text = $"{SlForceTouchEmulationDragLockoutDistance.Value:0}";
         }
@@ -2464,7 +2492,8 @@ namespace AmtPtpConfigGui
 
         private void SmallContactRejectionOption_Changed(object sender, RoutedEventArgs e)
         {
-            if (ChkSmallContactRejection == null || ChkSmallContactRejectionStrict == null)
+            if (ChkSmallContactRejection == null || ChkSmallContactRejectionStrict == null ||
+                SmallContactMajorRow == null || SlSmallContactMajorThreshold == null)
                 return;
 
             bool enabled = ChkSmallContactRejection.IsChecked == true;
@@ -2473,6 +2502,28 @@ namespace AmtPtpConfigGui
 
             if (!enabled)
                 ChkSmallContactRejectionStrict.IsChecked = false;
+
+            bool strict = enabled && ChkSmallContactRejectionStrict.IsChecked == true;
+            SmallContactMajorRow.Visibility = strict ? Visibility.Visible : Visibility.Collapsed;
+            SlSmallContactMajorThreshold.Visibility = SmallContactMajorRow.Visibility;
+        }
+
+        private void ForceTouchSmallContactRejectionOption_Changed(object sender, RoutedEventArgs e)
+        {
+            if (ChkForceTouchSmallContactRejection == null || ChkForceTouchSmallContactRejectionStrict == null ||
+                ForceTouchSmallContactMajorRow == null || SlForceTouchSmallContactMajorThreshold == null)
+                return;
+
+            bool enabled = ChkForceTouchSmallContactRejection.IsChecked == true;
+            ChkForceTouchSmallContactRejectionStrict.Visibility =
+                enabled ? Visibility.Visible : Visibility.Collapsed;
+
+            if (!enabled)
+                ChkForceTouchSmallContactRejectionStrict.IsChecked = false;
+
+            bool strict = enabled && ChkForceTouchSmallContactRejectionStrict.IsChecked == true;
+            ForceTouchSmallContactMajorRow.Visibility = strict ? Visibility.Visible : Visibility.Collapsed;
+            SlForceTouchSmallContactMajorThreshold.Visibility = ForceTouchSmallContactMajorRow.Visibility;
         }
 
         // Scroll tab <-> ScrollConfig plumbing

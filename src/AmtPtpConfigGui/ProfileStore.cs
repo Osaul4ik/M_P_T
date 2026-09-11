@@ -185,6 +185,20 @@ namespace AmtPtpConfigGui
                         old.RequirePressureContinuously = defaults.RequirePressureContinuously;
                     }
 
+                    // Version 9 → 10: add the GUI-tunable "M" (Major)
+                    // small-contact threshold for non-Force-Touch devices
+                    // (previously hardcoded at 50), plus the mirrored
+                    // small-contact gate + threshold for Force-Touch
+                    // devices. Existing profiles adopt the old hardcoded
+                    // Major=50 and keep the new Force-Touch gate off.
+                    if (p.Pointer.StructVersion < 10)
+                    {
+                        old.SmallContactMajorThreshold = defaults.SmallContactMajorThreshold;
+                        old.ForceTouchSmallContactRejectionEnabled = defaults.ForceTouchSmallContactRejectionEnabled;
+                        old.ForceTouchSmallContactRejectionStrict = defaults.ForceTouchSmallContactRejectionStrict;
+                        old.ForceTouchSmallContactMajorThreshold = defaults.ForceTouchSmallContactMajorThreshold;
+                    }
+
                     if (p.Pointer.StructVersion < 3)
                     {
                         old.CursorDeadzoneSlow = defaults.CursorDeadzoneSlow;

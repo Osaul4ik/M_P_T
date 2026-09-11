@@ -99,8 +99,25 @@ typedef struct _AMT_POINTER_CONFIG
 
     // When enabled together with SmallContactRejectionEnabled on a
     // non-Force-Touch device, the Major/Minor gate is applied continuously:
-    // every frame requires Major >= 50 AND Minor >= 30.
+    // every frame requires Major >= SmallContactMajorThreshold AND
+    // Minor >= AMT_SMALL_CONTACT_MINOR_THRESHOLD (Match.c).
     ULONG SmallContactRejectionStrict;
+
+    // GUI-tunable "M" (Major axis) cutoff used by the gate above. Replaces
+    // the previously hardcoded 50. Minor keeps its fixed 30 floor - only
+    // Major is exposed as a slider.
+    ULONG SmallContactMajorThreshold;
+
+    // Same small-contact size gate as SmallContactRejectionEnabled/Strict
+    // above, but for Force-Touch-capable devices (where it is normally
+    // ignored - see SupportsForceTouch branch in AmtMatchBuildCandidates,
+    // Match.c). When both Enabled and Strict are set, every frame requires
+    // Major >= ForceTouchSmallContactMajorThreshold AND
+    // Minor >= AMT_SMALL_CONTACT_MINOR_THRESHOLD, same continuous
+    // (every-frame, not just birth) semantics as the non-Force-Touch gate.
+    ULONG ForceTouchSmallContactRejectionEnabled;
+    ULONG ForceTouchSmallContactRejectionStrict;
+    ULONG ForceTouchSmallContactMajorThreshold;
 
     // Software Force Touch emulation for trackpads with no hardware
     // pressure channel (DEVICE_CONTEXT::SupportsForceTouch == FALSE - see
@@ -133,7 +150,7 @@ typedef struct _AMT_POINTER_CONFIG
     ULONG ForceTouchEmulationDragLockoutDistance;   // emulation (hold-timer) path
 } AMT_POINTER_CONFIG, *PAMT_POINTER_CONFIG;
 
-#define AMT_POINTER_CONFIG_VERSION 9
+#define AMT_POINTER_CONFIG_VERSION 10
 
 #define AMT_POINTER_SMOOTH_MIN       0
 #define AMT_POINTER_SMOOTH_MAX       100
@@ -149,6 +166,14 @@ typedef struct _AMT_POINTER_CONFIG
 #define AMT_POINTER_ALPHA_DEN_MAX    16
 #define AMT_POINTER_ALPHA_SLOW_MIN  1
 #define AMT_POINTER_ALPHA_SLOW_MAX 16
+
+// Small-contact size gate ("M" = Major axis). Range for both
+// SmallContactMajorThreshold (non-Force-Touch) and
+// ForceTouchSmallContactMajorThreshold (Force-Touch) sliders. Minor keeps
+// its fixed floor below - only Major is GUI-tunable.
+#define AMT_POINTER_SMALL_CONTACT_MAJOR_MIN   10
+#define AMT_POINTER_SMALL_CONTACT_MAJOR_MAX  150
+#define AMT_SMALL_CONTACT_MINOR_THRESHOLD     30
 
 // ForceTapAction values.
 #define AMT_POINTER_ACTION_CONTEXT_MENU 0   // synthetic right-click (Button2)
@@ -179,6 +204,10 @@ typedef struct _AMT_POINTER_CONFIG
     3,                                                                      \
     1,                                                                      \
     0,                                                                      \
+    /* SmallContactMajorThreshold             */ 50,                       \
+    /* ForceTouchSmallContactRejectionEnabled */ 0,                        \
+    /* ForceTouchSmallContactRejectionStrict  */ 0,                        \
+    /* ForceTouchSmallContactMajorThreshold   */ 50,                       \
     1,                                                                      \
     AMT_POINTER_ACTION_CONTEXT_MENU,                                        \
     300,                                                                    \

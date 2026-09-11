@@ -1398,10 +1398,16 @@
                                 </GroupBox.Header>
                                 <StackPanel>
                                     <CheckBox x:Name="ChkSmallContactRejection" Style="{StaticResource OptionCheckBox}" Margin="0,10,0,4" Content="Enable small-contact rejection" Checked="SmallContactRejectionOption_Changed" Unchecked="SmallContactRejectionOption_Changed" ToolTip="On trackpads without Force Touch, reject a new contact while Major is below 80 and Minor is below 60. Once it reaches Major 80 or Minor 60, that contact remains accepted until it is lifted."/>
-                                    <CheckBox x:Name="ChkSmallContactRejectionStrict" Style="{StaticResource OptionCheckBox}" Margin="0,0,0,8" Content="Require M:50/30 continuously" Visibility="Collapsed" ToolTip="While enabled, a non-Force-Touch contact is ignored on every frame unless Major is at least 50 AND Minor is at least 30. If either value drops below the threshold while you move, the contact is ignored until it qualifies again."/>
-                                    <TextBlock Style="{StaticResource HintText}" Text="Normal mode checks M only when a contact starts. Strict mode checks M on every frame and requires Major ≥ 50 AND Minor ≥ 30."/>
+                                    <CheckBox x:Name="ChkSmallContactRejectionStrict" Style="{StaticResource OptionCheckBox}" Margin="0,0,0,8" Content="Require M continuously" Visibility="Collapsed" Checked="SmallContactRejectionOption_Changed" Unchecked="SmallContactRejectionOption_Changed" ToolTip="While enabled, a non-Force-Touch contact is ignored on every frame unless Major is at least M (below) AND Minor is at least 30. If either value drops below the threshold while you move, the contact is ignored until it qualifies again."/>
+                                    <Grid x:Name="SmallContactMajorRow" Style="{StaticResource SettingRow}" Margin="0,4,0,0" Visibility="Collapsed"><Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                                        <TextBlock Style="{StaticResource SliderLabel}" Text="M (Major) threshold" ToolTip="Minimum Major-axis contact size ('M') required on every frame in Strict mode. Minor keeps a fixed floor of 30."/>
+                                        <TextBlock x:Name="LblSmallContactMajorThreshold" Grid.Column="1" Style="{StaticResource SliderValue}"/>
+                                    </Grid>
+                                    <Slider x:Name="SlSmallContactMajorThreshold" Minimum="10" Maximum="150" Visibility="Collapsed" ValueChanged="PointerSlider_Changed"/>
+                                    <TextBlock Style="{StaticResource HintText}" Text="Normal mode checks M only when a contact starts. Strict mode checks M on every frame and requires Major ≥ M AND Minor ≥ 30."/>
                                 </StackPanel>
                             </GroupBox>
+
 
                             <GroupBox x:Name="ForceTouchGroup" Margin="0,12,0,0">
                                 <GroupBox.Header>
@@ -1431,6 +1437,25 @@
                                         <RadioButton x:Name="RbActionDoubleClick" Content="Double click" GroupName="ForceTapAction" Margin="0,4" Checked="PointerAction_Changed" ToolTip="Send a double left-click."/>
                                     </StackPanel>
                                     <TextBlock Style="{StaticResource HintText}" Margin="0,8,0,0" Text="Force Touch settings are available in the normal mode; Pro Mode contains only the lower-level pointer tuning parameters."/>
+                                </StackPanel>
+                            </GroupBox>
+
+                            <GroupBox x:Name="ForceTouchSmallContactRejectionGroup" Margin="0,12,0,0">
+                                <GroupBox.Header>
+                                    <StackPanel>
+                                        <TextBlock Text="Contact Rejection" Style="{StaticResource SectionTitle}"/>
+                                        <TextBlock Text="FORCE TOUCH · small-contact filter" Style="{StaticResource SectionCaption}"/>
+                                    </StackPanel>
+                                </GroupBox.Header>
+                                <StackPanel>
+                                    <CheckBox x:Name="ChkForceTouchSmallContactRejection" Style="{StaticResource OptionCheckBox}" Margin="0,10,0,4" Content="Enable small-contact rejection" Checked="ForceTouchSmallContactRejectionOption_Changed" Unchecked="ForceTouchSmallContactRejectionOption_Changed" ToolTip="On Force Touch trackpads, reject a new contact while Major is below M and Minor is below 30. Off by default - Force Touch normally relies on the pressure gate above instead."/>
+                                    <CheckBox x:Name="ChkForceTouchSmallContactRejectionStrict" Style="{StaticResource OptionCheckBox}" Margin="0,0,0,8" Content="Require M continuously" Visibility="Collapsed" Checked="ForceTouchSmallContactRejectionOption_Changed" Unchecked="ForceTouchSmallContactRejectionOption_Changed" ToolTip="While enabled, a Force Touch contact is ignored on every frame unless Major is at least M (below) AND Minor is at least 30. If either value drops below the threshold while you move, the contact is ignored until it qualifies again."/>
+                                    <Grid x:Name="ForceTouchSmallContactMajorRow" Style="{StaticResource SettingRow}" Margin="0,4,0,0" Visibility="Collapsed"><Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                                        <TextBlock Style="{StaticResource SliderLabel}" Text="M (Major) threshold" ToolTip="Minimum Major-axis contact size ('M') required on every frame in Strict mode. Minor keeps a fixed floor of 30."/>
+                                        <TextBlock x:Name="LblForceTouchSmallContactMajorThreshold" Grid.Column="1" Style="{StaticResource SliderValue}"/>
+                                    </Grid>
+                                    <Slider x:Name="SlForceTouchSmallContactMajorThreshold" Minimum="10" Maximum="150" Visibility="Collapsed" ValueChanged="PointerSlider_Changed"/>
+                                    <TextBlock Style="{StaticResource HintText}" Text="Normal mode checks M only when a contact starts. Strict mode checks M on every frame and requires Major ≥ M AND Minor ≥ 30."/>
                                 </StackPanel>
                             </GroupBox>
 
