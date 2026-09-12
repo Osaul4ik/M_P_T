@@ -20,19 +20,21 @@ namespace AmtPtpConfigGui.Native
         public uint CursorFastVelocity;
         public uint SmoothingAlphaDen;
         public uint SmoothingAlphaNumSlow;
-        public uint SmallContactRejectionEnabled;
-        public uint SmallContactRejectionStrict;
+        // --- Small-contact size filtering ---------------------------------
+        // Two INDEPENDENT gates, each with its own on/off flag and its own
+        // GUI-tunable "M" (Major axis) threshold. Neither depends on the
+        // other being enabled, and both are available for non-Force-Touch
+        // AND Force-Touch devices. See the matching AMT_POINTER_CONFIG
+        // fields/comments in Public.h.
+        public uint SmallContactRejectionEnabled;           // birth-only: on/off
+        public uint SmallContactBirthMajorThreshold;         // birth-only: M
+        public uint SmallContactRejectionStrict;             // continuous: on/off
+        public uint SmallContactMajorThreshold;              // continuous: M
 
-        // GUI-tunable "M" (Major axis) cutoff for the gate above
-        // (non-Force-Touch devices). Minor keeps its fixed floor.
-        public uint SmallContactMajorThreshold;
-
-        // Same small-contact size gate, mirrored for Force-Touch-capable
-        // devices (normally ignored there - Force Touch relies on the
-        // pressure gate instead). Off by default.
-        public uint ForceTouchSmallContactRejectionEnabled;
-        public uint ForceTouchSmallContactRejectionStrict;
-        public uint ForceTouchSmallContactMajorThreshold;
+        public uint ForceTouchSmallContactRejectionEnabled;      // birth-only: on/off
+        public uint ForceTouchSmallContactBirthMajorThreshold;   // birth-only: M
+        public uint ForceTouchSmallContactRejectionStrict;       // continuous: on/off
+        public uint ForceTouchSmallContactMajorThreshold;        // continuous: M
 
         // Software Force Touch emulation (non-Force-Touch trackpads only -
         // see the matching AMT_POINTER_CONFIG fields in Public.h).
@@ -45,7 +47,7 @@ namespace AmtPtpConfigGui.Native
         public uint ForceTapDragLockoutDistance;
         public uint ForceTouchEmulationDragLockoutDistance;
 
-        public const uint CurrentVersion = 10;
+        public const uint CurrentVersion = 11;
         public const uint ActionContextMenu = 0;
         public const uint ActionMiddleClick = 1;
         public const uint ActionDoubleClick = 2;
@@ -82,9 +84,11 @@ namespace AmtPtpConfigGui.Native
             SmoothingAlphaDen = 8,
             SmoothingAlphaNumSlow = 3,
             SmallContactRejectionEnabled = 1,
+            SmallContactBirthMajorThreshold = 80,
             SmallContactRejectionStrict = 0,
             SmallContactMajorThreshold = 50,
             ForceTouchSmallContactRejectionEnabled = 0,
+            ForceTouchSmallContactBirthMajorThreshold = 80,
             ForceTouchSmallContactRejectionStrict = 0,
             ForceTouchSmallContactMajorThreshold = 50,
             ForceTouchEmulationEnabled = 1,
@@ -103,16 +107,16 @@ namespace AmtPtpConfigGui.Native
             c.ForceTouchEnabled = c.ForceTouchEnabled != 0 ? 1u : 0u;
             c.RequirePressureToActivate = c.RequirePressureToActivate != 0 ? 1u : 0u;
             c.RequirePressureContinuously = c.RequirePressureContinuously != 0 ? 1u : 0u;
+            // Two INDEPENDENT small-contact gates per device kind - neither
+            // flag forces the other off. Each has its own "M" threshold.
             c.SmallContactRejectionEnabled = c.SmallContactRejectionEnabled != 0 ? 1u : 0u;
+            c.SmallContactBirthMajorThreshold = Clamp(c.SmallContactBirthMajorThreshold, SmallContactMajorMin, SmallContactMajorMax);
             c.SmallContactRejectionStrict = c.SmallContactRejectionStrict != 0 ? 1u : 0u;
-            if (c.SmallContactRejectionEnabled == 0)
-                c.SmallContactRejectionStrict = 0;
             c.SmallContactMajorThreshold = Clamp(c.SmallContactMajorThreshold, SmallContactMajorMin, SmallContactMajorMax);
 
             c.ForceTouchSmallContactRejectionEnabled = c.ForceTouchSmallContactRejectionEnabled != 0 ? 1u : 0u;
+            c.ForceTouchSmallContactBirthMajorThreshold = Clamp(c.ForceTouchSmallContactBirthMajorThreshold, SmallContactMajorMin, SmallContactMajorMax);
             c.ForceTouchSmallContactRejectionStrict = c.ForceTouchSmallContactRejectionStrict != 0 ? 1u : 0u;
-            if (c.ForceTouchSmallContactRejectionEnabled == 0)
-                c.ForceTouchSmallContactRejectionStrict = 0;
             c.ForceTouchSmallContactMajorThreshold = Clamp(c.ForceTouchSmallContactMajorThreshold, SmallContactMajorMin, SmallContactMajorMax);
             c.CursorSmoothingPercent = Clamp(c.CursorSmoothingPercent, 0, 100);
             c.CursorSpeedPercent = Clamp(c.CursorSpeedPercent, 50, 200);

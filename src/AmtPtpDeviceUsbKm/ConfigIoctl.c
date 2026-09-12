@@ -199,17 +199,20 @@ AmtPointerConfigClamp(_Inout_ PAMT_POINTER_CONFIG Config)
     Config->ForceTouchEnabled = Config->ForceTouchEnabled ? 1u : 0u;
     Config->RequirePressureToActivate = Config->RequirePressureToActivate ? 1u : 0u;
     Config->RequirePressureContinuously = Config->RequirePressureContinuously ? 1u : 0u;
+    // Small-contact gates: two INDEPENDENT on/off flags (birth-only vs
+    // continuous) - neither is forced off by the other being off. Each has
+    // its own Major ("M") threshold, clamped to the same shared range.
     Config->SmallContactRejectionEnabled = Config->SmallContactRejectionEnabled ? 1u : 0u;
+    Config->SmallContactBirthMajorThreshold = AmtClampULong(Config->SmallContactBirthMajorThreshold,
+        AMT_POINTER_SMALL_CONTACT_MAJOR_MIN, AMT_POINTER_SMALL_CONTACT_MAJOR_MAX);
     Config->SmallContactRejectionStrict = Config->SmallContactRejectionStrict ? 1u : 0u;
-    if (!Config->SmallContactRejectionEnabled)
-        Config->SmallContactRejectionStrict = 0;
     Config->SmallContactMajorThreshold = AmtClampULong(Config->SmallContactMajorThreshold,
         AMT_POINTER_SMALL_CONTACT_MAJOR_MIN, AMT_POINTER_SMALL_CONTACT_MAJOR_MAX);
 
     Config->ForceTouchSmallContactRejectionEnabled = Config->ForceTouchSmallContactRejectionEnabled ? 1u : 0u;
+    Config->ForceTouchSmallContactBirthMajorThreshold = AmtClampULong(Config->ForceTouchSmallContactBirthMajorThreshold,
+        AMT_POINTER_SMALL_CONTACT_MAJOR_MIN, AMT_POINTER_SMALL_CONTACT_MAJOR_MAX);
     Config->ForceTouchSmallContactRejectionStrict = Config->ForceTouchSmallContactRejectionStrict ? 1u : 0u;
-    if (!Config->ForceTouchSmallContactRejectionEnabled)
-        Config->ForceTouchSmallContactRejectionStrict = 0;
     Config->ForceTouchSmallContactMajorThreshold = AmtClampULong(Config->ForceTouchSmallContactMajorThreshold,
         AMT_POINTER_SMALL_CONTACT_MAJOR_MIN, AMT_POINTER_SMALL_CONTACT_MAJOR_MAX);
 
@@ -410,9 +413,11 @@ AmtPointerConfigLoadFromRegistry(
     AmtRegistryReadDword(key, AMT_REG_VALUE_CURSOR_ALPHA_SLOW,  &Config->SmoothingAlphaNumSlow);
     AmtRegistryReadDword(key, AMT_REG_VALUE_SMALL_CONTACT_REJECTION, &Config->SmallContactRejectionEnabled);
     AmtRegistryReadDword(key, AMT_REG_VALUE_SMALL_CONTACT_REJECTION_STRICT, &Config->SmallContactRejectionStrict);
+    AmtRegistryReadDword(key, AMT_REG_VALUE_SMALL_CONTACT_BIRTH_MAJOR_THRESHOLD, &Config->SmallContactBirthMajorThreshold);
     AmtRegistryReadDword(key, AMT_REG_VALUE_SMALL_CONTACT_MAJOR_THRESHOLD, &Config->SmallContactMajorThreshold);
     AmtRegistryReadDword(key, AMT_REG_VALUE_FORCETOUCH_SMALL_CONTACT_REJECTION, &Config->ForceTouchSmallContactRejectionEnabled);
     AmtRegistryReadDword(key, AMT_REG_VALUE_FORCETOUCH_SMALL_CONTACT_REJECTION_STRICT, &Config->ForceTouchSmallContactRejectionStrict);
+    AmtRegistryReadDword(key, AMT_REG_VALUE_FORCETOUCH_SMALL_CONTACT_BIRTH_MAJOR_THRESHOLD, &Config->ForceTouchSmallContactBirthMajorThreshold);
     AmtRegistryReadDword(key, AMT_REG_VALUE_FORCETOUCH_SMALL_CONTACT_MAJOR_THRESHOLD, &Config->ForceTouchSmallContactMajorThreshold);
     AmtRegistryReadDword(key, AMT_REG_VALUE_FORCETOUCH_EMULATION_ENABLED, &Config->ForceTouchEmulationEnabled);
     AmtRegistryReadDword(key, AMT_REG_VALUE_FORCETOUCH_EMULATION_ACTION,  &Config->ForceTouchEmulationAction);
@@ -464,9 +469,11 @@ AmtPointerConfigSaveToRegistry(
     AmtRegistryWriteDword(key, AMT_REG_VALUE_CURSOR_ALPHA_SLOW,  Config->SmoothingAlphaNumSlow);
     AmtRegistryWriteDword(key, AMT_REG_VALUE_SMALL_CONTACT_REJECTION, Config->SmallContactRejectionEnabled);
     AmtRegistryWriteDword(key, AMT_REG_VALUE_SMALL_CONTACT_REJECTION_STRICT, Config->SmallContactRejectionStrict);
+    AmtRegistryWriteDword(key, AMT_REG_VALUE_SMALL_CONTACT_BIRTH_MAJOR_THRESHOLD, Config->SmallContactBirthMajorThreshold);
     AmtRegistryWriteDword(key, AMT_REG_VALUE_SMALL_CONTACT_MAJOR_THRESHOLD, Config->SmallContactMajorThreshold);
     AmtRegistryWriteDword(key, AMT_REG_VALUE_FORCETOUCH_SMALL_CONTACT_REJECTION, Config->ForceTouchSmallContactRejectionEnabled);
     AmtRegistryWriteDword(key, AMT_REG_VALUE_FORCETOUCH_SMALL_CONTACT_REJECTION_STRICT, Config->ForceTouchSmallContactRejectionStrict);
+    AmtRegistryWriteDword(key, AMT_REG_VALUE_FORCETOUCH_SMALL_CONTACT_BIRTH_MAJOR_THRESHOLD, Config->ForceTouchSmallContactBirthMajorThreshold);
     AmtRegistryWriteDword(key, AMT_REG_VALUE_FORCETOUCH_SMALL_CONTACT_MAJOR_THRESHOLD, Config->ForceTouchSmallContactMajorThreshold);
     AmtRegistryWriteDword(key, AMT_REG_VALUE_FORCETOUCH_EMULATION_ENABLED, Config->ForceTouchEmulationEnabled);
     AmtRegistryWriteDword(key, AMT_REG_VALUE_FORCETOUCH_EMULATION_ACTION,  Config->ForceTouchEmulationAction);

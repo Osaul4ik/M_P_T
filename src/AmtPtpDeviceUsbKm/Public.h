@@ -91,33 +91,34 @@ typedef struct _AMT_POINTER_CONFIG
     ULONG SmoothingAlphaDen;
     ULONG SmoothingAlphaNumSlow;
 
-    // Reject small contacts on trackpads without Force Touch. A contact is
-    // initially rejected while Major < 80 AND Minor < 60; once it reaches
-    // Major >= 80 OR Minor >= 60 it stays accepted until that contact is
-    // lifted. Ignored on Force Touch-capable devices.
-    ULONG SmallContactRejectionEnabled;
+    // --- Small-contact size filtering -------------------------------------
+    // Two INDEPENDENT gates, each with its own enable flag and its own
+    // GUI-tunable "M" (Major axis) threshold. Neither depends on the other
+    // being enabled, and both are available on non-Force-Touch AND
+    // Force-Touch devices (Force-Touch normally relies on the pressure gate
+    // instead, but these gates are evaluated in addition to it, not instead
+    // of it).
+    //
+    // 1) Birth-only gate (Ptpcore.c): a brand-new contact is rejected while
+    //    Major < <...>BirthMajorThreshold AND Minor < the fixed
+    //    AMT_SMALL_CONTACT_BIRTH_MINOR_THRESHOLD floor. Once accepted it
+    //    stays accepted for the life of that contact - only evaluated at
+    //    birth, never again while the contact is tracked.
+    // 2) Continuous gate (Match.c): every frame (not just birth) requires
+    //    Major >= <...>MajorThreshold AND
+    //    Minor >= AMT_SMALL_CONTACT_MINOR_THRESHOLD. If either value drops
+    //    below the threshold while the contact moves, it is treated as
+    //    absent until it qualifies again.
 
-    // When enabled together with SmallContactRejectionEnabled on a
-    // non-Force-Touch device, the Major/Minor gate is applied continuously:
-    // every frame requires Major >= SmallContactMajorThreshold AND
-    // Minor >= AMT_SMALL_CONTACT_MINOR_THRESHOLD (Match.c).
-    ULONG SmallContactRejectionStrict;
+    ULONG SmallContactRejectionEnabled;         // (1) non-Force-Touch: on/off
+    ULONG SmallContactBirthMajorThreshold;       // (1) non-Force-Touch: M, default 80
+    ULONG SmallContactRejectionStrict;          // (2) non-Force-Touch: on/off
+    ULONG SmallContactMajorThreshold;            // (2) non-Force-Touch: M, default 50
 
-    // GUI-tunable "M" (Major axis) cutoff used by the gate above. Replaces
-    // the previously hardcoded 50. Minor keeps its fixed 30 floor - only
-    // Major is exposed as a slider.
-    ULONG SmallContactMajorThreshold;
-
-    // Same small-contact size gate as SmallContactRejectionEnabled/Strict
-    // above, but for Force-Touch-capable devices (where it is normally
-    // ignored - see SupportsForceTouch branch in AmtMatchBuildCandidates,
-    // Match.c). When both Enabled and Strict are set, every frame requires
-    // Major >= ForceTouchSmallContactMajorThreshold AND
-    // Minor >= AMT_SMALL_CONTACT_MINOR_THRESHOLD, same continuous
-    // (every-frame, not just birth) semantics as the non-Force-Touch gate.
-    ULONG ForceTouchSmallContactRejectionEnabled;
-    ULONG ForceTouchSmallContactRejectionStrict;
-    ULONG ForceTouchSmallContactMajorThreshold;
+    ULONG ForceTouchSmallContactRejectionEnabled;        // (1) Force-Touch: on/off
+    ULONG ForceTouchSmallContactBirthMajorThreshold;     // (1) Force-Touch: M, default 80
+    ULONG ForceTouchSmallContactRejectionStrict;         // (2) Force-Touch: on/off
+    ULONG ForceTouchSmallContactMajorThreshold;          // (2) Force-Touch: M, default 50
 
     // Software Force Touch emulation for trackpads with no hardware
     // pressure channel (DEVICE_CONTEXT::SupportsForceTouch == FALSE - see
@@ -150,7 +151,7 @@ typedef struct _AMT_POINTER_CONFIG
     ULONG ForceTouchEmulationDragLockoutDistance;   // emulation (hold-timer) path
 } AMT_POINTER_CONFIG, *PAMT_POINTER_CONFIG;
 
-#define AMT_POINTER_CONFIG_VERSION 10
+#define AMT_POINTER_CONFIG_VERSION 11
 
 #define AMT_POINTER_SMOOTH_MIN       0
 #define AMT_POINTER_SMOOTH_MAX       100
@@ -167,13 +168,14 @@ typedef struct _AMT_POINTER_CONFIG
 #define AMT_POINTER_ALPHA_SLOW_MIN  1
 #define AMT_POINTER_ALPHA_SLOW_MAX 16
 
-// Small-contact size gate ("M" = Major axis). Range for both
-// SmallContactMajorThreshold (non-Force-Touch) and
-// ForceTouchSmallContactMajorThreshold (Force-Touch) sliders. Minor keeps
-// its fixed floor below - only Major is GUI-tunable.
+// Small-contact size gate ("M" = Major axis). Range for all four
+// GUI-tunable Major thresholds (birth and continuous, non-Force-Touch and
+// Force-Touch). The two Minor floors are fixed, not GUI-tunable: birth
+// keeps the original 60, continuous keeps the original 30.
 #define AMT_POINTER_SMALL_CONTACT_MAJOR_MIN   10
 #define AMT_POINTER_SMALL_CONTACT_MAJOR_MAX  150
-#define AMT_SMALL_CONTACT_MINOR_THRESHOLD     30
+#define AMT_SMALL_CONTACT_MINOR_THRESHOLD     30   // continuous gate (Match.c)
+#define AMT_SMALL_CONTACT_BIRTH_MINOR_THRESHOLD 60 // birth-only gate (Ptpcore.c)
 
 // ForceTapAction values.
 #define AMT_POINTER_ACTION_CONTEXT_MENU 0   // synthetic right-click (Button2)
@@ -202,12 +204,14 @@ typedef struct _AMT_POINTER_CONFIG
     905,                                                                    \
     8,                                                                      \
     3,                                                                      \
-    1,                                                                      \
-    0,                                                                      \
-    /* SmallContactMajorThreshold             */ 50,                       \
-    /* ForceTouchSmallContactRejectionEnabled */ 0,                        \
-    /* ForceTouchSmallContactRejectionStrict  */ 0,                        \
-    /* ForceTouchSmallContactMajorThreshold   */ 50,                       \
+    /* SmallContactRejectionEnabled            */ 1,                       \
+    /* SmallContactBirthMajorThreshold         */ 80,                      \
+    /* SmallContactRejectionStrict             */ 0,                       \
+    /* SmallContactMajorThreshold              */ 50,                      \
+    /* ForceTouchSmallContactRejectionEnabled  */ 0,                       \
+    /* ForceTouchSmallContactBirthMajorThreshold */ 80,                    \
+    /* ForceTouchSmallContactRejectionStrict   */ 0,                       \
+    /* ForceTouchSmallContactMajorThreshold    */ 50,                      \
     1,                                                                      \
     AMT_POINTER_ACTION_CONTEXT_MENU,                                        \
     300,                                                                    \

@@ -199,6 +199,20 @@ namespace AmtPtpConfigGui
                         old.ForceTouchSmallContactMajorThreshold = defaults.ForceTouchSmallContactMajorThreshold;
                     }
 
+                    // Version 10 → 11: split the small-contact gates into two
+                    // INDEPENDENT mechanisms, each with its own "M" threshold -
+                    // birth-only (previously hardcoded Major<80, now
+                    // SmallContactBirthMajorThreshold) and continuous (already
+                    // tunable since v10). The Enabled/Strict flags no longer
+                    // force each other off, so only the two new threshold
+                    // fields need an explicit default here - existing profiles
+                    // adopt the old hardcoded birth threshold of 80.
+                    if (p.Pointer.StructVersion < 11)
+                    {
+                        old.SmallContactBirthMajorThreshold = defaults.SmallContactBirthMajorThreshold;
+                        old.ForceTouchSmallContactBirthMajorThreshold = defaults.ForceTouchSmallContactBirthMajorThreshold;
+                    }
+
                     if (p.Pointer.StructVersion < 3)
                     {
                         old.CursorDeadzoneSlow = defaults.CursorDeadzoneSlow;

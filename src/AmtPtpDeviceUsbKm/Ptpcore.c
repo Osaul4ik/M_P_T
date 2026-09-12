@@ -303,12 +303,21 @@ PTPCore_ProcessFrame(
             pCtx->PointerConfig.RequirePressureToActivate &&
             cand->Pressure == 0;
 
+        // Birth-only small-contact gate: independent of the pressure gate
+        // above (a Force-Touch device can have both active at once) and
+        // independent of the continuous gate in Match.c. Available on both
+        // device kinds, each with its own enable flag and GUI-tunable "M"
+        // (Major) threshold; Minor keeps its fixed
+        // AMT_SMALL_CONTACT_BIRTH_MINOR_THRESHOLD floor on both.
         BOOLEAN smallContactGatedBirth =
             isNewContact &&
-            !pCtx->SupportsForceTouch &&
-            pCtx->PointerConfig.SmallContactRejectionEnabled &&
-            cand->Major < 80 &&
-            cand->Minor < 60;
+            (pCtx->SupportsForceTouch
+                ? (pCtx->PointerConfig.ForceTouchSmallContactRejectionEnabled &&
+                   cand->Major < pCtx->PointerConfig.ForceTouchSmallContactBirthMajorThreshold &&
+                   cand->Minor < AMT_SMALL_CONTACT_BIRTH_MINOR_THRESHOLD)
+                : (pCtx->PointerConfig.SmallContactRejectionEnabled &&
+                   cand->Major < pCtx->PointerConfig.SmallContactBirthMajorThreshold &&
+                   cand->Minor < AMT_SMALL_CONTACT_BIRTH_MINOR_THRESHOLD));
 
         if (!pressureGatedBirth &&
             !smallContactGatedBirth &&
@@ -478,19 +487,33 @@ PTPCore_ProcessFrame(
         // Once a candidate has corresponded to an existing active contact,
         // Phase C updates/reports it without re-applying these gates.
         //
-        // Force-Touch devices: require positive pressure when configured.
-        // Non-Force-Touch devices: require Major >= 80 OR Minor >= 60 when
-        // Small Contact Rejection is enabled.
-        if (pCtx->SupportsForceTouch) {
-            if (pCtx->PointerConfig.ForceTouchEnabled &&
-                pCtx->PointerConfig.RequirePressureToActivate &&
-                cand->Pressure == 0)
-            {
-                continue;
-            }
-        } else if (pCtx->PointerConfig.SmallContactRejectionEnabled &&
-                   cand->Major < 80 &&
-                   cand->Minor < 60)
+        // Two INDEPENDENT gates, each evaluated on its own condition (not
+        // if/else-if): a Force-Touch device can be rejected by the
+        // pressure gate, the small-contact gate, both, or neither.
+        //
+        // Pressure gate (Force-Touch devices only): require positive
+        // pressure when configured.
+        if (pCtx->SupportsForceTouch &&
+            pCtx->PointerConfig.ForceTouchEnabled &&
+            pCtx->PointerConfig.RequirePressureToActivate &&
+            cand->Pressure == 0)
+        {
+            continue;
+        }
+
+        // Birth-only small-contact gate: available on BOTH device kinds,
+        // each with its own enable flag and GUI-tunable "M" (Major)
+        // threshold; Minor keeps its fixed
+        // AMT_SMALL_CONTACT_BIRTH_MINOR_THRESHOLD floor on both. Not gated
+        // by the pressure check above, and not gated by the continuous
+        // gate's enable flag in Match.c - fully independent.
+        if (pCtx->SupportsForceTouch
+                ? (pCtx->PointerConfig.ForceTouchSmallContactRejectionEnabled &&
+                   cand->Major < pCtx->PointerConfig.ForceTouchSmallContactBirthMajorThreshold &&
+                   cand->Minor < AMT_SMALL_CONTACT_BIRTH_MINOR_THRESHOLD)
+                : (pCtx->PointerConfig.SmallContactRejectionEnabled &&
+                   cand->Major < pCtx->PointerConfig.SmallContactBirthMajorThreshold &&
+                   cand->Minor < AMT_SMALL_CONTACT_BIRTH_MINOR_THRESHOLD))
         {
             continue;
         }

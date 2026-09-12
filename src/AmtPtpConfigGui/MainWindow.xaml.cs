@@ -770,6 +770,29 @@ namespace AmtPtpConfigGui
                     cfg.ForceTapDragLockoutDistance = defaults.ForceTapDragLockoutDistance;
                     cfg.ForceTouchEmulationDragLockoutDistance = defaults.ForceTouchEmulationDragLockoutDistance;
                 }
+
+                // Version 9 → 10: add the GUI-tunable continuous-gate "M"
+                // threshold for non-Force-Touch (previously hardcoded 50),
+                // plus the mirrored small-contact gate + threshold for
+                // Force-Touch devices (new, off by default).
+                if (cfg.StructVersion < 10)
+                {
+                    cfg.SmallContactMajorThreshold = defaults.SmallContactMajorThreshold;
+                    cfg.ForceTouchSmallContactRejectionEnabled = defaults.ForceTouchSmallContactRejectionEnabled;
+                    cfg.ForceTouchSmallContactRejectionStrict = defaults.ForceTouchSmallContactRejectionStrict;
+                    cfg.ForceTouchSmallContactMajorThreshold = defaults.ForceTouchSmallContactMajorThreshold;
+                }
+
+                // Version 10 → 11: split the small-contact gates into two
+                // INDEPENDENT mechanisms, each with its own "M" threshold -
+                // birth-only (previously hardcoded Major<80) and continuous
+                // (already tunable since v10). Existing configs adopt the
+                // old hardcoded birth threshold of 80 for both device kinds.
+                if (cfg.StructVersion < 11)
+                {
+                    cfg.SmallContactBirthMajorThreshold = defaults.SmallContactBirthMajorThreshold;
+                    cfg.ForceTouchSmallContactBirthMajorThreshold = defaults.ForceTouchSmallContactBirthMajorThreshold;
+                }
             }
 
             return cfg.Clamped();
@@ -942,31 +965,30 @@ namespace AmtPtpConfigGui
                 menu.Items.Add(new Forms.ToolStripSeparator());
                 menu.Items.Add(palmEdges);
 
-                // On non-Force-Touch trackpads expose the small-contact filter in
-                // the tray exactly like the Force Touch toggle. The driver ignores
-                // this setting on Force Touch-capable hardware.
+                // On non-Force-Touch trackpads expose both small-contact filters
+                // in the tray exactly like the Force Touch toggle. The driver
+                // ignores these settings on Force Touch-capable hardware. The
+                // two filters are independent - neither item's visibility
+                // depends on the other's checked state.
                 if (!_forceTouchSupported)
                 {
-                    var smallReject = new Forms.ToolStripMenuItem("Small-contact rejection")
+                    var smallReject = new Forms.ToolStripMenuItem("Small-contact rejection (birth-only)")
                     {
                         Checked = smallContactRejectionOn,
                         Padding = new System.Windows.Forms.Padding(10, 7, 10, 7),
-                        ToolTipText = "Reject tiny contacts on trackpads without Force Touch until M:80/60 is reached."
+                        ToolTipText = $"Reject a new contact on trackpads without Force Touch until M:{pointerCfg.SmallContactBirthMajorThreshold}/60 is reached."
                     };
                     smallReject.Click += (_, _) => Dispatcher.BeginInvoke(new Action(ToggleSmallContactRejectionFromTray));
                     menu.Items.Add(smallReject);
 
-                    if (smallContactRejectionOn)
+                    var requireM = new Forms.ToolStripMenuItem("Small-contact rejection (continuous)")
                     {
-                        var requireM = new Forms.ToolStripMenuItem("Require M:50/30 continuously")
-                        {
-                            Checked = pointerCfg.SmallContactRejectionStrict != 0,
-                            Padding = new System.Windows.Forms.Padding(28, 7, 10, 7),
-                            ToolTipText = "Ignore a non-Force-Touch contact on every frame unless Major is at least 50 and Minor is at least 30."
-                        };
-                        requireM.Click += (_, _) => Dispatcher.BeginInvoke(new Action(ToggleSmallContactStrictFromTray));
-                        menu.Items.Add(requireM);
-                    }
+                        Checked = pointerCfg.SmallContactRejectionStrict != 0,
+                        Padding = new System.Windows.Forms.Padding(10, 7, 10, 7),
+                        ToolTipText = $"Ignore a non-Force-Touch contact on every frame unless Major is at least {pointerCfg.SmallContactMajorThreshold} and Minor is at least 30."
+                    };
+                    requireM.Click += (_, _) => Dispatcher.BeginInvoke(new Action(ToggleSmallContactStrictFromTray));
+                    menu.Items.Add(requireM);
 
                     // Force Touch emulation: same idea as the hardware Force Touch
                     // block below, but for trackpads with no pressure sensor - hold
@@ -1536,11 +1558,6 @@ namespace AmtPtpConfigGui
                 ForceTouchEmulationGroup.Visibility = _forceTouchSupported ? Visibility.Collapsed : Visibility.Visible;
             if (SmallContactRejectionGroup != null)
                 SmallContactRejectionGroup.Visibility = _forceTouchSupported ? Visibility.Collapsed : Visibility.Visible;
-            if (ChkSmallContactRejectionStrict != null)
-                ChkSmallContactRejectionStrict.Visibility =
-                    (!_forceTouchSupported && ChkSmallContactRejection?.IsChecked == true)
-                        ? Visibility.Visible
-                        : Visibility.Collapsed;
 
             // The tray context menu is rebuilt on demand from RefreshTrayMenu,
             // but if it's already open/cached it should reflect the change
@@ -2322,32 +2339,28 @@ namespace AmtPtpConfigGui
                 ChkRequirePressure.IsChecked = cfg.RequirePressureToActivate != 0;
                 ChkRequirePressureContinuously.IsChecked = cfg.RequirePressureContinuously != 0;
                 ChkSmallContactRejection.IsChecked = cfg.SmallContactRejectionEnabled != 0;
+                SlSmallContactBirthMajorThreshold.Value = cfg.SmallContactBirthMajorThreshold;
                 ChkSmallContactRejectionStrict.IsChecked = cfg.SmallContactRejectionStrict != 0;
                 SlSmallContactMajorThreshold.Value = cfg.SmallContactMajorThreshold;
                 ChkForceTouchSmallContactRejection.IsChecked = cfg.ForceTouchSmallContactRejectionEnabled != 0;
+                SlForceTouchSmallContactBirthMajorThreshold.Value = cfg.ForceTouchSmallContactBirthMajorThreshold;
                 ChkForceTouchSmallContactRejectionStrict.IsChecked = cfg.ForceTouchSmallContactRejectionStrict != 0;
                 SlForceTouchSmallContactMajorThreshold.Value = cfg.ForceTouchSmallContactMajorThreshold;
                 ChkRequirePressure.IsEnabled = cfg.ForceTouchEnabled != 0;
                 ChkRequirePressureContinuously.Visibility = cfg.ForceTouchEnabled != 0 ? Visibility.Visible : Visibility.Collapsed;
                 ChkRequirePressureContinuously.IsEnabled = cfg.ForceTouchEnabled != 0;
-                ChkSmallContactRejectionStrict.Visibility =
-                    cfg.SmallContactRejectionEnabled != 0
-                        ? Visibility.Visible
-                        : Visibility.Collapsed;
-                SmallContactMajorRow.Visibility =
-                    (cfg.SmallContactRejectionEnabled != 0 && cfg.SmallContactRejectionStrict != 0)
-                        ? Visibility.Visible
-                        : Visibility.Collapsed;
-                SlSmallContactMajorThreshold.Visibility = SmallContactMajorRow.Visibility;
-                ChkForceTouchSmallContactRejectionStrict.Visibility =
-                    cfg.ForceTouchSmallContactRejectionEnabled != 0
-                        ? Visibility.Visible
-                        : Visibility.Collapsed;
-                ForceTouchSmallContactMajorRow.Visibility =
-                    (cfg.ForceTouchSmallContactRejectionEnabled != 0 && cfg.ForceTouchSmallContactRejectionStrict != 0)
-                        ? Visibility.Visible
-                        : Visibility.Collapsed;
-                SlForceTouchSmallContactMajorThreshold.Visibility = ForceTouchSmallContactMajorRow.Visibility;
+
+                // Two INDEPENDENT small-contact gates per device kind - each
+                // panel's visibility follows ONLY its own checkbox, never the
+                // other one's.
+                SmallContactBirthMajorPanel.Visibility =
+                    cfg.SmallContactRejectionEnabled != 0 ? Visibility.Visible : Visibility.Collapsed;
+                SmallContactMajorPanel.Visibility =
+                    cfg.SmallContactRejectionStrict != 0 ? Visibility.Visible : Visibility.Collapsed;
+                ForceTouchSmallContactBirthMajorPanel.Visibility =
+                    cfg.ForceTouchSmallContactRejectionEnabled != 0 ? Visibility.Visible : Visibility.Collapsed;
+                ForceTouchSmallContactMajorPanel.Visibility =
+                    cfg.ForceTouchSmallContactRejectionStrict != 0 ? Visibility.Visible : Visibility.Collapsed;
                 SlCursorSmoothing.Value = cfg.CursorSmoothingPercent;
                 SlCursorSpeed.Value = cfg.CursorSpeedPercent;
                 SlCursorDeadzone.Value = cfg.CursorDeadzone;
@@ -2399,14 +2412,12 @@ namespace AmtPtpConfigGui
             c.RequirePressureContinuously =
                 ChkRequirePressureContinuously.IsChecked == true ? 1u : 0u;
             c.SmallContactRejectionEnabled = ChkSmallContactRejection.IsChecked == true ? 1u : 0u;
-            c.SmallContactRejectionStrict =
-                (ChkSmallContactRejection.IsChecked == true &&
-                 ChkSmallContactRejectionStrict.IsChecked == true) ? 1u : 0u;
+            c.SmallContactBirthMajorThreshold = (uint)SlSmallContactBirthMajorThreshold.Value;
+            c.SmallContactRejectionStrict = ChkSmallContactRejectionStrict.IsChecked == true ? 1u : 0u;
             c.SmallContactMajorThreshold = (uint)SlSmallContactMajorThreshold.Value;
             c.ForceTouchSmallContactRejectionEnabled = ChkForceTouchSmallContactRejection.IsChecked == true ? 1u : 0u;
-            c.ForceTouchSmallContactRejectionStrict =
-                (ChkForceTouchSmallContactRejection.IsChecked == true &&
-                 ChkForceTouchSmallContactRejectionStrict.IsChecked == true) ? 1u : 0u;
+            c.ForceTouchSmallContactBirthMajorThreshold = (uint)SlForceTouchSmallContactBirthMajorThreshold.Value;
+            c.ForceTouchSmallContactRejectionStrict = ChkForceTouchSmallContactRejectionStrict.IsChecked == true ? 1u : 0u;
             c.ForceTouchSmallContactMajorThreshold = (uint)SlForceTouchSmallContactMajorThreshold.Value;
             c.CursorSmoothingPercent = (uint)SlCursorSmoothing.Value;
             c.CursorSpeedPercent = (uint)SlCursorSpeed.Value;
@@ -2445,7 +2456,9 @@ namespace AmtPtpConfigGui
             LblCursorFastVelocity.Text = $"{SlCursorFastVelocity.Value:0}";
             LblSmoothingAlphaDen.Text = $"{SlSmoothingAlphaDen.Value:0}";
             LblSmoothingAlphaNumSlow.Text = $"{SlSmoothingAlphaNumSlow.Value:0}";
+            LblSmallContactBirthMajorThreshold.Text = $"{SlSmallContactBirthMajorThreshold.Value:0}";
             LblSmallContactMajorThreshold.Text = $"{SlSmallContactMajorThreshold.Value:0}";
+            LblForceTouchSmallContactBirthMajorThreshold.Text = $"{SlForceTouchSmallContactBirthMajorThreshold.Value:0}";
             LblForceTouchSmallContactMajorThreshold.Text = $"{SlForceTouchSmallContactMajorThreshold.Value:0}";
             LblForceTouchEmulationHoldMs.Text = $"{SlForceTouchEmulationHoldMs.Value / 1000.0:0.00} s";
             LblForceTouchEmulationDragLockoutDistance.Text = $"{SlForceTouchEmulationDragLockoutDistance.Value:0}";
@@ -2492,38 +2505,24 @@ namespace AmtPtpConfigGui
 
         private void SmallContactRejectionOption_Changed(object sender, RoutedEventArgs e)
         {
-            if (ChkSmallContactRejection == null || ChkSmallContactRejectionStrict == null ||
-                SmallContactMajorRow == null || SlSmallContactMajorThreshold == null)
-                return;
+            if (ChkSmallContactRejection != null && SmallContactBirthMajorPanel != null)
+                SmallContactBirthMajorPanel.Visibility =
+                    ChkSmallContactRejection.IsChecked == true ? Visibility.Visible : Visibility.Collapsed;
 
-            bool enabled = ChkSmallContactRejection.IsChecked == true;
-            ChkSmallContactRejectionStrict.Visibility =
-                enabled ? Visibility.Visible : Visibility.Collapsed;
-
-            if (!enabled)
-                ChkSmallContactRejectionStrict.IsChecked = false;
-
-            bool strict = enabled && ChkSmallContactRejectionStrict.IsChecked == true;
-            SmallContactMajorRow.Visibility = strict ? Visibility.Visible : Visibility.Collapsed;
-            SlSmallContactMajorThreshold.Visibility = SmallContactMajorRow.Visibility;
+            if (ChkSmallContactRejectionStrict != null && SmallContactMajorPanel != null)
+                SmallContactMajorPanel.Visibility =
+                    ChkSmallContactRejectionStrict.IsChecked == true ? Visibility.Visible : Visibility.Collapsed;
         }
 
         private void ForceTouchSmallContactRejectionOption_Changed(object sender, RoutedEventArgs e)
         {
-            if (ChkForceTouchSmallContactRejection == null || ChkForceTouchSmallContactRejectionStrict == null ||
-                ForceTouchSmallContactMajorRow == null || SlForceTouchSmallContactMajorThreshold == null)
-                return;
+            if (ChkForceTouchSmallContactRejection != null && ForceTouchSmallContactBirthMajorPanel != null)
+                ForceTouchSmallContactBirthMajorPanel.Visibility =
+                    ChkForceTouchSmallContactRejection.IsChecked == true ? Visibility.Visible : Visibility.Collapsed;
 
-            bool enabled = ChkForceTouchSmallContactRejection.IsChecked == true;
-            ChkForceTouchSmallContactRejectionStrict.Visibility =
-                enabled ? Visibility.Visible : Visibility.Collapsed;
-
-            if (!enabled)
-                ChkForceTouchSmallContactRejectionStrict.IsChecked = false;
-
-            bool strict = enabled && ChkForceTouchSmallContactRejectionStrict.IsChecked == true;
-            ForceTouchSmallContactMajorRow.Visibility = strict ? Visibility.Visible : Visibility.Collapsed;
-            SlForceTouchSmallContactMajorThreshold.Visibility = ForceTouchSmallContactMajorRow.Visibility;
+            if (ChkForceTouchSmallContactRejectionStrict != null && ForceTouchSmallContactMajorPanel != null)
+                ForceTouchSmallContactMajorPanel.Visibility =
+                    ChkForceTouchSmallContactRejectionStrict.IsChecked == true ? Visibility.Visible : Visibility.Collapsed;
         }
 
         // Scroll tab <-> ScrollConfig plumbing
